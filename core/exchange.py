@@ -229,20 +229,28 @@ class OKXExchange:
         return self._f(rows[0], "totalEq")
 
     async def list_open_positions(self) -> list[dict]:
-        """List all option positions for BTC-USD."""
+        """List all option positions for BTC-USD.
+
+        python-okx >=0.4.1 dropped the `uly=` parameter from
+        `Account.get_positions`. We now fetch all OPTION positions and
+        filter to BASE_COIN-QUOTE_COIN in code.
+        """
         resp = await self._call(
             self._account.get_positions,
             instType="OPTION",
-            uly=f"{config.BASE_COIN}-{config.QUOTE_COIN}",
         )
         rows = self._data_or_empty(resp)
+        family_prefix = f"{config.BASE_COIN}-{config.QUOTE_COIN}-"
         out = []
         for r in rows:
             pos = self._f(r, "pos")
             if pos == 0:
                 continue
+            inst = r.get("instId", "")
+            if not inst.startswith(family_prefix):
+                continue
             out.append({
-                "instrument_name": r.get("instId", ""),
+                "instrument_name": inst,
                 "amount": pos,
                 "average_price": self._f(r, "avgPx"),
                 "mark_price": self._f(r, "markPx"),
