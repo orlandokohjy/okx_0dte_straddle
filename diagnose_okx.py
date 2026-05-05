@@ -15,6 +15,7 @@ api_key = os.environ.get("OKX_API_KEY", "")
 api_secret = os.environ.get("OKX_API_SECRET", "")
 passphrase = os.environ.get("OKX_PASSPHRASE", "")
 flag = os.environ.get("OKX_FLAG", "1")
+domain = os.environ.get("OKX_DOMAIN", "https://www.okx.com")
 
 print("=" * 60)
 print("OKX CREDENTIALS DIAGNOSTIC")
@@ -25,6 +26,7 @@ print(f"  Secret length:     {len(api_secret)}  (expected 32)")
 print(f"  Passphrase:        {passphrase}")
 print(f"  Passphrase length: {len(passphrase)}")
 print(f"  Flag:              {flag}  ({'DEMO' if flag == '1' else 'LIVE'})")
+print(f"  Domain:            {domain}")
 print()
 
 if not all([api_key, api_secret, passphrase]):
@@ -36,7 +38,7 @@ print("TEST 1 — public market data (no auth required)")
 print("─" * 60)
 try:
     from okx.MarketData import MarketAPI
-    m = MarketAPI(flag=flag, debug=False)
+    m = MarketAPI(flag=flag, domain=domain, debug=False)
     r = m.get_index_tickers(instId="BTC-USD")
     print(f"  code: {r.get('code')}, msg: {r.get('msg')!r}")
     if r.get("data"):
@@ -53,7 +55,7 @@ print("─" * 60)
 try:
     from okx.Account import AccountAPI
     a = AccountAPI(api_key, api_secret, passphrase, False,
-                   flag=flag, debug=False)
+                   flag=flag, domain=domain, debug=False)
     r = a.get_account_balance()
     print(f"  code: {r.get('code')}")
     print(f"  msg:  {r.get('msg')!r}")
@@ -82,7 +84,7 @@ print("─" * 60)
 try:
     from okx.Account import AccountAPI
     a = AccountAPI(api_key, api_secret, passphrase, False,
-                   flag=flag, debug=False)
+                   flag=flag, domain=domain, debug=False)
     r = a.get_positions(instType="OPTION")
     print(f"  code: {r.get('code')}, msg: {r.get('msg')!r}")
     if r.get("code") == "0":
@@ -104,7 +106,7 @@ print(f"  Flipping flag to {opposite_flag} ({opposite_label})…")
 try:
     from okx.Account import AccountAPI
     a = AccountAPI(api_key, api_secret, passphrase, False,
-                   flag=opposite_flag, debug=False)
+                   flag=opposite_flag, domain=domain, debug=False)
     r = a.get_account_balance()
     print(f"  code: {r.get('code')}, msg: {r.get('msg')!r}")
     print()

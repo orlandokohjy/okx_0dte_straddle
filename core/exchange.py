@@ -88,19 +88,24 @@ class OKXExchange:
             )
 
         flag = config.OKX_FLAG  # "0"=live, "1"=demo
-        self._market = MarketData.MarketAPI(flag=flag, debug=False)
-        self._public = PublicData.PublicAPI(flag=flag, debug=False)
+        domain = config.OKX_DOMAIN
+        self._market = MarketData.MarketAPI(
+            flag=flag, domain=domain, debug=False,
+        )
+        self._public = PublicData.PublicAPI(
+            flag=flag, domain=domain, debug=False,
+        )
         self._trade = Trade.TradeAPI(
             config.OKX_API_KEY or "x",
             config.OKX_API_SECRET or "x",
             config.OKX_PASSPHRASE or "x",
-            False, flag=flag, debug=False,
+            False, flag=flag, domain=domain, debug=False,
         )
         self._account = Account.AccountAPI(
             config.OKX_API_KEY or "x",
             config.OKX_API_SECRET or "x",
             config.OKX_PASSPHRASE or "x",
-            False, flag=flag, debug=False,
+            False, flag=flag, domain=domain, debug=False,
         )
         self._block = None
         if BlockTrading is not None:
@@ -109,7 +114,7 @@ class OKXExchange:
                     config.OKX_API_KEY or "x",
                     config.OKX_API_SECRET or "x",
                     config.OKX_PASSPHRASE or "x",
-                    False, flag=flag, debug=False,
+                    False, flag=flag, domain=domain, debug=False,
                 )
             except Exception:
                 log.warning("block_trading_init_failed", exc_info=True)
@@ -117,6 +122,7 @@ class OKXExchange:
         self._connected = True
         log.info("okx_connected",
                  mode="DEMO" if flag == "1" else "LIVE",
+                 domain=domain,
                  dry_run=config.DRY_RUN,
                  rfq=config.USE_RFQ and self._block is not None)
 

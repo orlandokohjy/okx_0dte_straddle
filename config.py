@@ -20,6 +20,13 @@ OKX_PASSPHRASE: str = os.getenv("OKX_PASSPHRASE", "")
 # Default to demo for safety. Override to "0" only when ready for live.
 OKX_FLAG: str = os.getenv("OKX_FLAG", "1")
 
+# OKX regional endpoint:
+#   "https://www.okx.com"   — global (default)
+#   "https://my.okx.com"    — OKX Singapore (SG-licensed users)
+#   "https://app.okx.com"   — alt regional gateway
+# Keys are scoped per-region; using the wrong domain returns 50119.
+OKX_DOMAIN: str = os.getenv("OKX_DOMAIN", "https://www.okx.com")
+
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # ──────────────────── Strategy Constants ──────────────────────────
