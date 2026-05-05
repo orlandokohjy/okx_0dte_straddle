@@ -1,6 +1,6 @@
 """
 Manual close for OKX positions — use BEFORE 08:00 UTC option expiry to
-flatten any open straddle if the scheduled 14:00 UTC close would miss
+flatten any open straddle if the scheduled 16:00 UTC close would miss
 it (e.g. the algo was started outside the normal session window).
 
 Reads OKX credentials from .env and sells every non-zero position with

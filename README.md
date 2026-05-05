@@ -3,7 +3,7 @@
 Daily long-straddle on OKX BTC options.
 
 - **Position**: 1 ITM call + 1 put (same strike) per `QTY_PER_LEG` BTC.
-- **Schedule**: 12:00 UTC entry, 14:00 UTC close (Mon–Fri).
+- **Schedule**: 12:00 UTC entry, 16:00 UTC close (Mon–Fri).
 - **Execution**: Maker-only (post-only) with 50% bid-ask gap-narrowing
   chase, fair-value cap (mark × 1.15), 10-minute deadline.
 - **Default mode**: Demo Trading (`OKX_FLAG=1`) + `DRY_RUN=true`. Set

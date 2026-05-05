@@ -1,7 +1,7 @@
 """
 OKX 0DTE BTC Pure Straddle Algo.
 
-Single daily session: 12:00–14:00 UTC, Mon–Fri.
+Single daily session: 12:00–16:00 UTC, Mon–Fri.
 Position: 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
 Compound sizing: 80% of current equity, override default = 1 straddle.
 Maker-only orders with 50%-gap-narrow chase.
@@ -473,7 +473,7 @@ class Algo:
                 "Close", "Unhandled exception — check logs",
             )
 
-    # ──────────────────── Daily Report (15:00 UTC) ────────────────
+    # ──────────────────── Daily Report (17:00 UTC) ────────────────
 
     async def _on_report(self) -> None:
         try:
@@ -484,7 +484,7 @@ class Algo:
                 "Report", "Daily report failed — check logs",
             )
 
-    # ──────────────────── Weekly Report (Fri 16:00 UTC) ──────────
+    # ──────────────────── Weekly Report (Fri 18:00 UTC) ──────────
 
     async def _on_weekly_report(self) -> None:
         try:
