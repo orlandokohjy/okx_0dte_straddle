@@ -30,11 +30,20 @@ from utils.time_utils import now_utc
 log = structlog.get_logger(__name__)
 
 
-def _spread_pct(bid: float, ask: float) -> float:
-    if bid <= 0 or ask <= 0:
-        return 1.0
-    mid = (bid + ask) / 2.0
-    return (ask - bid) / mid if mid > 0 else 1.0
+def _spread_pct(bid: float, ask: float, mark: float = 0.0) -> float:
+    """
+    Bid-ask spread as a fraction of mid (or mark if bid is missing).
+
+    Thin demo books often have bid=0 with a valid ask. Falling back to
+    `(ask − mark) / mark` keeps the spread gate meaningful instead of
+    returning 100% and skipping every session.
+    """
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        return (ask - bid) / mid if mid > 0 else 1.0
+    if ask > 0 and mark > 0:
+        return (ask - mark) / mark
+    return 1.0
 
 
 async def build_straddle(
@@ -58,8 +67,8 @@ async def build_straddle(
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles)
 
     # ── Pre-entry spread gate ──
-    call_spread = _spread_pct(pair.call.bid, pair.call.ask)
-    put_spread = _spread_pct(pair.put.bid, pair.put.ask)
+    call_spread = _spread_pct(pair.call.bid, pair.call.ask, pair.call.mark)
+    put_spread = _spread_pct(pair.put.bid, pair.put.ask, pair.put.mark)
     if (call_spread > config.OPTION_MAX_ENTRY_SPREAD_PCT
             or put_spread > config.OPTION_MAX_ENTRY_SPREAD_PCT):
         msg = (
@@ -94,8 +103,10 @@ async def build_straddle(
         )
     else:
         # ── Leg-by-leg: PUT first, then CALL ──
+        # Use mark as starting reference if bid is missing (thin demo books).
+        put_ref = pair.put.bid if pair.put.bid > 0 else pair.put.mark
         put_result = await exchange.chase_buy(
-            pair.put.symbol, total_qty, pair.put.bid,
+            pair.put.symbol, total_qty, put_ref,
         )
         if put_result is None:
             # Skip session entirely — no naked exposure
@@ -120,8 +131,9 @@ async def build_straddle(
         )
 
         # Now buy the call. If this fails, emergency-sell the puts.
+        call_ref = pair.call.bid if pair.call.bid > 0 else pair.call.mark
         call_result = await exchange.chase_buy(
-            pair.call.symbol, total_qty, pair.call.bid,
+            pair.call.symbol, total_qty, call_ref,
         )
         if call_result is None:
             log.error("call_buy_failed_after_put",

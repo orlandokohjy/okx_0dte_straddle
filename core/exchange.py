@@ -420,18 +420,25 @@ class OKXExchange:
                 mark = ticker.last if ticker.last > 0 else ticker.ask
 
             bid, ask = ticker.bid, ticker.ask
-            if ask <= 0 or bid <= 0:
-                log.warning("chase_no_quote",
+            if ask <= 0:
+                log.warning("chase_no_ask",
                             instrument=instrument, attempt=attempt,
                             bid=bid, ask=ask)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
+            # If bid is missing (empty bid side, common on demo), seed it
+            # using mark so we can still place a maker bid below ask.
+            effective_bid = bid if bid > 0 else max(
+                mark - config.OPTION_TICK_SIZE,
+                config.OPTION_TICK_SIZE,
+            )
+
             # 50% gap-narrowing: narrow remaining gap to (ask − tick) by pct
-            target_top = max(bid, ask - config.OPTION_TICK_SIZE)
+            target_top = max(effective_bid, ask - config.OPTION_TICK_SIZE)
             new_price = last_price + (target_top - last_price) \
                 * config.OPTION_CHASE_GAP_NARROW_PCT
-            new_price = max(new_price, bid + config.OPTION_TICK_SIZE)
+            new_price = max(new_price, effective_bid + config.OPTION_TICK_SIZE)
 
             # Fair-value cap: never bid above mark × max_slippage_factor
             max_price = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
@@ -518,14 +525,27 @@ class OKXExchange:
                 mark = ticker.last if ticker.last > 0 else ticker.bid
 
             bid, ask = ticker.bid, ticker.ask
-            if ask <= 0 or bid <= 0:
+            if bid <= 0 and mark <= 0:
+                log.warning("chase_no_bid_or_mark",
+                            instrument=instrument, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            target_bot = min(ask, bid + config.OPTION_TICK_SIZE)
+            # If ask is missing (empty offer side), seed it using mark
+            # so we can still place a maker offer above bid.
+            effective_ask = ask if ask > 0 else max(
+                mark + config.OPTION_TICK_SIZE,
+                config.OPTION_TICK_SIZE * 2,
+            )
+            effective_bid = bid if bid > 0 else max(
+                mark - config.OPTION_TICK_SIZE,
+                config.OPTION_TICK_SIZE,
+            )
+
+            target_bot = min(effective_ask, effective_bid + config.OPTION_TICK_SIZE)
             new_price = last_price - (last_price - target_bot) \
                 * config.OPTION_CHASE_GAP_NARROW_PCT
-            new_price = min(new_price, ask - config.OPTION_TICK_SIZE)
+            new_price = min(new_price, effective_ask - config.OPTION_TICK_SIZE)
 
             min_price = mark / config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
             if new_price < min_price:
