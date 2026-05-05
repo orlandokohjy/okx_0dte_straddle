@@ -95,5 +95,30 @@ try:
 except Exception:
     traceback.print_exc()
 
+print("─" * 60)
+print("TEST 4 — same key against the OPPOSITE environment")
+print("─" * 60)
+opposite_flag = "0" if flag == "1" else "1"
+opposite_label = "LIVE" if opposite_flag == "0" else "DEMO"
+print(f"  Flipping flag to {opposite_flag} ({opposite_label})…")
+try:
+    from okx.Account import AccountAPI
+    a = AccountAPI(api_key, api_secret, passphrase, False,
+                   flag=opposite_flag, debug=False)
+    r = a.get_account_balance()
+    print(f"  code: {r.get('code')}, msg: {r.get('msg')!r}")
+    print()
+    if r.get("code") == "0":
+        print(f"  ⚠️  AUTH WORKS UNDER {opposite_label} MODE!")
+        print(f"  → Your key was created in {opposite_label} mode, "
+              f"not {('DEMO' if flag == '1' else 'LIVE')} as intended.")
+        print(f"  → Either flip OKX_FLAG to {opposite_flag}, or "
+              f"create a fresh key in the right environment.")
+    else:
+        print(f"  Key fails in BOTH environments — likely deleted "
+              "or never created. Recreate from scratch.")
+except Exception:
+    traceback.print_exc()
+
 print("=" * 60)
 print("Done.")
