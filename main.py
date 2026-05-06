@@ -366,6 +366,7 @@ class Algo:
         straddle = await build_straddle(
             self.exchange, self.market, self.portfolio,
             pair, sizing.num_straddles,
+            entry_spot=spot,
         )
         if straddle:
             self._consecutive_failures = 0

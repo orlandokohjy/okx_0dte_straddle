@@ -21,6 +21,7 @@ log = structlog.get_logger(__name__)
 TRADE_LOG_FIELDS = [
     "date", "entry_time", "exit_time", "exit_reason",
     "num_straddles", "strike",
+    "entry_spot", "exit_spot",
     "call_premium_entry", "call_premium_exit",
     "put_premium_entry", "put_premium_exit",
     "total_capital_used", "straddle_cost", "capital_before",
@@ -77,6 +78,11 @@ class Straddle:
     straddle_cost: float
     num_straddles: int
 
+    # Spot prices captured for context (verify strike selection, exit
+    # context). Optional — older state files may not have them.
+    entry_spot_price: float = 0.0
+    exit_spot_price: float = 0.0
+
     status: str = "open"
     exit_time: Optional[str] = None
     exit_call_price: Optional[float] = None
@@ -112,6 +118,8 @@ class Straddle:
             "entry_put_price": self.entry_put_price,
             "straddle_cost": self.straddle_cost,
             "num_straddles": self.num_straddles,
+            "entry_spot_price": self.entry_spot_price,
+            "exit_spot_price": self.exit_spot_price,
             "status": self.status,
             "exit_time": self.exit_time,
             "exit_call_price": self.exit_call_price,
@@ -230,6 +238,8 @@ class Portfolio:
             "exit_reason": exit_reason,
             "num_straddles": s.num_straddles,
             "strike": s.strike,
+            "entry_spot": s.entry_spot_price,
+            "exit_spot": s.exit_spot_price,
             "call_premium_entry": s.entry_call_price,
             "call_premium_exit": s.exit_call_price,
             "put_premium_entry": s.entry_put_price,

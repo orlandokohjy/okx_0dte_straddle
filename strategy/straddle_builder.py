@@ -52,6 +52,7 @@ async def build_straddle(
     portfolio: Portfolio,
     pair: StraddlePair,
     num_straddles: int,
+    entry_spot: float = 0.0,
 ) -> Optional[Straddle]:
     """
     Execute the entry for N identical straddle units.
@@ -161,6 +162,14 @@ async def build_straddle(
 
     # ── Register ──
     straddle_cost = config.QTY_PER_LEG * (call_fill + put_fill)
+
+    # Capture spot if caller didn't provide it (rare path).
+    if entry_spot <= 0:
+        try:
+            entry_spot = await exchange.get_spot_price()
+        except Exception:
+            entry_spot = 0.0
+
     straddle = Straddle(
         id=straddle_id,
         call_leg=call_leg,
@@ -172,11 +181,13 @@ async def build_straddle(
         entry_put_price=put_fill,
         straddle_cost=straddle_cost,
         num_straddles=num_straddles,
+        entry_spot_price=entry_spot,
     )
     portfolio.set_straddle(straddle)
     log.info("straddle_built", id=straddle_id, num=num_straddles,
              cost=f"${straddle_cost * num_straddles:,.2f}",
-             call=call_fill, put=put_fill, strike=pair.strike)
+             call=call_fill, put=put_fill, strike=pair.strike,
+             spot=entry_spot)
     return straddle
 
 
@@ -196,6 +207,14 @@ async def unwind_straddle(
         return 0.0
 
     log.info("unwinding", id=straddle.id, reason=reason)
+
+    # Capture spot at exit for context — best-effort, never blocks the unwind.
+    try:
+        exit_spot = await exchange.get_spot_price()
+    except Exception:
+        exit_spot = 0.0
+    if exit_spot > 0:
+        straddle.exit_spot_price = exit_spot
 
     rfq_result = await exchange.send_rfq_sell(
         straddle.call_leg.instrument,

@@ -50,6 +50,8 @@ class TradeRow:
     straddle_cost: float
     exit_reason: str
     total_capital_used: float = 0.0
+    entry_spot: float = 0.0
+    exit_spot: float = 0.0
     call_entry_exec: ExecutionMetrics = None
     put_entry_exec: ExecutionMetrics = None
     call_exit_exec: ExecutionMetrics = None
@@ -103,6 +105,13 @@ class DailyMetrics:
     put_premium_entry: float
     put_premium_exit: float
     total_capital_used: float
+
+    # Equity snapshots (starting = before today's trade, equity = after)
+    starting_equity: float = 0.0
+
+    # Spot price snapshots — useful for verifying strike selection
+    entry_spot: float = 0.0
+    exit_spot: float = 0.0
 
     # Execution-quality (today's trade only)
     call_entry_exec: Optional[ExecutionMetrics] = None
@@ -171,6 +180,8 @@ def _load_trades() -> list[TradeRow]:
                     straddle_cost=float(row["straddle_cost"]),
                     exit_reason=row.get("exit_reason", ""),
                     total_capital_used=float(row.get("total_capital_used", 0)),
+                    entry_spot=_f(row, "entry_spot"),
+                    exit_spot=_f(row, "exit_spot"),
                     call_entry_exec=_exec_from_row(
                         row, "call_entry", "ref_ask",
                     ),
@@ -339,6 +350,9 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         put_premium_entry=latest.put_premium_entry,
         put_premium_exit=latest.put_premium_exit,
         total_capital_used=latest.total_capital_used,
+        starting_equity=latest.capital_before,
+        entry_spot=latest.entry_spot,
+        exit_spot=latest.exit_spot,
         call_entry_exec=latest.call_entry_exec,
         put_entry_exec=latest.put_entry_exec,
         call_exit_exec=latest.call_exit_exec,
@@ -440,13 +454,27 @@ def format_telegram_report(m: DailyMetrics) -> str:
     put_btc = config.QTY_PER_LEG * m.num_straddles
     total_btc = call_btc + put_btc
 
+    strike_line = f"  Strike: ${m.strike:,.0f}"
+    if m.entry_spot > 0:
+        strike_line += f"  (spot ${m.entry_spot:,.0f}"
+        if m.exit_spot > 0:
+            strike_line += f" -> ${m.exit_spot:,.0f}"
+        strike_line += ")"
+
+    if m.starting_equity > 0:
+        equity_line = (
+            f"  Equity: ${m.starting_equity:,.2f} -> ${m.equity:,.2f}"
+        )
+    else:
+        equity_line = f"  Equity: ${m.equity:,.2f}"
+
     lines = [
         f"<b>DAILY REPORT — {m.trade_date}</b>",
         "",
         "<b>Today's Trade</b>",
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} "
         f"({pnl_sign}{m.trade_return_pct:.2%})",
-        f"  Strike: ${m.strike:,.0f}",
+        strike_line,
         f"  Call: ${m.call_premium_entry:,.2f} → "
         f"${m.call_premium_exit:,.2f}",
         f"  Put: ${m.put_premium_entry:,.2f} → ${m.put_premium_exit:,.2f}",
@@ -463,7 +491,7 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  Call premium: ${m.call_premium_entry * call_btc:,.2f}",
         f"  Put premium: ${m.put_premium_entry * put_btc:,.2f}",
         f"  <b>Total deployed: ${m.total_capital_used:,.2f}</b>",
-        f"  Equity: ${m.equity:,.2f}",
+        equity_line,
         "",
         "<b>Portfolio</b>",
         f"  Cumulative P&L: ${m.total_pnl:,.2f} "
@@ -507,17 +535,34 @@ def format_telegram_summary(m: DailyMetrics) -> str:
     put_btc = config.QTY_PER_LEG * m.num_straddles
     total_btc = call_btc + put_btc
 
+    # Strike line shows spot at entry (and exit, if captured) so the
+    # reader can immediately verify the strike was ITM / picked sanely.
+    strike_line = f"  Strike: ${m.strike:,.0f}"
+    if m.entry_spot > 0:
+        strike_line += f"  (spot ${m.entry_spot:,.0f}"
+        if m.exit_spot > 0:
+            strike_line += f" -> ${m.exit_spot:,.0f}"
+        strike_line += ")"
+
+    # Equity line shows starting and ending side by side.
+    if m.starting_equity > 0:
+        equity_line = (
+            f"  Equity: ${m.starting_equity:,.2f} -> ${m.equity:,.2f}"
+        )
+    else:
+        equity_line = f"  Equity: ${m.equity:,.2f}"
+
     lines = [
         f"<b>TRADE SUMMARY — {m.trade_date}</b>",
         "",
         "<b>Today's Trade</b>",
         f"  P&L: {pnl_sign}${m.trade_pnl:,.2f} "
         f"({pnl_sign}{m.trade_return_pct:.2%})",
-        f"  Strike: ${m.strike:,.0f}",
+        strike_line,
         f"  Call: ${m.call_premium_entry:,.2f} → "
         f"${m.call_premium_exit:,.2f}",
         f"  Put: ${m.put_premium_entry:,.2f} → ${m.put_premium_exit:,.2f}",
-        f"  Equity: ${m.equity:,.2f}",
+        equity_line,
         "",
         "<b>Volume</b>",
         f"  Straddles: {m.num_straddles}",
@@ -657,6 +702,9 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
         put_premium_entry=latest.put_premium_entry,
         put_premium_exit=latest.put_premium_exit,
         total_capital_used=sum(t.total_capital_used for t in trades),
+        starting_equity=trades[0].capital_before if trades else 0.0,
+        entry_spot=latest.entry_spot,
+        exit_spot=latest.exit_spot,
     )
 
 
