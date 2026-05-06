@@ -25,6 +25,17 @@ RISK_FREE_RATE = 0.0
 
 
 @dataclass
+class ExecutionMetrics:
+    """Per-leg fill quality for one trade."""
+    duration_sec: float = 0.0
+    attempts: int = 0
+    ref_mark: float = 0.0
+    ref_quote: float = 0.0   # ask for entries, bid for exits
+    slippage_vs_mark_pct: float = 0.0
+    saved_vs_taker_usd: float = 0.0
+
+
+@dataclass
 class TradeRow:
     date: str
     net_pnl: float
@@ -39,6 +50,10 @@ class TradeRow:
     straddle_cost: float
     exit_reason: str
     total_capital_used: float = 0.0
+    call_entry_exec: ExecutionMetrics = None
+    put_entry_exec: ExecutionMetrics = None
+    call_exit_exec: ExecutionMetrics = None
+    put_exit_exec: ExecutionMetrics = None
 
 
 @dataclass
@@ -89,6 +104,49 @@ class DailyMetrics:
     put_premium_exit: float
     total_capital_used: float
 
+    # Execution-quality (today's trade only)
+    call_entry_exec: Optional[ExecutionMetrics] = None
+    put_entry_exec: Optional[ExecutionMetrics] = None
+    call_exit_exec: Optional[ExecutionMetrics] = None
+    put_exit_exec: Optional[ExecutionMetrics] = None
+    call_instrument: str = ""
+    put_instrument: str = ""
+
+
+def _f(row: dict, key: str, default: float = 0.0) -> float:
+    """Best-effort float parse — returns default if blank or invalid."""
+    raw = row.get(key, "")
+    if raw == "" or raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _i(row: dict, key: str, default: int = 0) -> int:
+    raw = row.get(key, "")
+    if raw == "" or raw is None:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def _exec_from_row(
+    row: dict, prefix: str, quote_key: str,
+) -> ExecutionMetrics:
+    """Extract one leg/side's execution metrics from a CSV row."""
+    return ExecutionMetrics(
+        duration_sec=_f(row, f"{prefix}_duration_sec"),
+        attempts=_i(row, f"{prefix}_attempts"),
+        ref_mark=_f(row, f"{prefix}_ref_mark"),
+        ref_quote=_f(row, f"{prefix}_{quote_key}"),
+        slippage_vs_mark_pct=_f(row, f"{prefix}_slippage_vs_mark_pct"),
+        saved_vs_taker_usd=_f(row, f"{prefix}_saved_vs_taker_usd"),
+    )
+
 
 def _load_trades() -> list[TradeRow]:
     path = config.TRADE_LOG_FILE
@@ -113,6 +171,18 @@ def _load_trades() -> list[TradeRow]:
                     straddle_cost=float(row["straddle_cost"]),
                     exit_reason=row.get("exit_reason", ""),
                     total_capital_used=float(row.get("total_capital_used", 0)),
+                    call_entry_exec=_exec_from_row(
+                        row, "call_entry", "ref_ask",
+                    ),
+                    put_entry_exec=_exec_from_row(
+                        row, "put_entry", "ref_ask",
+                    ),
+                    call_exit_exec=_exec_from_row(
+                        row, "call_exit", "ref_bid",
+                    ),
+                    put_exit_exec=_exec_from_row(
+                        row, "put_exit", "ref_bid",
+                    ),
                 ))
             except (ValueError, KeyError):
                 continue
@@ -269,7 +339,91 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         put_premium_entry=latest.put_premium_entry,
         put_premium_exit=latest.put_premium_exit,
         total_capital_used=latest.total_capital_used,
+        call_entry_exec=latest.call_entry_exec,
+        put_entry_exec=latest.put_entry_exec,
+        call_exit_exec=latest.call_exit_exec,
+        put_exit_exec=latest.put_exit_exec,
     )
+
+
+def _format_exec_block(
+    leg: str, side: str,
+    entry_price: float, exit_price: float,
+    e: Optional[ExecutionMetrics],
+) -> list[str]:
+    """Format one leg+side execution block. Returns empty if no metrics."""
+    if e is None or e.duration_sec <= 0:
+        return []
+    fill = exit_price if side == "exit" else entry_price
+    quote_label = "Ask" if side == "entry" else "Bid"
+    return [
+        f"  {leg.upper()} ({side})",
+        f"    Time to fill: {e.duration_sec:.1f}s, {e.attempts} attempt(s)",
+        f"    Mark at start: ${e.ref_mark:,.2f} -> Fill: ${fill:,.2f}",
+        f"    Slippage vs mark: {e.slippage_vs_mark_pct:+.2f}%",
+        f"    {quote_label} at start: ${e.ref_quote:,.2f}  "
+        f"Saved vs taker: ${e.saved_vs_taker_usd:+,.2f}",
+    ]
+
+
+def _format_execution_quality(m: DailyMetrics) -> list[str]:
+    """Build the execution-quality section for the daily report."""
+    blocks: list[str] = []
+
+    entry_blocks = []
+    entry_blocks += _format_exec_block(
+        "put", "entry",
+        m.put_premium_entry, m.put_premium_entry, m.put_entry_exec,
+    )
+    entry_blocks += _format_exec_block(
+        "call", "entry",
+        m.call_premium_entry, m.call_premium_entry, m.call_entry_exec,
+    )
+    if entry_blocks:
+        blocks.append("<b>Entry execution</b>")
+        blocks += entry_blocks
+
+    exit_blocks = []
+    exit_blocks += _format_exec_block(
+        "call", "exit",
+        m.call_premium_exit, m.call_premium_exit, m.call_exit_exec,
+    )
+    exit_blocks += _format_exec_block(
+        "put", "exit",
+        m.put_premium_exit, m.put_premium_exit, m.put_exit_exec,
+    )
+    if exit_blocks:
+        if blocks:
+            blocks.append("")
+        blocks.append("<b>Exit execution</b>")
+        blocks += exit_blocks
+
+    if not blocks:
+        return []
+
+    # Aggregate summary
+    legs = [
+        m.call_entry_exec, m.put_entry_exec,
+        m.call_exit_exec, m.put_exit_exec,
+    ]
+    legs = [x for x in legs if x and x.duration_sec > 0]
+    if legs:
+        total_saved = sum(x.saved_vs_taker_usd for x in legs)
+        total_attempts = sum(x.attempts for x in legs)
+        avg_dur = sum(x.duration_sec for x in legs) / len(legs)
+        avg_slip = sum(x.slippage_vs_mark_pct for x in legs) / len(legs)
+        blocks.append("")
+        blocks.append("<b>Execution summary</b>")
+        blocks.append(
+            f"  Avg time to fill: {avg_dur:.1f}s "
+            f"({total_attempts} total attempts across {len(legs)} legs)"
+        )
+        blocks.append(f"  Avg slippage vs mark: {avg_slip:+.2f}%")
+        blocks.append(
+            f"  Total saved vs taker: ${total_saved:+,.2f}"
+        )
+
+    return blocks
 
 
 def format_telegram_report(m: DailyMetrics) -> str:
@@ -336,6 +490,12 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  Expectancy: ${m.expectancy:,.2f}/trade",
         f"  Expectancy ratio: {m.expectancy_ratio:.2f}",
     ]
+
+    exec_lines = _format_execution_quality(m)
+    if exec_lines:
+        lines.append("")
+        lines.extend(exec_lines)
+
     return "\n".join(lines)
 
 
@@ -367,6 +527,12 @@ def format_telegram_summary(m: DailyMetrics) -> str:
         f"{put_btc:.1f} BTC",
         f"  Total: {total_btc:.1f} BTC",
     ]
+
+    exec_lines = _format_execution_quality(m)
+    if exec_lines:
+        lines.append("")
+        lines.extend(exec_lines)
+
     return "\n".join(lines)
 
 

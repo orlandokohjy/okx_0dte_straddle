@@ -128,6 +128,7 @@ async def build_straddle(
             qty=total_qty, entry_price=put_fill,
             order_id=put_result.get("order_id", ""),
             avg_fill_price=put_fill,
+            entry_metrics=put_result.get("metrics", {}),
         )
 
         # Now buy the call. If this fails, emergency-sell the puts.
@@ -155,6 +156,7 @@ async def build_straddle(
             qty=total_qty, entry_price=call_fill,
             order_id=call_result.get("order_id", ""),
             avg_fill_price=call_fill,
+            entry_metrics=call_result.get("metrics", {}),
         )
 
     # ── Register ──
@@ -221,6 +223,7 @@ async def unwind_straddle(
                 exit_call_price = float(
                     result.get("average_price", call_ask),
                 )
+                straddle.call_leg.exit_metrics = result.get("metrics", {})
                 log.info("call_sold", price=exit_call_price)
             else:
                 log.warning("call_sell_failed",
@@ -239,6 +242,7 @@ async def unwind_straddle(
                 exit_put_price = float(
                     result.get("average_price", put_ask),
                 )
+                straddle.put_leg.exit_metrics = result.get("metrics", {})
                 log.info("put_sold", price=exit_put_price)
             else:
                 log.warning("put_sell_failed",

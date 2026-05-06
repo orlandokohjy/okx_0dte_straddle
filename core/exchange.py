@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import structlog
@@ -28,6 +29,77 @@ import structlog
 import config
 
 log = structlog.get_logger(__name__)
+
+
+def _utc_iso(t_unix: float) -> str:
+    """Convert a unix timestamp to a UTC ISO8601 string."""
+    return datetime.fromtimestamp(t_unix, tz=timezone.utc).isoformat()
+
+
+def _build_fill_metrics(
+    *,
+    side: str,
+    instrument: str,
+    qty_btc: float,
+    fill_price: float,
+    t_started: float,
+    t_filled: float,
+    attempts: int,
+    ref_bid: float,
+    ref_ask: float,
+    ref_mark: float,
+) -> dict:
+    """
+    Build the fill-quality metrics dict that flows from chase_buy/sell
+    back to the straddle builder/exit manager and ultimately into the
+    daily report.
+
+    Slippage is positive when we paid more than mark (buys) or
+    received less than mark (sells) — i.e. execution worse than fair
+    value. Negative = better than fair value.
+    """
+    duration = max(0.0, t_filled - t_started)
+    ref_mid = (ref_bid + ref_ask) / 2 if ref_bid > 0 and ref_ask > 0 else 0.0
+
+    if side.lower() in ("buy", "b"):
+        slip_mark = ((fill_price - ref_mark) / ref_mark
+                     if ref_mark > 0 else 0.0)
+        slip_mid = ((fill_price - ref_mid) / ref_mid
+                    if ref_mid > 0 else 0.0)
+        # As a maker buy, the taker alternative was paying the ask.
+        taker_price = ref_ask
+        saved_per_btc = (ref_ask - fill_price) if ref_ask > 0 else 0.0
+        saved_pct = (saved_per_btc / ref_ask) if ref_ask > 0 else 0.0
+    else:  # sell
+        slip_mark = ((ref_mark - fill_price) / ref_mark
+                     if ref_mark > 0 else 0.0)
+        slip_mid = ((ref_mid - fill_price) / ref_mid
+                    if ref_mid > 0 else 0.0)
+        # As a maker sell, the taker alternative was hitting the bid.
+        taker_price = ref_bid
+        saved_per_btc = (fill_price - ref_bid) if ref_bid > 0 else 0.0
+        saved_pct = (saved_per_btc / ref_bid) if ref_bid > 0 else 0.0
+
+    return {
+        "instrument": instrument,
+        "side": side,
+        "qty_btc": qty_btc,
+        "t_started_iso": _utc_iso(t_started),
+        "t_filled_iso": _utc_iso(t_filled),
+        "duration_sec": round(duration, 2),
+        "attempts": attempts,
+        "ref_bid": round(ref_bid, 4),
+        "ref_ask": round(ref_ask, 4),
+        "ref_mid": round(ref_mid, 4),
+        "ref_mark": round(ref_mark, 4),
+        "fill_price": round(fill_price, 4),
+        "slippage_vs_mark_pct": round(slip_mark * 100, 4),
+        "slippage_vs_mid_pct": round(slip_mid * 100, 4),
+        "taker_price_at_start": round(taker_price, 4),
+        "saved_vs_taker_per_btc_usd": round(saved_per_btc, 4),
+        "saved_vs_taker_pct": round(saved_pct * 100, 4),
+        "saved_vs_taker_total_usd": round(saved_per_btc * qty_btc, 2),
+    }
 
 
 # ─────────────────────────── Data classes ────────────────────────────
@@ -406,11 +478,21 @@ class OKXExchange:
         OPTION_CHASE_GAP_NARROW_PCT each retry, never crossing past
         mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails on deadline.
 
-        Returns dict with average_price + order_id on full fill, else None.
+        Returns dict with average_price + order_id + metrics on full fill,
+        else None. The `metrics` dict captures execution-quality data:
+            t_started_iso, t_filled_iso, duration_sec, attempts,
+            ref_bid, ref_ask, ref_mark, ref_mid,
+            fill_price, qty_btc, side, instrument,
+            slippage_vs_mark_pct, slippage_vs_mid_pct,
+            taker_price_at_start (the ask), saved_vs_taker_pct,
+            saved_vs_taker_per_btc_usd  (premium quoted per BTC)
         """
         deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
         attempt = 0
         last_price = max(0.0, initial_bid)
+        t_started = time.time()
+        ref_bid = ref_ask = ref_mark = 0.0
+        captured_ref = False
 
         while time.time() < deadline:
             attempt += 1
@@ -426,6 +508,12 @@ class OKXExchange:
                             bid=bid, ask=ask)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
+
+            # Capture the very first usable market state — this is the
+            # "decision-time" reference for slippage and savings metrics.
+            if not captured_ref:
+                ref_bid, ref_ask, ref_mark = bid, ask, mark
+                captured_ref = True
 
             # If bid is missing (empty bid side, common on demo), seed it
             # using mark so we can still place a maker bid below ask.
@@ -484,12 +572,27 @@ class OKXExchange:
             state = status.get("state", "")
             if state == "filled":
                 avg_px = self._f(status, "avgPx", default=new_price)
+                t_filled = time.time()
+                metrics = _build_fill_metrics(
+                    side="buy",
+                    instrument=instrument,
+                    qty_btc=qty_btc,
+                    fill_price=avg_px,
+                    t_started=t_started,
+                    t_filled=t_filled,
+                    attempts=attempt,
+                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+                )
                 log.info("chase_buy_filled",
-                         instrument=instrument, avg=avg_px, attempt=attempt)
+                         instrument=instrument, avg=avg_px, attempt=attempt,
+                         duration_sec=metrics["duration_sec"],
+                         slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                         saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
                 return {
                     "average_price": avg_px,
                     "order_id": ord_id,
                     "avgPrice": avg_px,
+                    "metrics": metrics,
                 }
             # Cancel the resting order before placing the next one
             try:
@@ -516,6 +619,9 @@ class OKXExchange:
         deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
         attempt = 0
         last_price = max(0.0, initial_ask)
+        t_started = time.time()
+        ref_bid = ref_ask = ref_mark = 0.0
+        captured_ref = False
 
         while time.time() < deadline:
             attempt += 1
@@ -530,6 +636,11 @@ class OKXExchange:
                             instrument=instrument, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
+
+            # Capture decision-time market state for slippage metrics.
+            if not captured_ref:
+                ref_bid, ref_ask, ref_mark = bid, ask, mark
+                captured_ref = True
 
             # If ask is missing (empty offer side), seed it using mark
             # so we can still place a maker offer above bid.
@@ -588,12 +699,27 @@ class OKXExchange:
             state = status.get("state", "")
             if state == "filled":
                 avg_px = self._f(status, "avgPx", default=new_price)
+                t_filled = time.time()
+                metrics = _build_fill_metrics(
+                    side="sell",
+                    instrument=instrument,
+                    qty_btc=qty_btc,
+                    fill_price=avg_px,
+                    t_started=t_started,
+                    t_filled=t_filled,
+                    attempts=attempt,
+                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+                )
                 log.info("chase_sell_filled",
-                         instrument=instrument, avg=avg_px, attempt=attempt)
+                         instrument=instrument, avg=avg_px, attempt=attempt,
+                         duration_sec=metrics["duration_sec"],
+                         slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                         saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
                 return {
                     "average_price": avg_px,
                     "order_id": ord_id,
                     "avgPrice": avg_px,
+                    "metrics": metrics,
                 }
             try:
                 await self._call(

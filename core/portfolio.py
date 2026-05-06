@@ -8,7 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 import structlog
@@ -26,6 +26,24 @@ TRADE_LOG_FIELDS = [
     "total_capital_used", "straddle_cost", "capital_before",
     "call_pnl", "put_pnl", "gross_pnl", "fees", "net_pnl",
     "capital_after",
+    # Execution-quality metrics — entry
+    "call_entry_duration_sec", "call_entry_attempts",
+    "call_entry_ref_mark", "call_entry_ref_ask",
+    "call_entry_slippage_vs_mark_pct",
+    "call_entry_saved_vs_taker_usd",
+    "put_entry_duration_sec", "put_entry_attempts",
+    "put_entry_ref_mark", "put_entry_ref_ask",
+    "put_entry_slippage_vs_mark_pct",
+    "put_entry_saved_vs_taker_usd",
+    # Execution-quality metrics — exit
+    "call_exit_duration_sec", "call_exit_attempts",
+    "call_exit_ref_mark", "call_exit_ref_bid",
+    "call_exit_slippage_vs_mark_pct",
+    "call_exit_saved_vs_taker_usd",
+    "put_exit_duration_sec", "put_exit_attempts",
+    "put_exit_ref_mark", "put_exit_ref_bid",
+    "put_exit_slippage_vs_mark_pct",
+    "put_exit_saved_vs_taker_usd",
 ]
 
 
@@ -37,6 +55,10 @@ class StraddleLeg:
     entry_price: float
     order_id: str = ""
     avg_fill_price: float = 0.0
+    # Execution-quality metrics, captured at fill time. See
+    # core.exchange.chase_buy / chase_sell for the keys produced.
+    entry_metrics: dict = field(default_factory=dict)
+    exit_metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -196,6 +218,11 @@ class Portfolio:
         os.makedirs(config.STATE_DIR, exist_ok=True)
         total_capital_used = s.straddle_cost * s.num_straddles
 
+        ce = s.call_leg.entry_metrics or {}
+        cx = s.call_leg.exit_metrics or {}
+        pe = s.put_leg.entry_metrics or {}
+        px = s.put_leg.exit_metrics or {}
+
         row = {
             "date": s.entry_time[:10],
             "entry_time": s.entry_time,
@@ -216,6 +243,32 @@ class Portfolio:
             "fees": 0.0,
             "net_pnl": s.pnl,
             "capital_after": self._equity,
+            # Entry execution metrics
+            "call_entry_duration_sec": ce.get("duration_sec", ""),
+            "call_entry_attempts": ce.get("attempts", ""),
+            "call_entry_ref_mark": ce.get("ref_mark", ""),
+            "call_entry_ref_ask": ce.get("ref_ask", ""),
+            "call_entry_slippage_vs_mark_pct": ce.get("slippage_vs_mark_pct", ""),
+            "call_entry_saved_vs_taker_usd": ce.get("saved_vs_taker_total_usd", ""),
+            "put_entry_duration_sec": pe.get("duration_sec", ""),
+            "put_entry_attempts": pe.get("attempts", ""),
+            "put_entry_ref_mark": pe.get("ref_mark", ""),
+            "put_entry_ref_ask": pe.get("ref_ask", ""),
+            "put_entry_slippage_vs_mark_pct": pe.get("slippage_vs_mark_pct", ""),
+            "put_entry_saved_vs_taker_usd": pe.get("saved_vs_taker_total_usd", ""),
+            # Exit execution metrics
+            "call_exit_duration_sec": cx.get("duration_sec", ""),
+            "call_exit_attempts": cx.get("attempts", ""),
+            "call_exit_ref_mark": cx.get("ref_mark", ""),
+            "call_exit_ref_bid": cx.get("ref_bid", ""),
+            "call_exit_slippage_vs_mark_pct": cx.get("slippage_vs_mark_pct", ""),
+            "call_exit_saved_vs_taker_usd": cx.get("saved_vs_taker_total_usd", ""),
+            "put_exit_duration_sec": px.get("duration_sec", ""),
+            "put_exit_attempts": px.get("attempts", ""),
+            "put_exit_ref_mark": px.get("ref_mark", ""),
+            "put_exit_ref_bid": px.get("ref_bid", ""),
+            "put_exit_slippage_vs_mark_pct": px.get("slippage_vs_mark_pct", ""),
+            "put_exit_saved_vs_taker_usd": px.get("saved_vs_taker_total_usd", ""),
         }
 
         needs_header = not os.path.exists(config.TRADE_LOG_FILE)
