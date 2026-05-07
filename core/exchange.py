@@ -779,8 +779,10 @@ class OKXExchange:
                           instrument=instrument, sCode=sCode, sMsg=sMsg,
                           attempt=attempt,
                           hint="check OKX_TD_MODE / account margin mode / balance")
-                return {"avg_price": 0.0, "fee_rate": 0.0, "metrics": {},
-                        "fatal_sCode": sCode, "fatal_sMsg": sMsg}
+                # Return None so straddle_builder treats this as a real
+                # failure and skips the session — NEVER fall through with
+                # a placeholder price (would create a phantom position).
+                return None
 
             if not ord_id or sCode not in ("0", ""):
                 log.warning("chase_buy_order_rejected",
@@ -935,8 +937,8 @@ class OKXExchange:
                 log.error("chase_sell_fatal_reject",
                           instrument=instrument, sCode=sCode, sMsg=sMsg,
                           attempt=attempt)
-                return {"avg_price": 0.0, "fee_rate": 0.0, "metrics": {},
-                        "fatal_sCode": sCode, "fatal_sMsg": sMsg}
+                # Return None — caller (unwind logic) will retry / alert.
+                return None
 
             if not ord_id or sCode not in ("0", ""):
                 log.warning("chase_sell_order_rejected",
