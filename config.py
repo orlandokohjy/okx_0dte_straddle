@@ -54,11 +54,12 @@ OKX_CONTRACT_SIZE_BTC: float = float(os.getenv("OKX_CONTRACT_SIZE_BTC", "0.01"))
 # Trading mode for OKX OPTION orders.
 # OKX rejects `cash` for OPTION instType (cash is spot only), so this MUST
 # be one of:
-#   "cross"     — Cross-margin (default; uses unified margin pool)
-#   "isolated"  — Isolated-margin per position
-# Long-only buys still work in either mode; cross is recommended for
-# simplicity and shared collateral.
-OKX_TD_MODE: str = os.getenv("OKX_TD_MODE", "cross")
+#   "isolated" — Isolated-margin per position (REQUIRED for long-only buys)
+#   "cross"    — Cross-margin (only valid for SHORT options / selling premium;
+#                returns sCode 51019 for long buys: "No net long positions
+#                can be held under cross margin mode in options").
+# This algo is long-only (long call + long put), so default is `isolated`.
+OKX_TD_MODE: str = os.getenv("OKX_TD_MODE", "isolated")
 
 INITIAL_CAPITAL_USD: float = float(os.getenv("INITIAL_CAPITAL_USD", "8000.0"))
 ALLOC_PCT: float = 0.80

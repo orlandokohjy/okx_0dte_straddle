@@ -769,6 +769,7 @@ class OKXExchange:
                 "51001",   # Instrument doesn't exist
                 "51010",   # tdMode/instType incompatible
                 "51016",   # Insufficient balance
+                "51019",   # Net long not allowed under cross margin (use isolated)
                 "51020",   # Account in restricted mode
                 "51115",   # Margin mode not enabled / account-mode wrong
                 "51121",   # Position direction restriction
@@ -931,7 +932,7 @@ class OKXExchange:
                 continue
 
             FATAL_CODES = {
-                "51000", "51001", "51010", "51016", "51020",
+                "51000", "51001", "51010", "51016", "51019", "51020",
                 "51115", "51121", "51169", "51198",
             }
             if sCode in FATAL_CODES:
