@@ -590,23 +590,40 @@ class OKXExchange:
         sz = self._qty_to_contracts(qty_btc)
         ord_type = "post_only" if post_only else "limit"
 
+        # OKX OPTIONS only accept tdMode in {"cross", "isolated"}.
+        # `cash` is for SPOT trading. Using cash here previously caused
+        # the API to reject every order with the wrapper error
+        # `code=1 / msg="All operations failed"`.
+        td_mode = config.OKX_TD_MODE  # "cross" or "isolated"
+
         resp = await self._call(
             self._trade.place_order,
             instId=instrument,
-            tdMode="cash",          # plain options buy/sell, no margin
+            tdMode=td_mode,
             side=side,
             ordType=ord_type,
             sz=sz,
             px=str(price),
         )
 
-        rows = self._data_or_empty(resp)
+        # OKX returns code=1 / msg="All operations failed" as a wrapper
+        # whenever ANY leg fails, with the real reason in data[0].sCode /
+        # data[0].sMsg. We must read the inner row regardless of the
+        # outer code so the chase loop can react correctly.
+        outer_code = str(resp.get("code") or "")
+        outer_msg = resp.get("msg") or ""
+        rows = (resp.get("data") or []) if isinstance(resp, dict) else []
         if not rows:
-            return {"sCode": resp.get("code"), "sMsg": resp.get("msg")}
+            log.warning("order_no_data",
+                        instrument=instrument, side=side,
+                        outer_code=outer_code, outer_msg=outer_msg)
+            return {"sCode": outer_code or "no_data", "sMsg": outer_msg}
         r = rows[0]
         log.info("order_placed",
                  instrument=instrument, side=side, qty_btc=qty_btc,
                  sz=sz, price=price, post_only=post_only,
+                 td_mode=td_mode,
+                 outer_code=outer_code, outer_msg=outer_msg,
                  ord_id=r.get("ordId"), sCode=r.get("sCode"),
                  sMsg=r.get("sMsg"))
         return r
@@ -736,18 +753,39 @@ class OKXExchange:
             )
             ord_id = order.get("ordId")
             sCode = str(order.get("sCode") or "")
+            sMsg = str(order.get("sMsg") or "")
 
             # Post-only rejected (would cross) → narrow more next loop
-            if sCode == "51008" or "post_only" in str(order.get("sMsg", "")).lower():
+            if sCode == "51008" or "post_only" in sMsg.lower():
                 log.info("chase_buy_post_only_rejected",
                          instrument=instrument, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
+            # Structural / config errors: bail immediately, don't burn
+            # API rate-limit retrying something that will never succeed.
+            FATAL_CODES = {
+                "51000",   # Parameter error
+                "51001",   # Instrument doesn't exist
+                "51010",   # tdMode/instType incompatible
+                "51016",   # Insufficient balance
+                "51020",   # Account in restricted mode
+                "51115",   # Margin mode not enabled / account-mode wrong
+                "51121",   # Position direction restriction
+                "51169",   # Pricing limit
+            }
+            if sCode in FATAL_CODES:
+                log.error("chase_buy_fatal_reject",
+                          instrument=instrument, sCode=sCode, sMsg=sMsg,
+                          attempt=attempt,
+                          hint="check OKX_TD_MODE / account margin mode / balance")
+                return {"avg_price": 0.0, "fee_rate": 0.0, "metrics": {},
+                        "fatal_sCode": sCode, "fatal_sMsg": sMsg}
+
             if not ord_id or sCode not in ("0", ""):
                 log.warning("chase_buy_order_rejected",
-                            instrument=instrument, sCode=sCode,
-                            sMsg=order.get("sMsg"))
+                            instrument=instrument, sCode=sCode, sMsg=sMsg,
+                            attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
@@ -881,17 +919,29 @@ class OKXExchange:
             )
             ord_id = order.get("ordId")
             sCode = str(order.get("sCode") or "")
+            sMsg = str(order.get("sMsg") or "")
 
-            if sCode == "51008" or "post_only" in str(order.get("sMsg", "")).lower():
+            if sCode == "51008" or "post_only" in sMsg.lower():
                 log.info("chase_sell_post_only_rejected",
                          instrument=instrument, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
+            FATAL_CODES = {
+                "51000", "51001", "51010", "51016", "51020",
+                "51115", "51121", "51169",
+            }
+            if sCode in FATAL_CODES:
+                log.error("chase_sell_fatal_reject",
+                          instrument=instrument, sCode=sCode, sMsg=sMsg,
+                          attempt=attempt)
+                return {"avg_price": 0.0, "fee_rate": 0.0, "metrics": {},
+                        "fatal_sCode": sCode, "fatal_sMsg": sMsg}
+
             if not ord_id or sCode not in ("0", ""):
                 log.warning("chase_sell_order_rejected",
-                            instrument=instrument, sCode=sCode,
-                            sMsg=order.get("sMsg"))
+                            instrument=instrument, sCode=sCode, sMsg=sMsg,
+                            attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
@@ -970,9 +1020,9 @@ class OKXExchange:
             return None
 
         legs = [
-            {"instId": call_inst, "tdMode": "cash", "sz": str(sz),
+            {"instId": call_inst, "tdMode": config.OKX_TD_MODE, "sz": str(sz),
              "side": direction},
-            {"instId": put_inst, "tdMode": "cash", "sz": str(sz),
+            {"instId": put_inst, "tdMode": config.OKX_TD_MODE, "sz": str(sz),
              "side": direction},
         ]
 

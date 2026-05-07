@@ -51,6 +51,15 @@ QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "0.5"))
 # uses a different contract size.
 OKX_CONTRACT_SIZE_BTC: float = float(os.getenv("OKX_CONTRACT_SIZE_BTC", "0.01"))
 
+# Trading mode for OKX OPTION orders.
+# OKX rejects `cash` for OPTION instType (cash is spot only), so this MUST
+# be one of:
+#   "cross"     — Cross-margin (default; uses unified margin pool)
+#   "isolated"  — Isolated-margin per position
+# Long-only buys still work in either mode; cross is recommended for
+# simplicity and shared collateral.
+OKX_TD_MODE: str = os.getenv("OKX_TD_MODE", "cross")
+
 INITIAL_CAPITAL_USD: float = float(os.getenv("INITIAL_CAPITAL_USD", "8000.0"))
 ALLOC_PCT: float = 0.80
 NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))
