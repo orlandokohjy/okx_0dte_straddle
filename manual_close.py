@@ -124,8 +124,17 @@ async def _close_one_position(
         return False, None
 
     avg_px = result.get("average_price", 0.0)
+    fully = result.get("fully_filled", True)
+    filled_btc = result.get("filled_qty_btc", qty_btc)
+    if not fully:
+        log.warning("manual_close_chase_partial",
+                    instrument=inst, fill_price=avg_px,
+                    filled_qty_btc=filled_btc, target_qty_btc=qty_btc,
+                    residual_btc=qty_btc - filled_btc)
+        return False, result
     log.info("manual_close_chase_filled",
-             instrument=inst, fill_price=avg_px)
+             instrument=inst, fill_price=avg_px,
+             filled_qty_btc=filled_btc)
     return True, result
 
 

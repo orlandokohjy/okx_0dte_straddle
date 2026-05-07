@@ -765,6 +765,97 @@ class OKXExchange:
             await asyncio.sleep(1.0)
         return last
 
+    async def _reconcile_after_wait(
+        self,
+        instrument: str,
+        ord_id: str,
+        wait_status: dict,
+        fallback_price: float,
+        *,
+        side: str,
+        attempt: int,
+    ) -> tuple[int, float, str]:
+        """Cancel the order and reconcile the final fill state.
+
+        Returns (filled_contracts_this_iter, avg_px, order_state). The
+        order_state is one of:
+          • "filled" / "canceled" / "cancelled"   — terminal (safe to proceed)
+          • "still_live_after_retries"            — caller MUST abort the
+              chase to avoid stacking duplicate orders on top of a live one.
+
+        Strategy:
+          1. Try to cancel.
+          2. Read final order state (max accFillSz across wait + final reads).
+          3. If state still "live" (cancel didn't propagate), retry cancel
+             + read up to 3 times with 250ms backoff. Only then give up.
+        """
+        if not ord_id:
+            return 0, fallback_price, ""
+
+        async def _try_cancel() -> None:
+            try:
+                await self._call(
+                    self._trade.cancel_order,
+                    instId=instrument, ordId=ord_id,
+                )
+            except Exception:
+                log.warning(f"chase_{side}_cancel_failed",
+                            instrument=instrument, ord_id=ord_id,
+                            attempt=attempt, exc_info=True)
+
+        await _try_cancel()
+
+        wait_acc = self._f(wait_status, "accFillSz") if wait_status else 0.0
+        final_acc = 0.0
+        final_best: dict = {}
+        order_state = (wait_status or {}).get("state", "")
+
+        for retry in range(3):
+            final: dict = {}
+            try:
+                final = await self.get_order_status(instrument, ord_id)
+            except Exception:
+                log.warning(f"chase_{side}_final_status_read_failed",
+                            instrument=instrument, ord_id=ord_id,
+                            attempt=attempt, retry=retry, exc_info=True)
+                final = {}
+            f_acc = self._f(final, "accFillSz") if final else 0.0
+            if f_acc > final_acc:
+                final_acc = f_acc
+                final_best = final
+            f_state = (final or {}).get("state", "")
+            if f_state:
+                order_state = f_state
+            if f_state in ("filled", "canceled", "cancelled") or not f_state:
+                # Terminal or empty (order vanished — also safe to proceed).
+                break
+            # Order still live → retry cancel and re-read briefly.
+            await asyncio.sleep(0.25)
+            await _try_cancel()
+
+        if order_state in ("live", "partially_filled"):
+            log.error(
+                f"chase_{side}_order_still_live_after_3_retries",
+                instrument=instrument, ord_id=ord_id, attempt=attempt,
+                state=order_state, wait_acc=wait_acc, final_acc=final_acc,
+                hint="aborting chase to avoid duplicate-order stacking",
+            )
+            order_state = "still_live_after_retries"
+
+        # Pick the source whose accFillSz matches the larger reading so the
+        # avgPx we read aligns with the contracts we credit. If they're tied
+        # we prefer `final_best` (more recent read).
+        if final_acc >= wait_acc:
+            best, best_acc = final_best, final_acc
+        else:
+            best, best_acc = wait_status or {}, wait_acc
+
+        filled_this = int(best_acc)
+        avg_px = self._f(best, "avgPx", default=fallback_price)
+        if avg_px <= 0:
+            avg_px = fallback_price
+        return filled_this, avg_px, order_state
+
     # ──────────────────── Maker-only chase (BUY) ──────────────────
 
     async def chase_buy(
@@ -927,26 +1018,14 @@ class OKXExchange:
                 continue
 
             # Wait then cancel + reconcile final accFillSz
-            await self._wait_for_fill(
+            wait_status = await self._wait_for_fill(
                 instrument, ord_id, config.OPTION_CHASE_INTERVAL_SEC,
             )
-            try:
-                await self._call(
-                    self._trade.cancel_order,
-                    instId=instrument, ordId=ord_id,
+            filled_this, avg_px_this, order_state = \
+                await self._reconcile_after_wait(
+                    instrument, ord_id, wait_status, new_price,
+                    side="buy", attempt=attempt,
                 )
-            except Exception:
-                pass
-
-            # Authoritative post-cancel read — captures fills that landed
-            # before the cancel + clean partials.
-            try:
-                final = await self.get_order_status(instrument, ord_id)
-            except Exception:
-                final = {}
-            filled_this = int(self._f(final, "accFillSz"))
-            avg_px_this = self._f(final, "avgPx", default=new_price)
-
             if filled_this > 0:
                 filled_contracts += filled_this
                 weighted_value += filled_this * avg_px_this
@@ -956,7 +1035,16 @@ class OKXExchange:
                          total_filled=filled_contracts,
                          remaining=target_contracts - filled_contracts,
                          vwap=weighted_value / filled_contracts,
-                         px_this=avg_px_this)
+                         px_this=avg_px_this,
+                         state=order_state)
+            elif order_state == "still_live_after_retries":
+                # Refusing to stack another order on top of a still-live
+                # order. Bail the chase. The straddle_builder treats this
+                # as a leg failure → emergency-flatten of any partial fill.
+                log.error("chase_buy_aborting_to_avoid_duplicate",
+                          instrument=instrument, ord_id=ord_id,
+                          attempt=attempt, filled_so_far=filled_contracts)
+                break
 
         # ── Build result ──
         if filled_contracts == 0:
@@ -1144,24 +1232,14 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            await self._wait_for_fill(
+            wait_status = await self._wait_for_fill(
                 instrument, ord_id, config.OPTION_CHASE_INTERVAL_SEC,
             )
-            try:
-                await self._call(
-                    self._trade.cancel_order,
-                    instId=instrument, ordId=ord_id,
+            filled_this, avg_px_this, order_state = \
+                await self._reconcile_after_wait(
+                    instrument, ord_id, wait_status, new_price,
+                    side="sell", attempt=attempt,
                 )
-            except Exception:
-                pass
-
-            try:
-                final = await self.get_order_status(instrument, ord_id)
-            except Exception:
-                final = {}
-            filled_this = int(self._f(final, "accFillSz"))
-            avg_px_this = self._f(final, "avgPx", default=new_price)
-
             if filled_this > 0:
                 filled_contracts += filled_this
                 weighted_value += filled_this * avg_px_this
@@ -1171,7 +1249,13 @@ class OKXExchange:
                          total_filled=filled_contracts,
                          remaining=target_contracts - filled_contracts,
                          vwap=weighted_value / filled_contracts,
-                         px_this=avg_px_this)
+                         px_this=avg_px_this,
+                         state=order_state)
+            elif order_state == "still_live_after_retries":
+                log.error("chase_sell_aborting_to_avoid_duplicate",
+                          instrument=instrument, ord_id=ord_id,
+                          attempt=attempt, filled_so_far=filled_contracts)
+                break
 
         if filled_contracts == 0:
             if attempt > 0 and time.time() >= deadline:
