@@ -1,22 +1,20 @@
 """
-Manual close for OKX positions — use BEFORE 08:00 UTC option expiry to
-flatten any open straddle if the scheduled 16:00 UTC close would miss
-it (e.g. the algo was started outside the normal session window).
+Manual close for OKX positions — flatten any open option position
+without going through the OKX UI.
 
-Reads OKX credentials from .env and sells every non-zero position with
-a maker-only chase. No equity / portfolio side-effects — purely
-unwinds whatever the exchange has open.
+Reads OKX credentials from .env. Uses chase-sell (maker-only) by default
+or `--taker` for an immediate fill at the bid (pays 1-tick spread).
 
 Usage:
-    python manual_close.py
-    python manual_close.py --dry-run     # print only, no orders
-    python manual_close.py --silent      # no Telegram notifications
+    python manual_close.py                # maker-only chase (slow, no fees)
+    python manual_close.py --taker        # taker fill (fast, ~1 tick cost)
+    python manual_close.py --dry-run      # print only, no orders
+    python manual_close.py --silent       # no Telegram notifications
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 
 import structlog
@@ -29,10 +27,115 @@ from utils.logging_config import setup_logging
 log = structlog.get_logger(__name__)
 
 
-async def manual_close(dry_run: bool = False, silent: bool = False) -> int:
+async def _close_one_position(
+    exchange: OKXExchange,
+    inst: str,
+    pos_contracts: float,
+    taker: bool,
+) -> tuple[bool, dict | None]:
+    """Close a single option position. Returns (ok, fill_result)."""
+    # OKX `pos` is in contracts. Convert to BTC notional for chase_*.
+    qty_btc = abs(pos_contracts) * config.OKX_CONTRACT_SIZE_BTC
+    side = "sell" if pos_contracts > 0 else "buy"
+
+    try:
+        ticker = await exchange.get_ticker(inst)
+    except Exception:
+        log.warning("manual_close_ticker_failed", instrument=inst, exc_info=True)
+        return False, None
+
+    if ticker.bid <= 0 or ticker.ask <= 0:
+        log.warning("manual_close_no_quote",
+                    instrument=inst, bid=ticker.bid, ask=ticker.ask)
+        return False, None
+
+    log.info("manual_close_unwinding",
+             instrument=inst, side=side,
+             pos_contracts=pos_contracts, qty_btc=qty_btc,
+             bid=ticker.bid, ask=ticker.ask, taker=taker)
+
+    if config.DRY_RUN:
+        log.info("manual_close_dry_run_skip",
+                 instrument=inst, side=side,
+                 qty_btc=qty_btc, taker=taker)
+        return True, None
+
+    if taker:
+        # Lift the opposite side immediately. Sell → cross to bid, Buy → cross to ask.
+        # We pad by 1 tick to ensure the cross happens even if mid moves slightly.
+        tick = exchange.get_tick_size(inst)
+        if tick <= 0:
+            tick = config.OPTION_TICK_SIZE
+        if side == "sell":
+            taker_price = max(ticker.bid - tick, tick)
+        else:
+            taker_price = ticker.ask + tick
+
+        log.info("manual_close_taker_order",
+                 instrument=inst, side=side, price=taker_price,
+                 qty_btc=qty_btc, post_only=False)
+
+        try:
+            order = await exchange._place_limit_order(
+                instrument=inst, side=side,
+                qty_btc=qty_btc, price=taker_price,
+                post_only=False,
+            )
+        except Exception:
+            log.error("manual_close_taker_failed",
+                      instrument=inst, exc_info=True)
+            return False, None
+
+        ord_id = order.get("ordId")
+        sCode = str(order.get("sCode") or "")
+        if not ord_id or sCode not in ("0", ""):
+            log.error("manual_close_taker_rejected",
+                      instrument=inst, sCode=sCode,
+                      sMsg=order.get("sMsg"))
+            return False, None
+
+        # Wait briefly for fill confirmation
+        status = await exchange._wait_for_fill(inst, ord_id, timeout=10.0)
+        state = status.get("state", "")
+        if state == "filled":
+            avg_px = exchange._f(status, "avgPx", default=taker_price)
+            log.info("manual_close_taker_filled",
+                     instrument=inst, fill_price=avg_px, ord_id=ord_id)
+            return True, {"average_price": avg_px, "order_id": ord_id}
+
+        # Not filled within 10s — try once more with even more aggressive crossing
+        log.warning("manual_close_taker_no_fill_yet",
+                    instrument=inst, state=state, ord_id=ord_id)
+        return False, None
+
+    # Maker-only chase (default)
+    try:
+        if side == "sell":
+            result = await exchange.chase_sell(inst, qty_btc, ticker.ask)
+        else:
+            result = await exchange.chase_buy(inst, qty_btc, ticker.bid)
+    except Exception:
+        log.error("manual_close_chase_failed",
+                  instrument=inst, exc_info=True)
+        return False, None
+
+    if result is None:
+        log.warning("manual_close_chase_no_fill", instrument=inst)
+        return False, None
+
+    avg_px = result.get("average_price", 0.0)
+    log.info("manual_close_chase_filled",
+             instrument=inst, fill_price=avg_px)
+    return True, result
+
+
+async def manual_close(
+    dry_run: bool = False,
+    silent: bool = False,
+    taker: bool = False,
+) -> int:
     setup_logging()
 
-    # Force DRY_RUN if requested (overrides .env)
     if dry_run:
         config.DRY_RUN = True
 
@@ -41,16 +144,18 @@ async def manual_close(dry_run: bool = False, silent: bool = False) -> int:
 
     log.info("manual_close_start",
              okx_flag=config.OKX_FLAG,
-             dry_run=config.DRY_RUN)
+             dry_run=config.DRY_RUN,
+             taker=taker)
 
     if not silent and not dry_run:
         await notifier.send(
             "<b>MANUAL CLOSE STARTED</b>\n"
-            f"Mode: {'DEMO' if config.OKX_FLAG == '1' else 'LIVE'}\n"
+            f"Mode: {'DEMO' if config.OKX_FLAG == '1' else 'LIVE'} "
+            f"({'TAKER' if taker else 'MAKER'})\n"
             "Flattening all open OKX positions…"
         )
 
-    # 1. Cancel any resting orders first so they don't block the unwind
+    # 1. Cancel any resting orders first so they don't interfere
     try:
         cancelled = await exchange.cancel_all_open_orders()
         log.info("manual_close_orders_cancelled", count=cancelled)
@@ -85,17 +190,17 @@ async def manual_close(dry_run: bool = False, silent: bool = False) -> int:
 
     if not silent:
         details = "\n".join(
-            f"  • {p['instrument_name']} amt={p['amount']:+.4f}  "
-            f"mark=${p['mark_price']:,.2f}  "
-            f"uPnL=${p['unrealized_pnl']:+,.2f}"
+            f"  • {p['instrument_name']}  pos={p['amount']:+.4f}  "
+            f"mark={p['mark_price']:.4f}  uPnL={p['unrealized_pnl']:+.4f}"
             for p in positions
         )
         await notifier.send(
             f"<b>MANUAL CLOSE — found {len(positions)} positions</b>\n"
-            f"{details}\n\nFlattening with maker-only chase…"
+            f"{details}\n\n"
+            f"Flattening with {'TAKER' if taker else 'maker-only chase'}…"
         )
 
-    # 3. Sell each non-zero position
+    # 3. Close each non-zero position
     sold = 0
     failed = 0
     for p in positions:
@@ -103,55 +208,13 @@ async def manual_close(dry_run: bool = False, silent: bool = False) -> int:
         amt = float(p["amount"])
         if amt == 0:
             continue
-
-        # Side opposite of current holding
-        side = "sell" if amt > 0 else "buy"
-        qty_btc = abs(amt)
-
-        try:
-            t = await exchange.get_ticker(inst)
-        except Exception:
-            log.warning("manual_close_ticker_failed",
-                        instrument=inst, exc_info=True)
-            failed += 1
-            continue
-
-        if t.bid <= 0 or t.ask <= 0:
-            log.warning("manual_close_no_quote",
-                        instrument=inst, bid=t.bid, ask=t.ask)
-            failed += 1
-            continue
-
-        log.info("manual_close_unwinding",
-                 instrument=inst, side=side, qty_btc=qty_btc,
-                 bid=t.bid, ask=t.ask)
-
-        if config.DRY_RUN:
-            log.info("manual_close_dry_run_skip",
-                     instrument=inst, side=side, qty=qty_btc)
+        ok, _result = await _close_one_position(
+            exchange, inst, amt, taker=taker,
+        )
+        if ok:
             sold += 1
-            continue
-
-        try:
-            if side == "sell":
-                result = await exchange.chase_sell(inst, qty_btc, t.ask)
-            else:
-                result = await exchange.chase_buy(inst, qty_btc, t.bid)
-        except Exception:
-            log.error("manual_close_chase_failed",
-                      instrument=inst, exc_info=True)
+        else:
             failed += 1
-            continue
-
-        if result is None:
-            log.warning("manual_close_chase_no_fill", instrument=inst)
-            failed += 1
-            continue
-
-        log.info("manual_close_filled",
-                 instrument=inst,
-                 fill_price=result.get("avg_fill_price"))
-        sold += 1
 
     # 4. Verify flat
     try:
@@ -170,7 +233,7 @@ async def manual_close(dry_run: bool = False, silent: bool = False) -> int:
         msg_lines.append("<b>Still open — investigate:</b>")
         for p in residuals:
             msg_lines.append(
-                f"  • {p['instrument_name']}  amt={p['amount']:+.4f}"
+                f"  • {p['instrument_name']}  pos={p['amount']:+.4f}"
             )
 
     log.info("manual_close_done",
@@ -189,9 +252,12 @@ def main() -> None:
                         help="Print actions without sending orders.")
     parser.add_argument("--silent", action="store_true",
                         help="Suppress Telegram notifications.")
+    parser.add_argument("--taker", action="store_true",
+                        help="Use taker order (instant fill, ~1-tick cost) "
+                             "instead of maker-only chase.")
     args = parser.parse_args()
 
-    rc = asyncio.run(manual_close(args.dry_run, args.silent))
+    rc = asyncio.run(manual_close(args.dry_run, args.silent, args.taker))
     sys.exit(rc)
 
 
