@@ -566,15 +566,57 @@ class OKXExchange:
     # ──────────────────── Account / positions ─────────────────────
 
     async def get_account_equity(self, ccy: str = "USDT") -> float:
-        """Return total trading-account equity in `ccy`."""
-        resp = await self._call(self._account.get_account_balance, ccy=ccy)
-        rows = self._data_or_empty(resp)
+        """Return total trading-account equity in USD-equivalent.
+
+        OKX BTC-USD inverse options are coin-margined — the user typically
+        funds the account in BTC, not USDT. Reading only the `ccy=USDT`
+        balance would return 0 (or a tiny residual) and starve the
+        collateral / pre-flight checks.
+
+        Strategy:
+          1. Read the FULL account (no ccy filter) and use `totalEq` —
+             OKX reports this in USD across all currencies.
+          2. Fall back to the per-ccy `eq` field only if totalEq is
+             missing AND we find a meaningful per-ccy balance.
+        """
+        try:
+            resp = await self._call(self._account.get_account_balance)
+            rows = self._data_or_empty(resp)
+        except Exception:
+            log.warning("get_account_equity_failed", exc_info=True)
+            return 0.0
+
+        if not rows:
+            return 0.0
+
+        total_eq = self._f(rows[0], "totalEq")
+        if total_eq > 0:
+            return total_eq
+
+        # Fallback: pick the largest per-currency eq we can find.
+        details = rows[0].get("details") or []
+        best = 0.0
+        for d in details:
+            eq = self._f(d, "eqUsd") or self._f(d, "eq")
+            if eq > best:
+                best = eq
+        if best > 0:
+            return best
+
+        # Final fallback: explicit ccy filter for the requested currency.
+        try:
+            resp = await self._call(
+                self._account.get_account_balance, ccy=ccy,
+            )
+            rows = self._data_or_empty(resp)
+        except Exception:
+            return 0.0
         if not rows:
             return 0.0
         details = rows[0].get("details") or []
         for d in details:
             if d.get("ccy") == ccy:
-                return self._f(d, "eq")
+                return self._f(d, "eqUsd") or self._f(d, "eq")
         return self._f(rows[0], "totalEq")
 
     async def list_open_positions(self) -> list[dict]:
@@ -629,6 +671,44 @@ class OKXExchange:
         )
         rows = self._data_or_empty(resp)
         return rows
+
+    async def cancel_orders_for_instrument(self, instrument: str) -> int:
+        """Cancel any open orders for a specific instrument.
+
+        Used as a safety net before _emergency_sell so we don't sell on top
+        of a still-live buy from the same chase iteration (the rare case
+        where the chase aborted with `still_live_after_retries`).
+        """
+        try:
+            orders = await self.list_open_orders()
+        except Exception:
+            log.warning("cancel_for_instrument_list_failed",
+                        instrument=instrument, exc_info=True)
+            return 0
+        cancelled = 0
+        for o in orders:
+            if o.get("instId") != instrument:
+                continue
+            oid = o.get("ordId")
+            if not oid:
+                continue
+            try:
+                resp = await self._call(
+                    self._trade.cancel_order, instId=instrument, ordId=oid,
+                )
+                if str(resp.get("code")) in ("0",):
+                    cancelled += 1
+                else:
+                    log.warning("cancel_for_instrument_failed",
+                                instId=instrument, ordId=oid,
+                                code=resp.get("code"), msg=resp.get("msg"))
+            except Exception:
+                log.warning("cancel_for_instrument_exception",
+                            instId=instrument, ordId=oid, exc_info=True)
+        if cancelled > 0:
+            log.info("cancel_for_instrument_done",
+                     instrument=instrument, cancelled=cancelled)
+        return cancelled
 
     async def cancel_all_open_orders(self) -> int:
         """Cancel every resting option order. Returns count cancelled."""

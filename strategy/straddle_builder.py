@@ -475,6 +475,18 @@ async def _emergency_sell(
         log.info("emergency_sell_skip_zero_qty", instrument=instrument)
         return
     try:
+        # Defensive: clear any stuck buy orders for this instrument before
+        # selling. Otherwise a not-yet-cancelled buy could fill more
+        # contracts while our sell is resting, leaving a residual.
+        try:
+            cleared = await exchange.cancel_orders_for_instrument(instrument)
+            if cleared > 0:
+                log.info("emergency_sell_pre_cancel_done",
+                         instrument=instrument, cancelled=cleared)
+        except Exception:
+            log.warning("emergency_sell_pre_cancel_failed",
+                        instrument=instrument, exc_info=True)
+
         ticker = await exchange.get_ticker(instrument)
         ask = ticker.ask if ticker.ask > 0 else entry_price
         result = await exchange.chase_sell(instrument, qty, ask)
