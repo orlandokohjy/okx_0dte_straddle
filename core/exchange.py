@@ -756,7 +756,10 @@ class OKXExchange:
             sMsg = str(order.get("sMsg") or "")
 
             # Post-only rejected (would cross) → narrow more next loop
-            if sCode == "51008" or "post_only" in sMsg.lower():
+            # OKX docs: 51120 = "Order would immediately match" (post-only).
+            # 51008 is *insufficient margin*, NOT post-only — fatal.
+            if sCode == "51120" or "would immediately match" in sMsg.lower() \
+                    or "post_only" in sMsg.lower():
                 log.info("chase_buy_post_only_rejected",
                          instrument=instrument, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
@@ -767,8 +770,9 @@ class OKXExchange:
             FATAL_CODES = {
                 "51000",   # Parameter error
                 "51001",   # Instrument doesn't exist
+                "51008",   # Insufficient {ccy} margin (BTC for inverse options!)
                 "51010",   # tdMode/instType incompatible
-                "51016",   # Insufficient balance
+                "51016",   # Insufficient balance (general)
                 "51019",   # Net long not allowed under cross margin (use isolated)
                 "51020",   # Account in restricted mode
                 "51115",   # Margin mode not enabled / account-mode wrong
@@ -925,15 +929,16 @@ class OKXExchange:
             sCode = str(order.get("sCode") or "")
             sMsg = str(order.get("sMsg") or "")
 
-            if sCode == "51008" or "post_only" in sMsg.lower():
+            if sCode == "51120" or "would immediately match" in sMsg.lower() \
+                    or "post_only" in sMsg.lower():
                 log.info("chase_sell_post_only_rejected",
                          instrument=instrument, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
             FATAL_CODES = {
-                "51000", "51001", "51010", "51016", "51019", "51020",
-                "51115", "51121", "51169", "51198",
+                "51000", "51001", "51008", "51010", "51016", "51019",
+                "51020", "51115", "51121", "51169", "51198",
             }
             if sCode in FATAL_CODES:
                 log.error("chase_sell_fatal_reject",
