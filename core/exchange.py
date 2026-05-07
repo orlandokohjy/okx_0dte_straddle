@@ -773,6 +773,7 @@ class OKXExchange:
                 "51115",   # Margin mode not enabled / account-mode wrong
                 "51121",   # Position direction restriction
                 "51169",   # Pricing limit
+                "51198",   # Options trading not yet activated by user
             }
             if sCode in FATAL_CODES:
                 log.error("chase_buy_fatal_reject",
@@ -931,7 +932,7 @@ class OKXExchange:
 
             FATAL_CODES = {
                 "51000", "51001", "51010", "51016", "51020",
-                "51115", "51121", "51169",
+                "51115", "51121", "51169", "51198",
             }
             if sCode in FATAL_CODES:
                 log.error("chase_sell_fatal_reject",
