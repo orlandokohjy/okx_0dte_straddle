@@ -144,10 +144,31 @@ async def build_straddle(
                       exc_info=call_result)
             call_result = None
 
-        # Per-leg fill notification — fires regardless of the other leg's
-        # state. This is the missing piece that left the user blind on
-        # 2026-05-07 when the put filled but never reached the straddle
-        # notify path.
+        # Promote partial-fill chase results to "failed" so they go through
+        # the emergency-unwind path. The chase still returns a dict carrying
+        # the partial filled_qty_btc + VWAP so we can flatten exactly what's
+        # exposed instead of guessing the size.
+        put_partial_qty: float = 0.0
+        call_partial_qty: float = 0.0
+        if put_result is not None and not put_result.get("fully_filled", True):
+            put_partial_qty = float(put_result.get("filled_qty_btc", 0.0))
+            log.warning("put_partial_fill_treating_as_failure",
+                        id=straddle_id,
+                        filled_qty_btc=put_partial_qty,
+                        target_qty_btc=total_qty)
+            put_result = None
+        if call_result is not None and not call_result.get("fully_filled", True):
+            call_partial_qty = float(call_result.get("filled_qty_btc", 0.0))
+            log.warning("call_partial_fill_treating_as_failure",
+                        id=straddle_id,
+                        filled_qty_btc=call_partial_qty,
+                        target_qty_btc=total_qty)
+            call_result = None
+
+        # Per-leg fill notification fires for FULL-fill legs only. Partial
+        # fills are reported separately by the chase_*'s own notifier so
+        # the operator sees both messages: "PARTIAL FILL DETECTED" first,
+        # then the partial-leg-failure handling below.
         if put_result is not None:
             await notifier.send(
                 f"<b>LEG FILLED — PUT</b> [{straddle_id}]\n"
@@ -164,45 +185,87 @@ async def build_straddle(
             )
 
         # ── Outcome dispatch: 4 cases ──
+        # Note: put_partial_qty / call_partial_qty (set above) carry the
+        # actual exposure if a leg was promoted from partial → failed. We
+        # use those for emergency-sell sizing instead of `total_qty` so the
+        # unwind targets exactly the live position, not the original target.
         if put_result is None and call_result is None:
-            log.error("both_legs_failed_skipping_session", id=straddle_id)
+            log.error("both_legs_failed_skipping_session",
+                      id=straddle_id,
+                      put_partial_qty=put_partial_qty,
+                      call_partial_qty=call_partial_qty)
             await notifier.send(
                 f"<b>SESSION SKIPPED</b> [{straddle_id}]\n"
                 f"Both legs failed to fill within deadline.\n"
-                f"No exposure — see chase logs above for sCode/sMsg."
+                f"Put partial residual: {put_partial_qty:.4f} BTC\n"
+                f"Call partial residual: {call_partial_qty:.4f} BTC\n"
+                f"Flattening any partial exposure now."
             )
+            if put_partial_qty > 0:
+                await _emergency_sell(
+                    exchange, pair.put.symbol, put_partial_qty,
+                    pair.put.ask,
+                )
+            if call_partial_qty > 0:
+                await _emergency_sell(
+                    exchange, pair.call.symbol, call_partial_qty,
+                    pair.call.ask,
+                )
             return None
 
         if put_result is not None and call_result is None:
             put_fill_for_emer = float(
                 put_result.get("average_price", pair.put.ask),
             )
+            put_qty_for_emer = float(
+                put_result.get("filled_qty_btc", total_qty),
+            )
             log.error("call_leg_failed_unwinding_put",
-                      id=straddle_id, put_symbol=pair.put.symbol)
+                      id=straddle_id, put_symbol=pair.put.symbol,
+                      put_qty=put_qty_for_emer,
+                      call_partial_qty=call_partial_qty)
             await notifier.send(
                 f"<b>⚠️ PARTIAL FILL — CALL FAILED</b> [{straddle_id}]\n"
-                f"Put filled @ {put_fill_for_emer:.4f} BTC\n"
-                f"Call failed to fill. Selling put to flatten."
+                f"Put filled {put_qty_for_emer:.4f} BTC @ {put_fill_for_emer:.4f}\n"
+                f"Call partial residual: {call_partial_qty:.4f} BTC\n"
+                f"Flattening both."
             )
             await _emergency_sell(
-                exchange, pair.put.symbol, total_qty, put_fill_for_emer,
+                exchange, pair.put.symbol, put_qty_for_emer, put_fill_for_emer,
             )
+            if call_partial_qty > 0:
+                await _emergency_sell(
+                    exchange, pair.call.symbol, call_partial_qty,
+                    pair.call.ask,
+                )
             return None
 
         if call_result is not None and put_result is None:
             call_fill_for_emer = float(
                 call_result.get("average_price", pair.call.ask),
             )
+            call_qty_for_emer = float(
+                call_result.get("filled_qty_btc", total_qty),
+            )
             log.error("put_leg_failed_unwinding_call",
-                      id=straddle_id, call_symbol=pair.call.symbol)
+                      id=straddle_id, call_symbol=pair.call.symbol,
+                      call_qty=call_qty_for_emer,
+                      put_partial_qty=put_partial_qty)
             await notifier.send(
                 f"<b>⚠️ PARTIAL FILL — PUT FAILED</b> [{straddle_id}]\n"
-                f"Call filled @ {call_fill_for_emer:.4f} BTC\n"
-                f"Put failed to fill. Selling call to flatten."
+                f"Call filled {call_qty_for_emer:.4f} BTC @ {call_fill_for_emer:.4f}\n"
+                f"Put partial residual: {put_partial_qty:.4f} BTC\n"
+                f"Flattening both."
             )
             await _emergency_sell(
-                exchange, pair.call.symbol, total_qty, call_fill_for_emer,
+                exchange, pair.call.symbol, call_qty_for_emer,
+                call_fill_for_emer,
             )
+            if put_partial_qty > 0:
+                await _emergency_sell(
+                    exchange, pair.put.symbol, put_partial_qty,
+                    pair.put.ask,
+                )
             return None
 
         # Both filled — build the legs.
@@ -336,7 +399,22 @@ async def unwind_straddle(
                 call_result.get("average_price", call_ask),
             )
             straddle.call_leg.exit_metrics = call_result.get("metrics", {})
-            log.info("call_sold", price=exit_call_price)
+            call_fully = call_result.get("fully_filled", True)
+            call_filled_btc = float(
+                call_result.get("filled_qty_btc", straddle.call_leg.qty),
+            )
+            log.info("call_sold", price=exit_call_price,
+                     fully_filled=call_fully,
+                     filled_btc=call_filled_btc,
+                     target_btc=straddle.call_leg.qty)
+            if not call_fully:
+                await notifier.send(
+                    f"<b>⚠️ CALL UNWIND PARTIAL</b> [{straddle.id}]\n"
+                    f"Symbol: {straddle.call_leg.instrument}\n"
+                    f"Sold {call_filled_btc:.4f} of {straddle.call_leg.qty:.4f} BTC\n"
+                    f"Residual: {straddle.call_leg.qty - call_filled_btc:.4f} BTC\n"
+                    f"post_close_reconcile will flag the orphan."
+                )
         else:
             log.warning("call_sell_failed",
                         instrument=straddle.call_leg.instrument)
@@ -351,7 +429,22 @@ async def unwind_straddle(
                 put_result.get("average_price", put_ask),
             )
             straddle.put_leg.exit_metrics = put_result.get("metrics", {})
-            log.info("put_sold", price=exit_put_price)
+            put_fully = put_result.get("fully_filled", True)
+            put_filled_btc = float(
+                put_result.get("filled_qty_btc", straddle.put_leg.qty),
+            )
+            log.info("put_sold", price=exit_put_price,
+                     fully_filled=put_fully,
+                     filled_btc=put_filled_btc,
+                     target_btc=straddle.put_leg.qty)
+            if not put_fully:
+                await notifier.send(
+                    f"<b>⚠️ PUT UNWIND PARTIAL</b> [{straddle.id}]\n"
+                    f"Symbol: {straddle.put_leg.instrument}\n"
+                    f"Sold {put_filled_btc:.4f} of {straddle.put_leg.qty:.4f} BTC\n"
+                    f"Residual: {straddle.put_leg.qty - put_filled_btc:.4f} BTC\n"
+                    f"post_close_reconcile will flag the orphan."
+                )
         else:
             log.warning("put_sell_failed",
                         instrument=straddle.put_leg.instrument)
@@ -372,24 +465,45 @@ async def _emergency_sell(
     exchange: OKXExchange, instrument: str,
     qty: float, entry_price: float,
 ) -> None:
-    """Sell a leg that filled during a failed build (rollback)."""
+    """Sell a leg that filled during a failed build (rollback).
+
+    qty is in BTC notional and represents the actual position to flatten —
+    NOT the original target. Caller is responsible for passing the real
+    filled_qty_btc when a partial fill is being unwound.
+    """
+    if qty <= 0:
+        log.info("emergency_sell_skip_zero_qty", instrument=instrument)
+        return
     try:
         ticker = await exchange.get_ticker(instrument)
         ask = ticker.ask if ticker.ask > 0 else entry_price
         result = await exchange.chase_sell(instrument, qty, ask)
         if result:
+            avg_px = result.get("average_price", 0)
+            fully = result.get("fully_filled", True)
+            sold_btc = float(result.get("filled_qty_btc", qty))
             log.info("emergency_sell_done", instrument=instrument,
-                     price=result.get("average_price"))
-            await notifier.send(
-                f"<b>ROLLBACK COMPLETE</b>\n"
-                f"Sold {qty} @ ${result.get('average_price', 0):,.2f}\n"
-                f"Symbol: {instrument}"
-            )
+                     price=avg_px, fully_filled=fully,
+                     sold_btc=sold_btc, target_btc=qty)
+            if fully:
+                await notifier.send(
+                    f"<b>ROLLBACK COMPLETE</b>\n"
+                    f"Sold {qty:.4f} BTC @ {avg_px:.4f}\n"
+                    f"Symbol: {instrument}"
+                )
+            else:
+                await notifier.send(
+                    f"<b>⚠️ ROLLBACK PARTIAL</b>\n"
+                    f"Sold {sold_btc:.4f} of {qty:.4f} BTC @ {avg_px:.4f}\n"
+                    f"Residual: {qty - sold_btc:.4f} BTC\n"
+                    f"Symbol: {instrument}\n"
+                    f"<b>MANUAL ACTION REQUIRED for residual.</b>"
+                )
         else:
             log.error("emergency_sell_chase_exhausted", instrument=instrument)
             await notifier.send(
                 f"<b>⚠️ ROLLBACK FAILED</b>\n"
-                f"Could not sell {qty} of {instrument} within deadline.\n"
+                f"Could not sell {qty:.4f} BTC of {instrument} within deadline.\n"
                 f"<b>MANUAL ACTION REQUIRED.</b>"
             )
     except Exception:

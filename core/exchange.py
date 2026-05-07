@@ -95,6 +95,43 @@ async def _notify_chase_failure(
         log.warning("chase_failure_notify_skipped", exc_info=True)
 
 
+async def _notify_partial_fill(
+    *,
+    side: str,
+    instrument: str,
+    filled_contracts: int,
+    target_contracts: int,
+    vwap: float,
+) -> None:
+    """Telegram alert when a chase terminates with filled < target.
+
+    The leg has *some* live exposure on the exchange that is smaller than
+    the algo's intended size. The caller is responsible for deciding what
+    to do (typically: emergency-flatten the partial). This notifier just
+    raises operator awareness immediately.
+    """
+    try:
+        from core import notifier
+        filled_btc = filled_contracts * config.OKX_CONTRACT_SIZE_BTC
+        target_btc = target_contracts * config.OKX_CONTRACT_SIZE_BTC
+        body = [
+            "<b>PARTIAL FILL DETECTED</b>",
+            f"Side: {side.upper()}",
+            f"Instrument: {instrument}",
+            f"Filled: {filled_contracts} contracts ({filled_btc:.4f} BTC)",
+            f"Target: {target_contracts} contracts ({target_btc:.4f} BTC)",
+            f"Pct filled: {filled_contracts / target_contracts:.1%}",
+            f"VWAP: {vwap:.4f} BTC",
+            "",
+            "The chase terminated with less than full size on the exchange. "
+            "The straddle builder will treat this as a leg failure and "
+            "flatten the partial position to avoid naked exposure.",
+        ]
+        await notifier.send("\n".join(body))
+    except Exception:
+        log.warning("partial_fill_notify_skipped", exc_info=True)
+
+
 def _build_fill_metrics(
     *,
     side: str,
@@ -483,13 +520,38 @@ class OKXExchange:
                  tick_size=self._default_option_tick,
                  contract_size=live_ct)
 
-        # Sanity: if OKX advertises a different contract size than our config,
-        # warn loudly so the operator can fix .env.
-        if live_ct > 0 and abs(live_ct - config.OKX_CONTRACT_SIZE_BTC) > 1e-9:
-            log.warning("contract_size_mismatch",
-                        config=config.OKX_CONTRACT_SIZE_BTC,
-                        live=live_ct,
-                        action="update OKX_CONTRACT_SIZE_BTC in .env")
+        # Note on contract-size reporting:
+        # OKX's `ctVal` field for BTC-USD inverse OPTIONS is reported as 1.0
+        # via /api/v5/public/instruments — but empirically, 1 contract = 0.01
+        # BTC of underlying (verified by the OKX UI: pos=50 contracts shows
+        # as 0.5 BTC notional). The API's ctVal=1.0 in this context appears
+        # to be a USD multiplier on inverse contracts, NOT a BTC quantity.
+        #
+        # Therefore we trust .env's OKX_CONTRACT_SIZE_BTC as the source of
+        # truth. The known-correct value for BTC-USD options is 0.01.
+        # We only warn if the operator has set the env to something OTHER
+        # than 0.01, which is almost certainly a misconfiguration.
+        EMPIRICAL_CTVAL_BTC = 0.01
+        if abs(config.OKX_CONTRACT_SIZE_BTC - EMPIRICAL_CTVAL_BTC) > 1e-9:
+            log.warning(
+                "contract_size_unusual",
+                config=config.OKX_CONTRACT_SIZE_BTC,
+                expected=EMPIRICAL_CTVAL_BTC,
+                api_field=live_ct,
+                hint=("BTC-USD options use 0.01 BTC per contract empirically; "
+                      "OKX's ctVal API field reports 1.0 (USD multiplier) "
+                      "but that is NOT the BTC notional multiplier we need."),
+                action="set OKX_CONTRACT_SIZE_BTC=0.01 in .env",
+            )
+        elif live_ct > 0 and abs(live_ct - 1.0) > 1e-9:
+            # Belt and suspenders — flag if OKX's ctVal API ever changes
+            # away from the well-known 1.0 value, so we re-investigate.
+            log.warning(
+                "contract_size_api_changed",
+                live=live_ct,
+                expected_api_value=1.0,
+                hint="OKX may have changed ctVal semantics — review the algo.",
+            )
 
         return self._default_option_tick
 
@@ -682,11 +744,13 @@ class OKXExchange:
     ) -> dict:
         """Poll order status until filled / cancelled / timeout.
 
-        Race-condition guard: when OKX reports state=canceled, an order can
-        STILL have a non-zero accFillSz (partial or full fill that landed
-        microseconds before our cancel landed). In that case we promote the
-        status to ``filled`` so the caller doesn't drop a real position on
-        the floor (orphan-position scenario, 2026-05-07).
+        Returns the latest raw OKX order row. The caller is responsible for
+        interpreting the {state, sz, accFillSz} triple — this function does
+        NOT promote partial fills to ``filled``. Why: the chase loop needs
+        to distinguish (a) a true full fill, (b) a partial fill that should
+        cause the next iteration to size for only the remainder, and
+        (c) a canceled-with-zero-fill that should retry with full size.
+        See chase_buy/chase_sell for the post-cancel reconciliation.
         """
         deadline = time.time() + timeout
         last: dict = {}
@@ -694,34 +758,11 @@ class OKXExchange:
             try:
                 last = await self.get_order_status(instrument, order_id)
                 state = last.get("state", "")
-                acc_fill = self._f(last, "accFillSz")
-                if state == "filled":
-                    return last
-                if state in ("canceled", "cancelled"):
-                    if acc_fill > 0:
-                        log.warning("wait_for_fill_canceled_but_filled",
-                                    instrument=instrument, order_id=order_id,
-                                    accFillSz=acc_fill,
-                                    avgPx=last.get("avgPx"))
-                        last = dict(last)
-                        last["state"] = "filled"
+                if state in ("filled", "canceled", "cancelled"):
                     return last
             except Exception:
                 log.warning("order_status_failed", exc_info=True)
             await asyncio.sleep(1.0)
-        # Final post-deadline sanity check: catch a fill that landed during
-        # the last sleep window before we return "no fill".
-        try:
-            last = await self.get_order_status(instrument, order_id)
-            if self._f(last, "accFillSz") > 0:
-                last = dict(last)
-                last["state"] = "filled"
-                log.warning("wait_for_fill_late_fill_detected",
-                            instrument=instrument, order_id=order_id,
-                            accFillSz=last.get("accFillSz"),
-                            avgPx=last.get("avgPx"))
-        except Exception:
-            pass
         return last
 
     # ──────────────────── Maker-only chase (BUY) ──────────────────
@@ -730,25 +771,44 @@ class OKXExchange:
         self, instrument: str, qty_btc: float, initial_bid: float,
     ) -> Optional[dict]:
         """
-        Maker-only buy chase: walks toward the ask by narrowing the gap by
-        OPTION_CHASE_GAP_NARROW_PCT each retry, never crossing past
-        mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails on deadline.
+        Maker-only buy chase with partial-fill tracking.
+
+        Walks the bid toward the ask by OPTION_CHASE_GAP_NARROW_PCT each
+        retry, never above mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails
+        on deadline or fatal reject.
+
+        Partial-fill semantics:
+          • Each iteration sizes the order for the REMAINING quantity, not
+            the original target.
+          • After every cancel we read the order's final accFillSz to
+            capture both clean partials and fills that landed during the
+            cancel race (the 2026-05-07 orphan-put scenario).
+          • Running totals: filled_contracts, weighted_value (Σ contracts×px)
+            give a true VWAP across all child orders.
 
         Tight-spread handling: if (bid + tick) ≥ ask (1-tick wide market,
         common in liquid 0DTE options), the floor collapses to `bid` so we
-        place a non-crossing maker bid AT the bid level instead of getting
-        stuck rejecting against the ask forever.
+        place a non-crossing maker bid AT the bid level.
 
-        Returns dict with average_price + order_id + metrics on full fill,
-        else None. The `metrics` dict captures execution-quality data:
-            t_started_iso, t_filled_iso, duration_sec, attempts,
-            ref_bid, ref_ask, ref_mark, ref_mid,
-            fill_price, qty_btc, side, instrument,
-            slippage_vs_mark_pct, slippage_vs_mid_pct,
-            taker_price_at_start (the ask), saved_vs_taker_pct,
-            saved_vs_taker_per_btc_usd  (premium in BTC per BTC notional)
+        Returns:
+          • dict with {average_price, order_id, filled_qty_btc,
+              fully_filled, metrics} on any fill (full OR partial)
+          • None only if filled_contracts == 0 (no fill at all)
+
+        The caller checks `fully_filled` to decide whether the leg is
+        usable as-is or needs to be flattened (partial-fill failure).
         """
         deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
+        ct_val = config.OKX_CONTRACT_SIZE_BTC
+        target_contracts = int(round(qty_btc / ct_val))
+        if target_contracts <= 0:
+            log.error("chase_buy_target_zero_contracts",
+                      instrument=instrument, qty_btc=qty_btc, ct_val=ct_val)
+            return None
+
+        filled_contracts = 0
+        weighted_value = 0.0  # Σ (contracts × fill_px) for VWAP
+        last_ord_id = ""
         attempt = 0
         last_price = max(0.0, initial_bid)
         t_started = time.time()
@@ -758,8 +818,25 @@ class OKXExchange:
         if tick <= 0:
             tick = config.OPTION_TICK_SIZE
 
-        while time.time() < deadline:
+        FATAL_CODES = {
+            "51000",   # Parameter error
+            "51001",   # Instrument doesn't exist
+            "51008",   # Insufficient {ccy} margin (BTC for inverse options!)
+            "51010",   # tdMode/instType incompatible
+            "51016",   # Insufficient balance (general)
+            "51019",   # Net long not allowed under cross margin (use isolated)
+            "51020",   # Account in restricted mode
+            "51115",   # Margin mode not enabled / account-mode wrong
+            "51121",   # Position direction restriction
+            "51169",   # Pricing limit
+            "51198",   # Options trading not yet activated by user
+        }
+
+        while time.time() < deadline and filled_contracts < target_contracts:
             attempt += 1
+            remaining_contracts = target_contracts - filled_contracts
+            remaining_qty_btc = remaining_contracts * ct_val
+
             ticker = await self.get_ticker(instrument)
             mark = await self.get_option_mark_price(instrument)
             if mark <= 0:
@@ -773,44 +850,24 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            # Capture the very first usable market state — this is the
-            # "decision-time" reference for slippage and savings metrics.
             if not captured_ref:
                 ref_bid, ref_ask, ref_mark = bid, ask, mark
                 captured_ref = True
 
-            # If bid is missing (empty bid side, common on demo), seed it
-            # using mark so we can still place a maker bid below ask.
-            effective_bid = bid if bid > 0 else max(
-                mark - tick, tick,
-            )
-
-            # 50% gap-narrowing: narrow remaining gap to (ask − tick) by pct
+            effective_bid = bid if bid > 0 else max(mark - tick, tick)
             target_top = max(effective_bid, ask - tick)
             new_price = last_price + (target_top - last_price) \
                 * config.OPTION_CHASE_GAP_NARROW_PCT
 
-            # Floor: prefer one tick above effective_bid (front of bid queue).
-            # But in tight 1-tick-wide spreads, that floor lands AT the ask
-            # which post_only would reject every time. In that case, drop
-            # the floor to effective_bid (queue at bid level instead).
             improvement_floor = effective_bid + tick
-            if improvement_floor >= ask:
-                # Tight spread: queue at bid; still maker, just slower.
-                floor_price = effective_bid
-            else:
-                floor_price = improvement_floor
+            floor_price = effective_bid if improvement_floor >= ask else improvement_floor
             new_price = max(new_price, floor_price)
 
-            # Hard ceiling: never AT or above ask (would cross → post_only
-            # reject loop). Stay at least one tick below.
             ceiling_price = ask - tick
             if ceiling_price < effective_bid:
-                # Tight spread again — settle at effective_bid.
                 ceiling_price = effective_bid
             new_price = min(new_price, ceiling_price)
 
-            # Fair-value cap: never bid above mark × max_slippage_factor
             max_price = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
             if new_price > max_price:
                 log.warning("chase_buy_cap_hit",
@@ -824,19 +881,22 @@ class OKXExchange:
 
             log.info("chase_buy_attempt",
                      instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark,
-                     tick=tick)
+                     price=new_price, bid=bid, ask=ask, mark=mark, tick=tick,
+                     remaining_contracts=remaining_contracts,
+                     filled_so_far=filled_contracts,
+                     target_contracts=target_contracts)
 
             order = await self._place_limit_order(
-                instrument, "buy", qty_btc, new_price, post_only=True,
+                instrument, "buy", remaining_qty_btc, new_price,
+                post_only=True,
             )
             ord_id = order.get("ordId")
             sCode = str(order.get("sCode") or "")
             sMsg = str(order.get("sMsg") or "")
+            if ord_id:
+                last_ord_id = ord_id
 
-            # Post-only rejected (would cross) → narrow more next loop
-            # OKX docs: 51120 = "Order would immediately match" (post-only).
-            # 51008 is *insufficient margin*, NOT post-only — fatal.
+            # Post-only reject (would cross) → narrow next loop
             if sCode == "51120" or "would immediately match" in sMsg.lower() \
                     or "post_only" in sMsg.lower():
                 log.info("chase_buy_post_only_rejected",
@@ -844,35 +904,20 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            # Structural / config errors: bail immediately, don't burn
-            # API rate-limit retrying something that will never succeed.
-            FATAL_CODES = {
-                "51000",   # Parameter error
-                "51001",   # Instrument doesn't exist
-                "51008",   # Insufficient {ccy} margin (BTC for inverse options!)
-                "51010",   # tdMode/instType incompatible
-                "51016",   # Insufficient balance (general)
-                "51019",   # Net long not allowed under cross margin (use isolated)
-                "51020",   # Account in restricted mode
-                "51115",   # Margin mode not enabled / account-mode wrong
-                "51121",   # Position direction restriction
-                "51169",   # Pricing limit
-                "51198",   # Options trading not yet activated by user
-            }
             if sCode in FATAL_CODES:
                 log.error("chase_buy_fatal_reject",
                           instrument=instrument, sCode=sCode, sMsg=sMsg,
-                          attempt=attempt,
-                          hint="check OKX_TD_MODE / account margin mode / balance")
+                          attempt=attempt, filled_so_far=filled_contracts,
+                          hint="check OKX_TD_MODE / account margin / balance")
                 await _notify_chase_failure(
                     side="buy", instrument=instrument,
                     qty_btc=qty_btc, reason="fatal_reject",
                     sCode=sCode, sMsg=sMsg, attempt=attempt,
                 )
-                # Return None so straddle_builder treats this as a real
-                # failure and skips the session — NEVER fall through with
-                # a placeholder price (would create a phantom position).
-                return None
+                # If anything filled before the fatal reject, surface it as
+                # a partial result so the caller can flatten it cleanly.
+                # If nothing filled, return None.
+                break
 
             if not ord_id or sCode not in ("0", ""):
                 log.warning("chase_buy_order_rejected",
@@ -881,36 +926,10 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            # Wait for fill
-            status = await self._wait_for_fill(
+            # Wait then cancel + reconcile final accFillSz
+            await self._wait_for_fill(
                 instrument, ord_id, config.OPTION_CHASE_INTERVAL_SEC,
             )
-            state = status.get("state", "")
-            if state == "filled":
-                avg_px = self._f(status, "avgPx", default=new_price)
-                t_filled = time.time()
-                metrics = _build_fill_metrics(
-                    side="buy",
-                    instrument=instrument,
-                    qty_btc=qty_btc,
-                    fill_price=avg_px,
-                    t_started=t_started,
-                    t_filled=t_filled,
-                    attempts=attempt,
-                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
-                )
-                log.info("chase_buy_filled",
-                         instrument=instrument, avg=avg_px, attempt=attempt,
-                         duration_sec=metrics["duration_sec"],
-                         slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
-                         saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
-                return {
-                    "average_price": avg_px,
-                    "order_id": ord_id,
-                    "avgPrice": avg_px,
-                    "metrics": metrics,
-                }
-            # Cancel the resting order before placing the next one
             try:
                 await self._call(
                     self._trade.cancel_order,
@@ -919,13 +938,80 @@ class OKXExchange:
             except Exception:
                 pass
 
-        log.error("chase_buy_deadline_exhausted", instrument=instrument)
-        await _notify_chase_failure(
-            side="buy", instrument=instrument,
-            qty_btc=qty_btc, reason="deadline_exhausted",
-            sCode="", sMsg="", attempt=attempt,
+            # Authoritative post-cancel read — captures fills that landed
+            # before the cancel + clean partials.
+            try:
+                final = await self.get_order_status(instrument, ord_id)
+            except Exception:
+                final = {}
+            filled_this = int(self._f(final, "accFillSz"))
+            avg_px_this = self._f(final, "avgPx", default=new_price)
+
+            if filled_this > 0:
+                filled_contracts += filled_this
+                weighted_value += filled_this * avg_px_this
+                log.info("chase_buy_partial_or_full_recorded",
+                         instrument=instrument, attempt=attempt,
+                         filled_this_attempt=filled_this,
+                         total_filled=filled_contracts,
+                         remaining=target_contracts - filled_contracts,
+                         vwap=weighted_value / filled_contracts,
+                         px_this=avg_px_this)
+
+        # ── Build result ──
+        if filled_contracts == 0:
+            if attempt > 0 and time.time() >= deadline:
+                log.error("chase_buy_deadline_exhausted",
+                          instrument=instrument, attempts=attempt)
+                await _notify_chase_failure(
+                    side="buy", instrument=instrument,
+                    qty_btc=qty_btc, reason="deadline_exhausted",
+                    sCode="", sMsg="", attempt=attempt,
+                )
+            return None
+
+        vwap = weighted_value / filled_contracts
+        filled_qty_btc = filled_contracts * ct_val
+        fully_filled = filled_contracts >= target_contracts
+        t_filled = time.time()
+        metrics = _build_fill_metrics(
+            side="buy",
+            instrument=instrument,
+            qty_btc=filled_qty_btc,
+            fill_price=vwap,
+            t_started=t_started,
+            t_filled=t_filled,
+            attempts=attempt,
+            ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
         )
-        return None
+        if fully_filled:
+            log.info("chase_buy_filled",
+                     instrument=instrument, avg=vwap, attempts=attempt,
+                     duration_sec=metrics["duration_sec"],
+                     slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                     saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
+        else:
+            log.warning("chase_buy_partial_terminated",
+                        instrument=instrument,
+                        filled_contracts=filled_contracts,
+                        target_contracts=target_contracts,
+                        filled_qty_btc=filled_qty_btc,
+                        target_qty_btc=qty_btc,
+                        vwap=vwap, attempts=attempt)
+            await _notify_partial_fill(
+                side="buy", instrument=instrument,
+                filled_contracts=filled_contracts,
+                target_contracts=target_contracts,
+                vwap=vwap,
+            )
+        return {
+            "average_price": vwap,
+            "order_id": last_ord_id,
+            "avgPrice": vwap,
+            "filled_qty_btc": filled_qty_btc,
+            "fully_filled": fully_filled,
+            "metrics": metrics,
+        }
 
     # ──────────────────── Maker-only chase (SELL) ─────────────────
 
@@ -933,15 +1019,24 @@ class OKXExchange:
         self, instrument: str, qty_btc: float, initial_ask: float,
     ) -> Optional[dict]:
         """
-        Maker-only sell chase: walks toward the bid by narrowing the gap by
-        OPTION_CHASE_GAP_NARROW_PCT each retry, never below
-        mark / OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails on deadline.
+        Maker-only sell chase with partial-fill tracking. Symmetric to
+        chase_buy — see that docstring for the partial-fill semantics.
 
-        Tight-spread handling: if (ask − tick) ≤ bid (1-tick wide market),
-        the ceiling collapses to `ask` so we place a non-crossing maker
-        offer AT the ask level instead of looping forever rejecting.
+        Returns a dict with {average_price, order_id, filled_qty_btc,
+        fully_filled, metrics} on any fill, else None on zero fill.
+        Caller checks fully_filled to detect under-unwound positions.
         """
         deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
+        ct_val = config.OKX_CONTRACT_SIZE_BTC
+        target_contracts = int(round(qty_btc / ct_val))
+        if target_contracts <= 0:
+            log.error("chase_sell_target_zero_contracts",
+                      instrument=instrument, qty_btc=qty_btc, ct_val=ct_val)
+            return None
+
+        filled_contracts = 0
+        weighted_value = 0.0
+        last_ord_id = ""
         attempt = 0
         last_price = max(0.0, initial_ask)
         t_started = time.time()
@@ -951,8 +1046,16 @@ class OKXExchange:
         if tick <= 0:
             tick = config.OPTION_TICK_SIZE
 
-        while time.time() < deadline:
+        FATAL_CODES = {
+            "51000", "51001", "51008", "51010", "51016", "51019",
+            "51020", "51115", "51121", "51169", "51198",
+        }
+
+        while time.time() < deadline and filled_contracts < target_contracts:
             attempt += 1
+            remaining_contracts = target_contracts - filled_contracts
+            remaining_qty_btc = remaining_contracts * ct_val
+
             ticker = await self.get_ticker(instrument)
             mark = await self.get_option_mark_price(instrument)
             if mark <= 0:
@@ -965,13 +1068,10 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            # Capture decision-time market state for slippage metrics.
             if not captured_ref:
                 ref_bid, ref_ask, ref_mark = bid, ask, mark
                 captured_ref = True
 
-            # If ask is missing (empty offer side), seed it using mark
-            # so we can still place a maker offer above bid.
             effective_ask = ask if ask > 0 else max(mark + tick, tick * 2)
             effective_bid = bid if bid > 0 else max(mark - tick, tick)
 
@@ -979,9 +1079,6 @@ class OKXExchange:
             new_price = last_price - (last_price - target_bot) \
                 * config.OPTION_CHASE_GAP_NARROW_PCT
 
-            # Ceiling: ideally one tick below effective_ask (front of ask queue).
-            # In tight 1-tick spreads that lands AT the bid; collapse to the
-            # ask level so we still post a non-crossing offer.
             improvement_ceiling = effective_ask - tick
             if improvement_ceiling <= effective_bid:
                 ceiling_price = effective_ask
@@ -989,7 +1086,6 @@ class OKXExchange:
                 ceiling_price = improvement_ceiling
             new_price = min(new_price, ceiling_price)
 
-            # Floor: never AT or below bid (would cross → post_only reject).
             floor_price = effective_bid + tick
             if floor_price > effective_ask:
                 floor_price = effective_ask
@@ -1008,15 +1104,20 @@ class OKXExchange:
 
             log.info("chase_sell_attempt",
                      instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark,
-                     tick=tick)
+                     price=new_price, bid=bid, ask=ask, mark=mark, tick=tick,
+                     remaining_contracts=remaining_contracts,
+                     filled_so_far=filled_contracts,
+                     target_contracts=target_contracts)
 
             order = await self._place_limit_order(
-                instrument, "sell", qty_btc, new_price, post_only=True,
+                instrument, "sell", remaining_qty_btc, new_price,
+                post_only=True,
             )
             ord_id = order.get("ordId")
             sCode = str(order.get("sCode") or "")
             sMsg = str(order.get("sMsg") or "")
+            if ord_id:
+                last_ord_id = ord_id
 
             if sCode == "51120" or "would immediately match" in sMsg.lower() \
                     or "post_only" in sMsg.lower():
@@ -1025,21 +1126,16 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            FATAL_CODES = {
-                "51000", "51001", "51008", "51010", "51016", "51019",
-                "51020", "51115", "51121", "51169", "51198",
-            }
             if sCode in FATAL_CODES:
                 log.error("chase_sell_fatal_reject",
                           instrument=instrument, sCode=sCode, sMsg=sMsg,
-                          attempt=attempt)
+                          attempt=attempt, filled_so_far=filled_contracts)
                 await _notify_chase_failure(
                     side="sell", instrument=instrument,
                     qty_btc=qty_btc, reason="fatal_reject",
                     sCode=sCode, sMsg=sMsg, attempt=attempt,
                 )
-                # Return None — caller (unwind logic) will retry / alert.
-                return None
+                break
 
             if not ord_id or sCode not in ("0", ""):
                 log.warning("chase_sell_order_rejected",
@@ -1048,34 +1144,9 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            status = await self._wait_for_fill(
+            await self._wait_for_fill(
                 instrument, ord_id, config.OPTION_CHASE_INTERVAL_SEC,
             )
-            state = status.get("state", "")
-            if state == "filled":
-                avg_px = self._f(status, "avgPx", default=new_price)
-                t_filled = time.time()
-                metrics = _build_fill_metrics(
-                    side="sell",
-                    instrument=instrument,
-                    qty_btc=qty_btc,
-                    fill_price=avg_px,
-                    t_started=t_started,
-                    t_filled=t_filled,
-                    attempts=attempt,
-                    ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
-                )
-                log.info("chase_sell_filled",
-                         instrument=instrument, avg=avg_px, attempt=attempt,
-                         duration_sec=metrics["duration_sec"],
-                         slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
-                         saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
-                return {
-                    "average_price": avg_px,
-                    "order_id": ord_id,
-                    "avgPrice": avg_px,
-                    "metrics": metrics,
-                }
             try:
                 await self._call(
                     self._trade.cancel_order,
@@ -1084,13 +1155,77 @@ class OKXExchange:
             except Exception:
                 pass
 
-        log.error("chase_sell_deadline_exhausted", instrument=instrument)
-        await _notify_chase_failure(
-            side="sell", instrument=instrument,
-            qty_btc=qty_btc, reason="deadline_exhausted",
-            sCode="", sMsg="", attempt=attempt,
+            try:
+                final = await self.get_order_status(instrument, ord_id)
+            except Exception:
+                final = {}
+            filled_this = int(self._f(final, "accFillSz"))
+            avg_px_this = self._f(final, "avgPx", default=new_price)
+
+            if filled_this > 0:
+                filled_contracts += filled_this
+                weighted_value += filled_this * avg_px_this
+                log.info("chase_sell_partial_or_full_recorded",
+                         instrument=instrument, attempt=attempt,
+                         filled_this_attempt=filled_this,
+                         total_filled=filled_contracts,
+                         remaining=target_contracts - filled_contracts,
+                         vwap=weighted_value / filled_contracts,
+                         px_this=avg_px_this)
+
+        if filled_contracts == 0:
+            if attempt > 0 and time.time() >= deadline:
+                log.error("chase_sell_deadline_exhausted",
+                          instrument=instrument, attempts=attempt)
+                await _notify_chase_failure(
+                    side="sell", instrument=instrument,
+                    qty_btc=qty_btc, reason="deadline_exhausted",
+                    sCode="", sMsg="", attempt=attempt,
+                )
+            return None
+
+        vwap = weighted_value / filled_contracts
+        filled_qty_btc = filled_contracts * ct_val
+        fully_filled = filled_contracts >= target_contracts
+        t_filled = time.time()
+        metrics = _build_fill_metrics(
+            side="sell",
+            instrument=instrument,
+            qty_btc=filled_qty_btc,
+            fill_price=vwap,
+            t_started=t_started,
+            t_filled=t_filled,
+            attempts=attempt,
+            ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
         )
-        return None
+        if fully_filled:
+            log.info("chase_sell_filled",
+                     instrument=instrument, avg=vwap, attempts=attempt,
+                     duration_sec=metrics["duration_sec"],
+                     slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
+                     saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
+        else:
+            log.warning("chase_sell_partial_terminated",
+                        instrument=instrument,
+                        filled_contracts=filled_contracts,
+                        target_contracts=target_contracts,
+                        filled_qty_btc=filled_qty_btc,
+                        target_qty_btc=qty_btc,
+                        vwap=vwap, attempts=attempt)
+            await _notify_partial_fill(
+                side="sell", instrument=instrument,
+                filled_contracts=filled_contracts,
+                target_contracts=target_contracts,
+                vwap=vwap,
+            )
+        return {
+            "average_price": vwap,
+            "order_id": last_ord_id,
+            "avgPrice": vwap,
+            "filled_qty_btc": filled_qty_btc,
+            "fully_filled": fully_filled,
+            "metrics": metrics,
+        }
 
     # ──────────────────── RFQ (Block Trading) ─────────────────────
     #
