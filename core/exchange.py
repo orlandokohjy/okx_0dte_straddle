@@ -373,8 +373,15 @@ class OKXExchange:
             return self._default_option_tick
 
         # Cache every row while we have the data — saves later RTTs.
+        # Only count rows that are *real options* (instId ends in "-C" or
+        # "-P" and matches the BASE-QUOTE-EXPIRY-STRIKE-{C|P} shape) toward
+        # the default-tick computation. OKX sometimes returns non-option
+        # entries when instType+uly are loose; on 2026-05-07 this caused
+        # _default_option_tick to be set to 5.0 (futures tick) which would
+        # have been a latent footgun if the per-instrument cache missed.
         ticks: list[float] = []
         ct_vals: list[float] = []
+        option_rows = 0
         for r in rows:
             inst = r.get("instId")
             if not inst:
@@ -386,18 +393,44 @@ class OKXExchange:
                 "minSz": self._f(r, "minSz"),
             }
             self._inst_meta[inst] = meta
+
+            # Filter for genuine option instruments (ends in -C or -P)
+            parts = inst.split("-")
+            is_option = (
+                len(parts) == 5 and parts[-1] in ("C", "P")
+                and (r.get("instType") or "OPTION") == "OPTION"
+            )
+            if not is_option:
+                continue
+            option_rows += 1
             if meta["tickSz"] > 0:
                 ticks.append(meta["tickSz"])
             if meta["ctVal"] > 0:
                 ct_vals.append(meta["ctVal"])
 
         if ticks:
-            self._default_option_tick = ticks[0]
+            # Use the most common tick — OKX BTC options are uniform
+            # 0.0001 across the family, so this should be unambiguous.
+            from collections import Counter
+            most_common_tick = Counter(ticks).most_common(1)[0][0]
+            self._default_option_tick = most_common_tick
+
         live_ct = ct_vals[0] if ct_vals else 0.0
+
+        # Sanity: an option tick > 0.01 BTC is almost certainly wrong (real
+        # OKX BTC options are 0.0001). If we got something nonsensical,
+        # refuse to override the sensible config default.
+        if self._default_option_tick > 0.01:
+            log.warning("prime_tick_implausible",
+                        candidate=self._default_option_tick,
+                        action="keeping config fallback",
+                        config_value=config.OPTION_TICK_SIZE)
+            self._default_option_tick = config.OPTION_TICK_SIZE
 
         log.info("instrument_meta_primed",
                  underlying=underlying,
-                 instruments=len(rows),
+                 total_rows=len(rows),
+                 option_rows=option_rows,
                  tick_size=self._default_option_tick,
                  contract_size=live_ct)
 
