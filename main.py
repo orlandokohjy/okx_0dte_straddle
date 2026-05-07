@@ -61,6 +61,42 @@ def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
         log.warning("entry_now_disable_failed", exc_info=True)
 
 
+def _disable_reset_state_in_env_file(env_path: str = ".env") -> None:
+    """Rewrite RESET_STATE_ON_BOOT=true → false. Same auto-disable pattern as
+    ENTRY_NOW so a container restart never silently wipes state twice."""
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r") as f:
+            content = f.read()
+        new_content = re.sub(
+            r"^(\s*RESET_STATE_ON_BOOT\s*=\s*)(true|TRUE|True|1)\b.*$",
+            r"\1false",
+            content,
+            flags=re.MULTILINE,
+        )
+        if new_content != content:
+            with open(env_path, "w") as f:
+                f.write(new_content)
+            log.info("reset_state_auto_disabled", env_path=env_path)
+    except Exception:
+        log.warning("reset_state_auto_disable_failed", exc_info=True)
+
+
+def _reset_local_state() -> None:
+    """Delete state/equity.json + state/positions.json. Caller is responsible
+    for the ENTRY_NOW-style auto-disable so this only runs once."""
+    removed: list[str] = []
+    for path in (config.EQUITY_FILE, config.POSITIONS_FILE):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                removed.append(path)
+        except Exception:
+            log.warning("state_reset_unlink_failed", path=path, exc_info=True)
+    log.info("state_reset_done", removed=removed)
+
+
 class Algo:
     def __init__(self) -> None:
         self.exchange = OKXExchange()
@@ -80,25 +116,63 @@ class Algo:
     async def start(self) -> None:
         setup_logging()
         mode = "DEMO" if config.OKX_FLAG == "1" else "LIVE"
-        log.info("algo_starting", mode=mode, dry_run=config.DRY_RUN)
+
+        # Optional one-shot state reset — wipe demo equity/positions before
+        # connecting so we don't leak the $5,000 demo seed into a live boot.
+        if config.RESET_STATE_ON_BOOT:
+            _reset_local_state()
+            _disable_reset_state_in_env_file()
+            self.portfolio = Portfolio()  # reload from clean state
+            self.risk = RiskManager(self.portfolio)
+            self.exit_mgr = ExitManager(
+                self.exchange, self.market, self.portfolio,
+            )
+
+        log.info("algo_starting", mode=mode, dry_run=config.DRY_RUN,
+                 has_creds=config.HAS_OKX_CREDS,
+                 reset_state=config.RESET_STATE_ON_BOOT)
 
         self.exchange.connect()
 
-        if not config.DRY_RUN:
+        # Prime per-instrument metadata (tick size, contract size). Public
+        # endpoint, no auth required. Sets the runtime tick that chase_buy/
+        # chase_sell use, replacing the old hardcoded OPTION_TICK_SIZE=5.0.
+        try:
+            await self.exchange.prime_option_tick_size()
+        except Exception:
+            log.warning("prime_option_tick_failed", exc_info=True)
+
+        # Auth-required startup safeguards. Run whenever we HAVE credentials,
+        # regardless of DRY_RUN — this lets a dry-run boot still validate the
+        # auth path + balance fetch + position reconcile, catching bad keys
+        # before we ever flip to live.
+        if config.HAS_OKX_CREDS:
             await self._startup_cancel_stale_orders()
             await self._startup_reconcile_positions()
 
         spot = await self.exchange.get_spot_price()
 
-        if not config.DRY_RUN:
+        if config.HAS_OKX_CREDS:
             live_equity = await self.exchange.get_account_equity()
             if live_equity > 0:
                 self.portfolio.sync_equity(live_equity)
 
+        # Self-test: simulate a chase iteration on a real ITM option and
+        # abort if the math produces nonsense (defends against unit-conv
+        # regressions like the 2026-05-07 OPTION_TICK_SIZE=5.0 USD bug).
+        ok = await self._chase_pricing_selftest(spot)
+        if not ok:
+            self._entry_locked = True
+            self._lock_reason = (
+                "Chase-pricing self-test failed — see logs. "
+                "Tick size / unit conversion likely misconfigured."
+            )
+
         log.info("algo_initialized",
                  spot=f"${spot:,.2f}",
                  equity=f"${self.portfolio.equity:,.2f}",
-                 entry_locked=self._entry_locked)
+                 entry_locked=self._entry_locked,
+                 tick_size=self.exchange.get_tick_size())
 
         lock_line = (
             f"\n<b>⚠️ ENTRY LOCKED</b>: {self._lock_reason}"
@@ -136,6 +210,92 @@ class Algo:
         await self._shutdown.wait()
 
     # ──────────────────── Startup Safeguards ──────────────────────
+
+    async def _chase_pricing_selftest(self, spot: float) -> bool:
+        """
+        Simulate one chase_buy iteration on a live ITM option and verify the
+        resulting price is sensible. Catches unit-conversion regressions (the
+        2026-05-07 incident where OPTION_TICK_SIZE=5.0 USD added 5 BTC to a
+        BTC-quoted bid, producing 5.0055 BTC) BEFORE we ever route an order.
+
+        Returns False if the test cannot run (no chain) or if the simulated
+        price is outside sanity bounds. Caller locks entry on False.
+        """
+        try:
+            count = await self.chain.refresh()
+            if count == 0:
+                log.warning("selftest_skipped_no_chain")
+                return True  # not a math bug; just no data — don't block
+
+            sample = None
+            for c in self.chain.calls:
+                if c.strike < spot and c.ask > 0:
+                    sample = c
+                    break
+            if sample is None:
+                for p in self.chain.puts:
+                    if p.ask > 0:
+                        sample = p
+                        break
+            if sample is None:
+                log.warning("selftest_skipped_no_quotes")
+                return True
+
+            tick = self.exchange.get_tick_size(sample.symbol)
+            if tick <= 0:
+                tick = config.OPTION_TICK_SIZE
+
+            mark = await self.exchange.get_option_mark_price(sample.symbol)
+            if mark <= 0:
+                mark = sample.mark if sample.mark > 0 else sample.ask
+
+            bid = sample.bid if sample.bid > 0 else max(mark - tick, tick)
+            ask = sample.ask
+            target_top = max(bid, ask - tick)
+            new_price = bid + (target_top - bid) * \
+                config.OPTION_CHASE_GAP_NARROW_PCT
+            improvement_floor = bid + tick
+            floor = bid if improvement_floor >= ask else improvement_floor
+            ceiling = bid if (ask - tick) < bid else (ask - tick)
+            new_price = max(min(new_price, ceiling), floor)
+
+            ok_vs_mark = (
+                mark <= 0 or
+                new_price <= mark * config.CHASE_SELFTEST_MAX_OVER_MARK
+            )
+            ok_absolute = new_price <= config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC
+            ok_positive = new_price > 0
+
+            log.info("chase_selftest",
+                     instrument=sample.symbol,
+                     bid=bid, ask=ask, mark=mark, tick=tick,
+                     simulated_price=new_price,
+                     ok_vs_mark=ok_vs_mark,
+                     ok_absolute=ok_absolute,
+                     ok_positive=ok_positive)
+
+            if not (ok_vs_mark and ok_absolute and ok_positive):
+                log.error("chase_selftest_failed",
+                          instrument=sample.symbol,
+                          simulated_price=new_price,
+                          mark=mark, tick=tick,
+                          max_over_mark=config.CHASE_SELFTEST_MAX_OVER_MARK,
+                          max_absolute=config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC)
+                await notifier.send(
+                    f"<b>STARTUP SELF-TEST FAILED</b>\n"
+                    f"Chase math produced an unreasonable price on a "
+                    f"sample option.\n"
+                    f"Instrument: {sample.symbol}\n"
+                    f"Bid/Ask: {bid:.4f} / {ask:.4f} BTC\n"
+                    f"Mark: {mark:.4f} BTC, tick: {tick:.4f}\n"
+                    f"Simulated price: {new_price:.4f} BTC\n"
+                    f"Entry will be LOCKED until restart with fix."
+                )
+                return False
+            return True
+        except Exception:
+            log.error("chase_selftest_exception", exc_info=True)
+            return True  # don't block on transient errors
 
     async def _startup_cancel_stale_orders(self) -> None:
         try:
@@ -270,13 +430,14 @@ class Algo:
             )
             return
 
-        if not config.DRY_RUN:
+        if config.HAS_OKX_CREDS:
             live_equity = await self.exchange.get_account_equity()
             if live_equity > 0:
                 self.portfolio.sync_equity(live_equity)
 
         equity = self.portfolio.equity
-        sizing = size_position(equity, pair.call.ask, pair.put.ask)
+        # Premium quotes are in BTC; sizer needs spot to compute USD costs.
+        sizing = size_position(equity, pair.call.ask, pair.put.ask, spot)
 
         if config.NUM_STRADDLES_OVERRIDE > 0:
             sizing.num_straddles = config.NUM_STRADDLES_OVERRIDE
@@ -312,7 +473,7 @@ class Algo:
             return
 
         # ── Pre-entry collateral check ──
-        if not config.DRY_RUN:
+        if config.HAS_OKX_CREDS:
             available = await self.exchange.get_account_equity()
             required = sizing.total_capital_required \
                 * config.COLLATERAL_BUFFER_FACTOR
@@ -371,23 +532,32 @@ class Algo:
         if straddle:
             self._consecutive_failures = 0
             volume_tracker.record_trade(sizing.num_straddles)
+            # Convert BTC-quoted premiums to USD for human-readable display.
+            entry_spot = straddle.entry_spot_price or spot
+            call_fill_usd = straddle.entry_call_price * entry_spot
+            put_fill_usd = straddle.entry_put_price * entry_spot
+            call_cost_total_usd = (
+                call_fill_usd * config.QTY_PER_LEG * sizing.num_straddles
+            )
+            put_cost_total_usd = (
+                put_fill_usd * config.QTY_PER_LEG * sizing.num_straddles
+            )
             await notifier.notify_entry(
                 num_straddles=sizing.num_straddles,
                 equity=equity,
                 straddle_cost=sizing.straddle_cost,
                 strike=pair.strike,
-                call_fill=straddle.entry_call_price,
-                put_fill=straddle.entry_put_price,
-                call_cost_total=(
-                    straddle.entry_call_price
-                    * config.QTY_PER_LEG * sizing.num_straddles
-                ),
-                put_cost_total=(
-                    straddle.entry_put_price
-                    * config.QTY_PER_LEG * sizing.num_straddles
-                ),
+                call_fill=call_fill_usd,
+                put_fill=put_fill_usd,
+                call_cost_total=call_cost_total_usd,
+                put_cost_total=put_cost_total_usd,
             )
-            log.info("session_entry_done", num_straddles=sizing.num_straddles)
+            log.info("session_entry_done",
+                     num_straddles=sizing.num_straddles,
+                     call_fill_btc=straddle.entry_call_price,
+                     put_fill_btc=straddle.entry_put_price,
+                     call_fill_usd=call_fill_usd,
+                     put_fill_usd=put_fill_usd)
         else:
             log.error("straddle_build_failed")
             self._register_session_failure("build_straddle returned None")
@@ -448,7 +618,7 @@ class Algo:
             equity_before = self.portfolio.equity
             pnl = await self.exit_mgr.hard_close()
 
-            if not config.DRY_RUN:
+            if config.HAS_OKX_CREDS:
                 live_equity = await self.exchange.get_account_equity()
                 if live_equity > 0:
                     self.portfolio.sync_equity(live_equity)

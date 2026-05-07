@@ -47,14 +47,16 @@ async def notify_entry(
     strike: float, call_fill: float, put_fill: float,
     call_cost_total: float, put_cost_total: float,
 ) -> None:
+    """All money values are USD. The caller is responsible for converting
+    BTC-quoted OKX premiums to USD via spot before invoking this."""
     await send(
         f"<b>SESSION ENTRY</b>\n"
         f"Straddles: {num_straddles}\n"
         f"Equity: ${equity:,.2f}\n"
         f"\n<b>Fills</b>\n"
         f"Strike: ${strike:,.0f}\n"
-        f"Call premium: ${call_fill:,.2f}\n"
-        f"Put premium: ${put_fill:,.2f}\n"
+        f"Call premium per BTC: ${call_fill:,.2f}\n"
+        f"Put premium per BTC: ${put_fill:,.2f}\n"
         f"\n<b>Capital used</b>\n"
         f"Call cost: ${call_cost_total:,.2f}\n"
         f"Put cost: ${put_cost_total:,.2f}\n"

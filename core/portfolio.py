@@ -89,22 +89,61 @@ class Straddle:
     exit_put_price: Optional[float] = None
     pnl: Optional[float] = None
 
-    def call_pnl(self, call_now: float) -> float:
+    def call_pnl(self, call_now: float, exit_spot: float = 0.0) -> float:
+        """USD P&L on the call leg.
+
+        Premium quotes are in BTC per BTC of notional. To convert to USD we
+        cost the entry leg at the entry spot and credit the exit leg at the
+        exit spot — this is the USDT-account convention (account value rises
+        when premium-in-BTC × spot rises). If spot is missing, we degrade
+        gracefully to a single-spot model using whichever is available.
+        """
+        entry_spot = self.entry_spot_price
+        spot_for_exit = exit_spot or self.exit_spot_price or entry_spot
+        if entry_spot <= 0 and spot_for_exit <= 0:
+            # No spot information at all — fall back to BTC-only number.
+            # Better than crashing; the trade log will flag missing spots.
+            return (
+                self.qty_per_leg
+                * (call_now - self.entry_call_price)
+                * self.num_straddles
+            )
+        if entry_spot <= 0:
+            entry_spot = spot_for_exit
+        if spot_for_exit <= 0:
+            spot_for_exit = entry_spot
         return (
             self.qty_per_leg
-            * (call_now - self.entry_call_price)
             * self.num_straddles
+            * (call_now * spot_for_exit - self.entry_call_price * entry_spot)
         )
 
-    def put_pnl(self, put_now: float) -> float:
+    def put_pnl(self, put_now: float, exit_spot: float = 0.0) -> float:
+        entry_spot = self.entry_spot_price
+        spot_for_exit = exit_spot or self.exit_spot_price or entry_spot
+        if entry_spot <= 0 and spot_for_exit <= 0:
+            return (
+                self.qty_per_leg
+                * (put_now - self.entry_put_price)
+                * self.num_straddles
+            )
+        if entry_spot <= 0:
+            entry_spot = spot_for_exit
+        if spot_for_exit <= 0:
+            spot_for_exit = entry_spot
         return (
             self.qty_per_leg
-            * (put_now - self.entry_put_price)
             * self.num_straddles
+            * (put_now * spot_for_exit - self.entry_put_price * entry_spot)
         )
 
-    def combined_pnl(self, call_now: float, put_now: float) -> float:
-        return self.call_pnl(call_now) + self.put_pnl(put_now)
+    def combined_pnl(
+        self, call_now: float, put_now: float, exit_spot: float = 0.0,
+    ) -> float:
+        return (
+            self.call_pnl(call_now, exit_spot)
+            + self.put_pnl(put_now, exit_spot)
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -176,7 +215,11 @@ class Portfolio:
         if s is None or s.status != "open":
             return 0.0
 
-        pnl = s.combined_pnl(exit_call_price, exit_put_price)
+        # USD P&L using entry_spot for the entry leg and exit_spot for the
+        # exit leg (set on Straddle by unwind_straddle just before close).
+        pnl = s.combined_pnl(
+            exit_call_price, exit_put_price, exit_spot=s.exit_spot_price,
+        )
         s.status = "closed"
         s.exit_time = now_utc().isoformat()
         s.exit_call_price = exit_call_price
@@ -224,7 +267,24 @@ class Portfolio:
 
     def _log_trade(self, s: Straddle, exit_reason: str) -> None:
         os.makedirs(config.STATE_DIR, exist_ok=True)
-        total_capital_used = s.straddle_cost * s.num_straddles
+
+        # Convert BTC-quoted premiums to USD using the spot at the moment of
+        # the relevant fill (entry_spot for entry legs, exit_spot for exit
+        # legs). Daily/weekly reports read these CSV columns as USD amounts.
+        entry_spot = s.entry_spot_price or 0.0
+        exit_spot = s.exit_spot_price or entry_spot or 0.0
+        call_entry_usd = (s.entry_call_price or 0.0) * entry_spot
+        put_entry_usd = (s.entry_put_price or 0.0) * entry_spot
+        call_exit_usd = (s.exit_call_price or 0.0) * exit_spot
+        put_exit_usd = (s.exit_put_price or 0.0) * exit_spot
+        straddle_cost_usd = (call_entry_usd + put_entry_usd) * s.qty_per_leg
+        total_capital_used = straddle_cost_usd * s.num_straddles
+        call_pnl_usd = s.call_pnl(
+            s.exit_call_price or s.entry_call_price, exit_spot=exit_spot,
+        )
+        put_pnl_usd = s.put_pnl(
+            s.exit_put_price or s.entry_put_price, exit_spot=exit_spot,
+        )
 
         ce = s.call_leg.entry_metrics or {}
         cx = s.call_leg.exit_metrics or {}
@@ -240,15 +300,15 @@ class Portfolio:
             "strike": s.strike,
             "entry_spot": s.entry_spot_price,
             "exit_spot": s.exit_spot_price,
-            "call_premium_entry": s.entry_call_price,
-            "call_premium_exit": s.exit_call_price,
-            "put_premium_entry": s.entry_put_price,
-            "put_premium_exit": s.exit_put_price,
+            "call_premium_entry": round(call_entry_usd, 4),
+            "call_premium_exit": round(call_exit_usd, 4),
+            "put_premium_entry": round(put_entry_usd, 4),
+            "put_premium_exit": round(put_exit_usd, 4),
             "total_capital_used": round(total_capital_used, 2),
-            "straddle_cost": s.straddle_cost,
+            "straddle_cost": round(straddle_cost_usd, 4),
             "capital_before": self._equity - (s.pnl or 0),
-            "call_pnl": s.call_pnl(s.exit_call_price or s.entry_call_price),
-            "put_pnl": s.put_pnl(s.exit_put_price or s.entry_put_price),
+            "call_pnl": round(call_pnl_usd, 2),
+            "put_pnl": round(put_pnl_usd, 2),
             "gross_pnl": s.pnl,
             "fees": 0.0,
             "net_pnl": s.pnl,

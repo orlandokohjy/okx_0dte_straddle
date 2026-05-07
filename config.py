@@ -29,6 +29,18 @@ OKX_DOMAIN: str = os.getenv("OKX_DOMAIN", "https://www.okx.com")
 
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
 
+# When true, delete state/equity.json + state/positions.json on boot. Useful
+# for a clean cutover from demo state to a live deployment so we don't carry
+# the demo's $5,000 equity over. Auto-disables on first boot like ENTRY_NOW.
+RESET_STATE_ON_BOOT: bool = os.getenv(
+    "RESET_STATE_ON_BOOT", "false",
+).lower() == "true"
+
+# True iff API credentials are present. Used to gate startup-time auth calls
+# (reconcile, equity sync) independently from DRY_RUN. With creds + DRY_RUN
+# we still validate auth on startup, just don't place orders.
+HAS_OKX_CREDS: bool = bool(OKX_API_KEY and OKX_API_SECRET and OKX_PASSPHRASE)
+
 # ──────────────────── Strategy Constants ──────────────────────────
 BASE_COIN: str = "BTC"
 QUOTE_COIN: str = os.getenv("QUOTE_COIN", "USD")  # "USD" (coin-margined) or "USDT"
@@ -52,7 +64,21 @@ ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
 
 # ──────────────────── Execution Settings ──────────────────────────
 OPTION_CHASE_INTERVAL_SEC: float = 5.0
-OPTION_TICK_SIZE: float = 5.0  # OKX BTC option tick size in USD; verify via SDK
+
+# OKX BTC-USD coin-margined options:
+#   • Premium quoted in BTC (per BTC of underlying notional, dimensionless)
+#   • Tick size = 0.0005 BTC across all strikes/expiries (verified 2026-05)
+# This default is used as a fallback only — on startup the algo queries
+# /api/v5/public/instruments and overrides with the live tickSz from OKX.
+OPTION_TICK_SIZE: float = float(os.getenv("OPTION_TICK_SIZE", "0.0005"))
+
+# Sanity-check bounds for the chase-pricing self-test on startup. If the
+# chase math yields a price outside these bounds for a real ITM option
+# (relative to its mark), the algo aborts with a clear error rather than
+# attempting orders. Guards against unit-conversion regressions like the
+# OPTION_TICK_SIZE=5.0 (USD) bug.
+CHASE_SELFTEST_MAX_OVER_MARK: float = 1.5     # never > 1.5× mark
+CHASE_SELFTEST_MAX_ABSOLUTE_BTC: float = 0.5  # never > 0.5 BTC absolute
 
 # Maker-only chase: 50% bid-ask gap narrowing per retry, fair-value cap, deadline
 OPTION_CHASE_GAP_NARROW_PCT: float = float(

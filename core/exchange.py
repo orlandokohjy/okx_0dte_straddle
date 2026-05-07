@@ -8,10 +8,20 @@ Provides async helpers around the (sync) python-okx SDK for:
   - Maker-only order placement (post_only) with reject-on-cross
   - Maker-only chase: 50% bid-ask gap narrowing, fair-value cap, deadline
   - Cancel-all stale orders (called at startup)
+  - Live instrument-metadata fetch (tick size, contract size) on connect
 
 OKX BTC option naming: e.g.  BTC-USD-260418-65000-C
-Contract size is 0.01 BTC (configurable in config.OKX_CONTRACT_SIZE_BTC).
-Premiums are quoted in USD; settlement is in BTC for coin-margined options.
+Contract size = 0.01 BTC (verified per instrument via get_instrument_meta).
+
+UNIT CONVENTIONS for BTC-USD coin-margined inverse options:
+  • Premium px is quoted in BTC, as a fraction of the underlying notional
+    (e.g. 0.0065 BTC means 0.65% of the BTC underlying)
+  • Tick size = 0.0005 BTC across the OKX BTC option family
+  • To get USD premium per contract:  px × ctVal × spot
+  • To get USD premium per BTC notional: px × spot
+The previous codebase comment that premiums are "quoted in USD" was wrong
+— this caused a critical bug where OPTION_TICK_SIZE=5.0 (USD) was added to
+BTC-quoted bids, producing nonsense prices like 5.0055 BTC.
 
 NOTE: RFQ / Block Trading is stubbed — see send_rfq() / send_rfq_sell().
 Most retail accounts cannot use it, so leg-by-leg chase is the default.
@@ -125,6 +135,14 @@ class OKXExchange:
         self._account = None
         self._connected: bool = False
         self.error_count: int = 0
+        # Per-instrument metadata cache populated by prime_instrument_meta /
+        # get_instrument_meta. Each entry: {tickSz, ctVal, lotSz, minSz}
+        self._inst_meta: dict[str, dict] = {}
+        # Default tick size for the BTC option family. Seeded from config but
+        # overwritten on startup via prime_option_tick_size() with the live
+        # value from /api/v5/public/instruments. Used by chase_buy/chase_sell
+        # when an instrument-specific tick isn't cached.
+        self._default_option_tick: float = config.OPTION_TICK_SIZE
 
     # ──────────────────── Connection ──────────────────────────────
 
@@ -291,6 +309,115 @@ class OKXExchange:
         if not rows:
             return 0.0
         return self._f(rows[0], "markPx")
+
+    # ──────────────────── Instrument metadata ─────────────────────
+
+    async def get_instrument_meta(self, instrument: str) -> dict:
+        """
+        Fetch and cache per-instrument metadata (tickSz, ctVal, lotSz, minSz)
+        from /api/v5/public/instruments. Returns empty dict on failure so
+        callers can fall back to defaults.
+        """
+        cached = self._inst_meta.get(instrument)
+        if cached is not None:
+            return cached
+
+        resp = await self._call(
+            self._public.get_instruments,
+            instType="OPTION", instId=instrument,
+        )
+        rows = self._data_or_empty(resp)
+        if not rows:
+            return {}
+
+        r = rows[0]
+        meta = {
+            "tickSz": self._f(r, "tickSz"),
+            "ctVal": self._f(r, "ctVal"),
+            "lotSz": self._f(r, "lotSz"),
+            "minSz": self._f(r, "minSz"),
+        }
+        self._inst_meta[instrument] = meta
+        return meta
+
+    async def prime_option_tick_size(
+        self, sample_underlying: str = "",
+    ) -> float:
+        """
+        Read the live tick size for the BTC option family from OKX and
+        update self._default_option_tick. Returns the tick size in use.
+
+        We query the full instrument list for instType=OPTION+uly=<base-quote>
+        and pick the first row's tickSz. OKX BTC options share a common tick
+        across strikes, so any sample is fine.
+        """
+        underlying = (
+            sample_underlying
+            or f"{config.BASE_COIN}-{config.QUOTE_COIN}"
+        )
+        try:
+            resp = await self._call(
+                self._public.get_instruments,
+                instType="OPTION", uly=underlying,
+            )
+        except Exception:
+            log.warning("prime_tick_failed",
+                        underlying=underlying, exc_info=True)
+            return self._default_option_tick
+
+        rows = self._data_or_empty(resp)
+        if not rows:
+            log.warning("prime_tick_empty",
+                        underlying=underlying,
+                        fallback=self._default_option_tick)
+            return self._default_option_tick
+
+        # Cache every row while we have the data — saves later RTTs.
+        ticks: list[float] = []
+        ct_vals: list[float] = []
+        for r in rows:
+            inst = r.get("instId")
+            if not inst:
+                continue
+            meta = {
+                "tickSz": self._f(r, "tickSz"),
+                "ctVal": self._f(r, "ctVal"),
+                "lotSz": self._f(r, "lotSz"),
+                "minSz": self._f(r, "minSz"),
+            }
+            self._inst_meta[inst] = meta
+            if meta["tickSz"] > 0:
+                ticks.append(meta["tickSz"])
+            if meta["ctVal"] > 0:
+                ct_vals.append(meta["ctVal"])
+
+        if ticks:
+            self._default_option_tick = ticks[0]
+        live_ct = ct_vals[0] if ct_vals else 0.0
+
+        log.info("instrument_meta_primed",
+                 underlying=underlying,
+                 instruments=len(rows),
+                 tick_size=self._default_option_tick,
+                 contract_size=live_ct)
+
+        # Sanity: if OKX advertises a different contract size than our config,
+        # warn loudly so the operator can fix .env.
+        if live_ct > 0 and abs(live_ct - config.OKX_CONTRACT_SIZE_BTC) > 1e-9:
+            log.warning("contract_size_mismatch",
+                        config=config.OKX_CONTRACT_SIZE_BTC,
+                        live=live_ct,
+                        action="update OKX_CONTRACT_SIZE_BTC in .env")
+
+        return self._default_option_tick
+
+    def get_tick_size(self, instrument: str = "") -> float:
+        """Per-instrument tick size if cached, else the family default."""
+        if instrument:
+            meta = self._inst_meta.get(instrument)
+            if meta and meta.get("tickSz", 0) > 0:
+                return meta["tickSz"]
+        return self._default_option_tick
 
     # ──────────────────── Account / positions ─────────────────────
 
@@ -478,6 +605,11 @@ class OKXExchange:
         OPTION_CHASE_GAP_NARROW_PCT each retry, never crossing past
         mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails on deadline.
 
+        Tight-spread handling: if (bid + tick) ≥ ask (1-tick wide market,
+        common in liquid 0DTE options), the floor collapses to `bid` so we
+        place a non-crossing maker bid AT the bid level instead of getting
+        stuck rejecting against the ask forever.
+
         Returns dict with average_price + order_id + metrics on full fill,
         else None. The `metrics` dict captures execution-quality data:
             t_started_iso, t_filled_iso, duration_sec, attempts,
@@ -485,7 +617,7 @@ class OKXExchange:
             fill_price, qty_btc, side, instrument,
             slippage_vs_mark_pct, slippage_vs_mid_pct,
             taker_price_at_start (the ask), saved_vs_taker_pct,
-            saved_vs_taker_per_btc_usd  (premium quoted per BTC)
+            saved_vs_taker_per_btc_usd  (premium in BTC per BTC notional)
         """
         deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
         attempt = 0
@@ -493,6 +625,9 @@ class OKXExchange:
         t_started = time.time()
         ref_bid = ref_ask = ref_mark = 0.0
         captured_ref = False
+        tick = self.get_tick_size(instrument)
+        if tick <= 0:
+            tick = config.OPTION_TICK_SIZE
 
         while time.time() < deadline:
             attempt += 1
@@ -518,15 +653,33 @@ class OKXExchange:
             # If bid is missing (empty bid side, common on demo), seed it
             # using mark so we can still place a maker bid below ask.
             effective_bid = bid if bid > 0 else max(
-                mark - config.OPTION_TICK_SIZE,
-                config.OPTION_TICK_SIZE,
+                mark - tick, tick,
             )
 
             # 50% gap-narrowing: narrow remaining gap to (ask − tick) by pct
-            target_top = max(effective_bid, ask - config.OPTION_TICK_SIZE)
+            target_top = max(effective_bid, ask - tick)
             new_price = last_price + (target_top - last_price) \
                 * config.OPTION_CHASE_GAP_NARROW_PCT
-            new_price = max(new_price, effective_bid + config.OPTION_TICK_SIZE)
+
+            # Floor: prefer one tick above effective_bid (front of bid queue).
+            # But in tight 1-tick-wide spreads, that floor lands AT the ask
+            # which post_only would reject every time. In that case, drop
+            # the floor to effective_bid (queue at bid level instead).
+            improvement_floor = effective_bid + tick
+            if improvement_floor >= ask:
+                # Tight spread: queue at bid; still maker, just slower.
+                floor_price = effective_bid
+            else:
+                floor_price = improvement_floor
+            new_price = max(new_price, floor_price)
+
+            # Hard ceiling: never AT or above ask (would cross → post_only
+            # reject loop). Stay at least one tick below.
+            ceiling_price = ask - tick
+            if ceiling_price < effective_bid:
+                # Tight spread again — settle at effective_bid.
+                ceiling_price = effective_bid
+            new_price = min(new_price, ceiling_price)
 
             # Fair-value cap: never bid above mark × max_slippage_factor
             max_price = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
@@ -537,13 +690,13 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            new_price = round(new_price / config.OPTION_TICK_SIZE) \
-                * config.OPTION_TICK_SIZE
+            new_price = round(new_price / tick) * tick
             last_price = new_price
 
             log.info("chase_buy_attempt",
                      instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark)
+                     price=new_price, bid=bid, ask=ask, mark=mark,
+                     tick=tick)
 
             order = await self._place_limit_order(
                 instrument, "buy", qty_btc, new_price, post_only=True,
@@ -615,6 +768,10 @@ class OKXExchange:
         Maker-only sell chase: walks toward the bid by narrowing the gap by
         OPTION_CHASE_GAP_NARROW_PCT each retry, never below
         mark / OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails on deadline.
+
+        Tight-spread handling: if (ask − tick) ≤ bid (1-tick wide market),
+        the ceiling collapses to `ask` so we place a non-crossing maker
+        offer AT the ask level instead of looping forever rejecting.
         """
         deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
         attempt = 0
@@ -622,6 +779,9 @@ class OKXExchange:
         t_started = time.time()
         ref_bid = ref_ask = ref_mark = 0.0
         captured_ref = False
+        tick = self.get_tick_size(instrument)
+        if tick <= 0:
+            tick = config.OPTION_TICK_SIZE
 
         while time.time() < deadline:
             attempt += 1
@@ -644,19 +804,28 @@ class OKXExchange:
 
             # If ask is missing (empty offer side), seed it using mark
             # so we can still place a maker offer above bid.
-            effective_ask = ask if ask > 0 else max(
-                mark + config.OPTION_TICK_SIZE,
-                config.OPTION_TICK_SIZE * 2,
-            )
-            effective_bid = bid if bid > 0 else max(
-                mark - config.OPTION_TICK_SIZE,
-                config.OPTION_TICK_SIZE,
-            )
+            effective_ask = ask if ask > 0 else max(mark + tick, tick * 2)
+            effective_bid = bid if bid > 0 else max(mark - tick, tick)
 
-            target_bot = min(effective_ask, effective_bid + config.OPTION_TICK_SIZE)
+            target_bot = min(effective_ask, effective_bid + tick)
             new_price = last_price - (last_price - target_bot) \
                 * config.OPTION_CHASE_GAP_NARROW_PCT
-            new_price = min(new_price, effective_ask - config.OPTION_TICK_SIZE)
+
+            # Ceiling: ideally one tick below effective_ask (front of ask queue).
+            # In tight 1-tick spreads that lands AT the bid; collapse to the
+            # ask level so we still post a non-crossing offer.
+            improvement_ceiling = effective_ask - tick
+            if improvement_ceiling <= effective_bid:
+                ceiling_price = effective_ask
+            else:
+                ceiling_price = improvement_ceiling
+            new_price = min(new_price, ceiling_price)
+
+            # Floor: never AT or below bid (would cross → post_only reject).
+            floor_price = effective_bid + tick
+            if floor_price > effective_ask:
+                floor_price = effective_ask
+            new_price = max(new_price, floor_price)
 
             min_price = mark / config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
             if new_price < min_price:
@@ -666,13 +835,13 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            new_price = round(new_price / config.OPTION_TICK_SIZE) \
-                * config.OPTION_TICK_SIZE
+            new_price = round(new_price / tick) * tick
             last_price = new_price
 
             log.info("chase_sell_attempt",
                      instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark)
+                     price=new_price, bid=bid, ask=ask, mark=mark,
+                     tick=tick)
 
             order = await self._place_limit_order(
                 instrument, "sell", qty_btc, new_price, post_only=True,

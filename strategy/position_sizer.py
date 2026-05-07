@@ -1,8 +1,15 @@
 """
-Compound position sizing for a pure option straddle.
+Compound position sizing for a pure option straddle on OKX BTC-USD options.
 
-straddle_cost = call_premium + put_premium  (per QTY_PER_LEG BTC)
-num_straddles = floor(ALLOC_PCT × equity / buffered_straddle_cost)
+OKX BTC-USD options are coin-margined inverse contracts:
+  • Premium px is quoted in BTC (per BTC of underlying notional)
+  • To compare to a USD equity figure, we must multiply by spot:
+        usd_premium_per_btc_notional = btc_premium × spot
+        usd_cost_per_straddle = QTY_PER_LEG × (usd_call + usd_put)
+
+Sizing math (all in USD):
+    straddle_cost_usd = call_cost_per_usd + put_cost_per_usd
+    num_straddles = floor(ALLOC_PCT × equity_usd / buffered_straddle_cost_usd)
 """
 from __future__ import annotations
 
@@ -21,26 +28,50 @@ SLIPPAGE_BUFFER: float = 0.05
 @dataclass
 class SizingResult:
     num_straddles: int
-    call_cost_per: float
-    put_cost_per: float
-    straddle_cost: float
-    total_call_cost: float
-    total_put_cost: float
-    total_capital_required: float
-    equity: float
-    available_capital: float
+    call_cost_per: float            # USD per straddle
+    put_cost_per: float             # USD per straddle
+    straddle_cost: float            # USD per straddle
+    total_call_cost: float          # USD for all straddles
+    total_put_cost: float           # USD for all straddles
+    total_capital_required: float   # USD with buffer
+    equity: float                   # USD
+    available_capital: float        # USD
 
 
 def size_position(
-    equity: float, call_premium: float, put_premium: float,
+    equity: float,
+    call_premium_btc: float,
+    put_premium_btc: float,
+    spot_usd: float,
 ) -> SizingResult:
     """
-    Compute sizing based on available equity and option premiums.
+    Compute sizing in USD given BTC-quoted premiums and spot price.
 
-    Both legs are pure option buys — no spot margin needed.
+    Args:
+        equity: Trading-account equity in USD (USDT/USDC).
+        call_premium_btc: Call ask in BTC (per BTC of notional).
+        put_premium_btc: Put ask in BTC (per BTC of notional).
+        spot_usd: BTC spot in USD, used to translate BTC premiums → USD.
+
+    Returns:
+        SizingResult with all fields denominated in USD.
     """
-    call_cost_per = config.QTY_PER_LEG * call_premium
-    put_cost_per = config.QTY_PER_LEG * put_premium
+    if spot_usd <= 0:
+        log.warning("size_position_invalid_spot",
+                    spot=spot_usd, action="returning zero straddles")
+        return SizingResult(
+            num_straddles=0, call_cost_per=0, put_cost_per=0,
+            straddle_cost=0, total_call_cost=0, total_put_cost=0,
+            total_capital_required=0, equity=equity,
+            available_capital=config.ALLOC_PCT * equity,
+        )
+
+    # USD premium per BTC of notional.
+    call_premium_usd = call_premium_btc * spot_usd
+    put_premium_usd = put_premium_btc * spot_usd
+
+    call_cost_per = config.QTY_PER_LEG * call_premium_usd
+    put_cost_per = config.QTY_PER_LEG * put_premium_usd
     straddle_cost = call_cost_per + put_cost_per
 
     if straddle_cost <= 0:
@@ -75,8 +106,11 @@ def size_position(
     log.info(
         "position_sized",
         equity=f"${equity:,.0f}",
+        spot=f"${spot_usd:,.0f}",
         available=f"${available:,.0f}",
         num_straddles=n,
+        call_premium_btc=call_premium_btc,
+        put_premium_btc=put_premium_btc,
         call_cost_per=f"${call_cost_per:,.2f}",
         put_cost_per=f"${put_cost_per:,.2f}",
         straddle_cost=f"${straddle_cost:,.2f}",
