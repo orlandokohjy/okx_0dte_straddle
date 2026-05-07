@@ -46,6 +46,55 @@ def _utc_iso(t_unix: float) -> str:
     return datetime.fromtimestamp(t_unix, tz=timezone.utc).isoformat()
 
 
+async def _notify_chase_failure(
+    *,
+    side: str,
+    instrument: str,
+    qty_btc: float,
+    reason: str,
+    sCode: str = "",
+    sMsg: str = "",
+    attempt: int = 0,
+) -> None:
+    """Telegram alert for any chase that returns None.
+
+    Imported lazily to avoid an import cycle (notifier imports nothing from
+    exchange today, but this future-proofs it). Failures inside the notifier
+    must never propagate up — the caller is already on a critical error path.
+    """
+    try:
+        from core import notifier
+        title = (
+            "CHASE FATAL REJECT" if reason == "fatal_reject"
+            else "CHASE DEADLINE EXHAUSTED"
+        )
+        body_lines = [
+            f"<b>{title}</b>",
+            f"Side: {side.upper()}",
+            f"Instrument: {instrument}",
+            f"Qty (BTC): {qty_btc}",
+            f"Attempts: {attempt}",
+        ]
+        if sCode:
+            body_lines.append(f"OKX sCode: {sCode}")
+        if sMsg:
+            body_lines.append(f"OKX msg: {sMsg}")
+        body_lines.append("")
+        if reason == "fatal_reject":
+            body_lines.append(
+                "Order was rejected by OKX with a non-recoverable code. "
+                "Check account/margin/td_mode."
+            )
+        else:
+            body_lines.append(
+                "Maker-only chase exhausted its time budget without filling. "
+                "If this was an entry leg, the session is being aborted."
+            )
+        await notifier.send("\n".join(body_lines))
+    except Exception:
+        log.warning("chase_failure_notify_skipped", exc_info=True)
+
+
 def _build_fill_metrics(
     *,
     side: str,
@@ -631,18 +680,48 @@ class OKXExchange:
     async def _wait_for_fill(
         self, instrument: str, order_id: str, timeout: float,
     ) -> dict:
-        """Poll order status until filled / cancelled / timeout."""
+        """Poll order status until filled / cancelled / timeout.
+
+        Race-condition guard: when OKX reports state=canceled, an order can
+        STILL have a non-zero accFillSz (partial or full fill that landed
+        microseconds before our cancel landed). In that case we promote the
+        status to ``filled`` so the caller doesn't drop a real position on
+        the floor (orphan-position scenario, 2026-05-07).
+        """
         deadline = time.time() + timeout
         last: dict = {}
         while time.time() < deadline:
             try:
                 last = await self.get_order_status(instrument, order_id)
                 state = last.get("state", "")
-                if state in ("filled", "canceled", "cancelled"):
+                acc_fill = self._f(last, "accFillSz")
+                if state == "filled":
+                    return last
+                if state in ("canceled", "cancelled"):
+                    if acc_fill > 0:
+                        log.warning("wait_for_fill_canceled_but_filled",
+                                    instrument=instrument, order_id=order_id,
+                                    accFillSz=acc_fill,
+                                    avgPx=last.get("avgPx"))
+                        last = dict(last)
+                        last["state"] = "filled"
                     return last
             except Exception:
                 log.warning("order_status_failed", exc_info=True)
             await asyncio.sleep(1.0)
+        # Final post-deadline sanity check: catch a fill that landed during
+        # the last sleep window before we return "no fill".
+        try:
+            last = await self.get_order_status(instrument, order_id)
+            if self._f(last, "accFillSz") > 0:
+                last = dict(last)
+                last["state"] = "filled"
+                log.warning("wait_for_fill_late_fill_detected",
+                            instrument=instrument, order_id=order_id,
+                            accFillSz=last.get("accFillSz"),
+                            avgPx=last.get("avgPx"))
+        except Exception:
+            pass
         return last
 
     # ──────────────────── Maker-only chase (BUY) ──────────────────
@@ -785,6 +864,11 @@ class OKXExchange:
                           instrument=instrument, sCode=sCode, sMsg=sMsg,
                           attempt=attempt,
                           hint="check OKX_TD_MODE / account margin mode / balance")
+                await _notify_chase_failure(
+                    side="buy", instrument=instrument,
+                    qty_btc=qty_btc, reason="fatal_reject",
+                    sCode=sCode, sMsg=sMsg, attempt=attempt,
+                )
                 # Return None so straddle_builder treats this as a real
                 # failure and skips the session — NEVER fall through with
                 # a placeholder price (would create a phantom position).
@@ -836,6 +920,11 @@ class OKXExchange:
                 pass
 
         log.error("chase_buy_deadline_exhausted", instrument=instrument)
+        await _notify_chase_failure(
+            side="buy", instrument=instrument,
+            qty_btc=qty_btc, reason="deadline_exhausted",
+            sCode="", sMsg="", attempt=attempt,
+        )
         return None
 
     # ──────────────────── Maker-only chase (SELL) ─────────────────
@@ -944,6 +1033,11 @@ class OKXExchange:
                 log.error("chase_sell_fatal_reject",
                           instrument=instrument, sCode=sCode, sMsg=sMsg,
                           attempt=attempt)
+                await _notify_chase_failure(
+                    side="sell", instrument=instrument,
+                    qty_btc=qty_btc, reason="fatal_reject",
+                    sCode=sCode, sMsg=sMsg, attempt=attempt,
+                )
                 # Return None — caller (unwind logic) will retry / alert.
                 return None
 
@@ -991,6 +1085,11 @@ class OKXExchange:
                 pass
 
         log.error("chase_sell_deadline_exhausted", instrument=instrument)
+        await _notify_chase_failure(
+            side="sell", instrument=instrument,
+            qty_btc=qty_btc, reason="deadline_exhausted",
+            sCode="", sMsg="", attempt=attempt,
+        )
         return None
 
     # ──────────────────── RFQ (Block Trading) ─────────────────────

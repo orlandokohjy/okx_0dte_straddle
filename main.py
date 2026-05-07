@@ -4,7 +4,7 @@ OKX 0DTE BTC Pure Straddle Algo.
 Single daily session: 12:00–16:00 UTC, Mon–Fri.
 Position: 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
 Compound sizing: 80% of current equity, override default = 1 straddle.
-Maker-only orders with 50%-gap-narrow chase.
+Maker-only orders with 50%-gap-narrow chase, BOTH legs fired concurrently.
 
 Default mode: Demo Trading (OKX_FLAG=1) + DRY_RUN=true. Set both to "0"/"false"
 in .env when ready for live.
@@ -12,9 +12,12 @@ in .env when ready for live.
 from __future__ import annotations
 
 import asyncio
+import atexit
+import errno
 import os
 import re
 import signal
+import sys
 
 import structlog
 
@@ -97,6 +100,92 @@ def _reset_local_state() -> None:
     log.info("state_reset_done", removed=removed)
 
 
+# ── Single-instance lock ────────────────────────────────────────────────
+#
+# Two algo instances pointing at the same OKX API key will race each other
+# to place / cancel orders, which is exactly the failure pattern that
+# created the 2026-05-07 orphan put: a stray `sharp_brattain` container
+# was running alongside the `docker-compose` instance and both were
+# competing on `BTC-USD-...-P` orders. The result was a real fill that
+# neither algo successfully matched to its own state.
+#
+# Implementation: a PID lock file at state/algo.pid. On startup we check
+# whether the PID inside is still alive; if it is, we refuse to start.
+# If it's a stale file (process gone), we overwrite it. The file is
+# atexit-cleaned, plus removed by signal handlers on graceful shutdown.
+
+_LOCK_PATH = f"{config.STATE_DIR}/algo.pid"
+
+
+def _process_alive(pid: int) -> bool:
+    """True if a process with this PID exists. Cross-platform-ish."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM  # exists but we can't signal it
+    return True
+
+
+def _acquire_singleton_lock() -> None:
+    """Refuse to start if another algo with a live PID is already running."""
+    try:
+        os.makedirs(config.STATE_DIR, exist_ok=True)
+    except Exception:
+        log.warning("state_dir_mkdir_failed", path=config.STATE_DIR,
+                    exc_info=True)
+
+    if os.path.exists(_LOCK_PATH):
+        try:
+            with open(_LOCK_PATH, "r") as f:
+                existing_pid = int(f.read().strip() or "0")
+        except Exception:
+            existing_pid = 0
+        if existing_pid > 0 and existing_pid != os.getpid() \
+                and _process_alive(existing_pid):
+            log.error("singleton_lock_busy",
+                      lock_path=_LOCK_PATH,
+                      existing_pid=existing_pid,
+                      current_pid=os.getpid(),
+                      hint="another algo instance is running with the same "
+                           "API keys — kill it before starting this one")
+            sys.stderr.write(
+                f"REFUSED TO START: another instance (pid={existing_pid}) "
+                f"holds {_LOCK_PATH}.\n"
+                f"If you are sure no other algo is running, delete "
+                f"{_LOCK_PATH} and retry.\n"
+            )
+            sys.exit(2)
+        if existing_pid > 0:
+            log.info("singleton_lock_stale_overwrite",
+                     stale_pid=existing_pid)
+
+    try:
+        with open(_LOCK_PATH, "w") as f:
+            f.write(str(os.getpid()))
+        log.info("singleton_lock_acquired",
+                 lock_path=_LOCK_PATH, pid=os.getpid())
+        atexit.register(_release_singleton_lock)
+    except Exception:
+        log.warning("singleton_lock_write_failed",
+                    path=_LOCK_PATH, exc_info=True)
+
+
+def _release_singleton_lock() -> None:
+    """Best-effort lock-file cleanup. Safe to call multiple times."""
+    try:
+        if not os.path.exists(_LOCK_PATH):
+            return
+        with open(_LOCK_PATH, "r") as f:
+            owner = int(f.read().strip() or "0")
+        if owner == os.getpid():
+            os.remove(_LOCK_PATH)
+            log.info("singleton_lock_released", lock_path=_LOCK_PATH)
+    except Exception:
+        log.debug("singleton_lock_release_failed", exc_info=True)
+
+
 class Algo:
     def __init__(self) -> None:
         self.exchange = OKXExchange()
@@ -116,6 +205,11 @@ class Algo:
     async def start(self) -> None:
         setup_logging()
         mode = "DEMO" if config.OKX_FLAG == "1" else "LIVE"
+
+        # Refuse to start if another algo instance is already running with
+        # the same API keys. Prevents the stray-container race that caused
+        # the 2026-05-07 orphan put.
+        _acquire_singleton_lock()
 
         # Optional one-shot state reset — wipe demo equity/positions before
         # connecting so we don't leak the $5,000 demo seed into a live boot.
@@ -681,6 +775,7 @@ class Algo:
                 reason="shutdown",
             )
 
+        _release_singleton_lock()
         log.info("algo_stopped")
         self._shutdown.set()
 

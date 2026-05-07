@@ -3,17 +3,24 @@ Straddle construction and teardown on OKX.
 
 One straddle = 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
 
-Entry order is chosen to minimise risk:
+Entry strategy:
   1. Pre-entry spread gate — skip session if either leg's spread is too wide
   2. Optional RFQ atomic entry (if USE_RFQ=true and block trading available)
-  3. Otherwise leg-by-leg with maker-only chase: PUT first, then CALL
-       - if puts fail: skip session entirely (no naked exposure)
-       - if calls fail after puts filled: emergency-sell puts to flatten
+  3. Otherwise both legs fire CONCURRENTLY with maker-only chase
+       - both fail  : skip session, no exposure
+       - both fill  : straddle complete, register & notify
+       - put fills, call fails : emergency-sell put + alert
+       - call fills, put fails : emergency-sell call + alert
 
-Exit: RFQ if available, else leg-by-leg chase.
+Concurrent firing reduces inter-leg slippage (both reference the same market
+snapshot) and shrinks the orphan-position window: one leg can no longer be
+sitting half-filled while the other is still waiting in the queue.
+
+Exit: RFQ if available, else BOTH legs sold concurrently with maker chase.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Optional
 
@@ -103,26 +110,106 @@ async def build_straddle(
             order_id=rfq_id, avg_fill_price=put_fill,
         )
     else:
-        # ── Leg-by-leg: PUT first, then CALL ──
-        # Use mark as starting reference if bid is missing (thin demo books).
+        # ── Concurrent leg firing: PUT and CALL fire at the same time ──
+        # Both reference the same market snapshot (decision-time bid/mark)
+        # so the inter-leg skew that comes from sequential fills is gone.
         put_ref = pair.put.bid if pair.put.bid > 0 else pair.put.mark
-        put_result = await exchange.chase_buy(
-            pair.put.symbol, total_qty, put_ref,
+        call_ref = pair.call.bid if pair.call.bid > 0 else pair.call.mark
+        log.info("legs_firing_concurrently", id=straddle_id,
+                 call=pair.call.symbol, put=pair.put.symbol,
+                 call_ref=call_ref, put_ref=put_ref, qty=total_qty)
+
+        put_task = asyncio.create_task(
+            exchange.chase_buy(pair.put.symbol, total_qty, put_ref),
+            name=f"chase_buy_put_{straddle_id}",
         )
-        if put_result is None:
-            # Skip session entirely — no naked exposure
-            log.error("put_buy_failed_skipping_session",
-                      id=straddle_id, symbol=pair.put.symbol)
+        call_task = asyncio.create_task(
+            exchange.chase_buy(pair.call.symbol, total_qty, call_ref),
+            name=f"chase_buy_call_{straddle_id}",
+        )
+        # gather will return both results (or propagate the first exception
+        # from either leg). We treat any unhandled exception as a None fill
+        # for that leg and let the four-way handler decide what to do.
+        results = await asyncio.gather(
+            put_task, call_task, return_exceptions=True,
+        )
+        put_result, call_result = results
+
+        if isinstance(put_result, BaseException):
+            log.error("put_chase_exception", id=straddle_id,
+                      exc_info=put_result)
+            put_result = None
+        if isinstance(call_result, BaseException):
+            log.error("call_chase_exception", id=straddle_id,
+                      exc_info=call_result)
+            call_result = None
+
+        # Per-leg fill notification — fires regardless of the other leg's
+        # state. This is the missing piece that left the user blind on
+        # 2026-05-07 when the put filled but never reached the straddle
+        # notify path.
+        if put_result is not None:
+            await notifier.send(
+                f"<b>LEG FILLED — PUT</b> [{straddle_id}]\n"
+                f"Symbol: {pair.put.symbol}\n"
+                f"Avg fill: {put_result.get('average_price', 0):.4f} BTC\n"
+                f"Order id: {put_result.get('order_id', '')}"
+            )
+        if call_result is not None:
+            await notifier.send(
+                f"<b>LEG FILLED — CALL</b> [{straddle_id}]\n"
+                f"Symbol: {pair.call.symbol}\n"
+                f"Avg fill: {call_result.get('average_price', 0):.4f} BTC\n"
+                f"Order id: {call_result.get('order_id', '')}"
+            )
+
+        # ── Outcome dispatch: 4 cases ──
+        if put_result is None and call_result is None:
+            log.error("both_legs_failed_skipping_session", id=straddle_id)
             await notifier.send(
                 f"<b>SESSION SKIPPED</b> [{straddle_id}]\n"
-                f"Put leg failed to fill within deadline.\n"
-                f"No call leg attempted — no naked exposure.\n"
-                f"Symbol: {pair.put.symbol}"
+                f"Both legs failed to fill within deadline.\n"
+                f"No exposure — see chase logs above for sCode/sMsg."
             )
             return None
 
+        if put_result is not None and call_result is None:
+            put_fill_for_emer = float(
+                put_result.get("average_price", pair.put.ask),
+            )
+            log.error("call_leg_failed_unwinding_put",
+                      id=straddle_id, put_symbol=pair.put.symbol)
+            await notifier.send(
+                f"<b>⚠️ PARTIAL FILL — CALL FAILED</b> [{straddle_id}]\n"
+                f"Put filled @ {put_fill_for_emer:.4f} BTC\n"
+                f"Call failed to fill. Selling put to flatten."
+            )
+            await _emergency_sell(
+                exchange, pair.put.symbol, total_qty, put_fill_for_emer,
+            )
+            return None
+
+        if call_result is not None and put_result is None:
+            call_fill_for_emer = float(
+                call_result.get("average_price", pair.call.ask),
+            )
+            log.error("put_leg_failed_unwinding_call",
+                      id=straddle_id, call_symbol=pair.call.symbol)
+            await notifier.send(
+                f"<b>⚠️ PARTIAL FILL — PUT FAILED</b> [{straddle_id}]\n"
+                f"Call filled @ {call_fill_for_emer:.4f} BTC\n"
+                f"Put failed to fill. Selling call to flatten."
+            )
+            await _emergency_sell(
+                exchange, pair.call.symbol, total_qty, call_fill_for_emer,
+            )
+            return None
+
+        # Both filled — build the legs.
         put_fill = float(put_result.get("average_price", pair.put.ask))
-        log.info("put_filled", id=straddle_id, price=put_fill)
+        call_fill = float(call_result.get("average_price", pair.call.ask))
+        log.info("both_legs_filled", id=straddle_id,
+                 call=call_fill, put=put_fill)
 
         put_leg = StraddleLeg(
             instrument=pair.put.symbol, side="Buy",
@@ -131,27 +218,6 @@ async def build_straddle(
             avg_fill_price=put_fill,
             entry_metrics=put_result.get("metrics", {}),
         )
-
-        # Now buy the call. If this fails, emergency-sell the puts.
-        call_ref = pair.call.bid if pair.call.bid > 0 else pair.call.mark
-        call_result = await exchange.chase_buy(
-            pair.call.symbol, total_qty, call_ref,
-        )
-        if call_result is None:
-            log.error("call_buy_failed_after_put",
-                      id=straddle_id, symbol=pair.call.symbol)
-            await notifier.send(
-                f"<b>⚠️ CALL FILL FAILED</b> [{straddle_id}]\n"
-                f"Put filled but call failed. Selling puts to flatten."
-            )
-            await _emergency_sell(
-                exchange, pair.put.symbol, total_qty, put_fill,
-            )
-            return None
-
-        call_fill = float(call_result.get("average_price", pair.call.ask))
-        log.info("call_filled", id=straddle_id, price=call_fill)
-
         call_leg = StraddleLeg(
             instrument=pair.call.symbol, side="Buy",
             qty=total_qty, entry_price=call_fill,
@@ -228,44 +294,72 @@ async def unwind_straddle(
                  id=straddle.id,
                  call_exit=exit_call_price, put_exit=exit_put_price)
     else:
-        # Sell call first, then put
+        # ── Concurrent unwind: sell BOTH legs at once ──
         exit_call_price = straddle.entry_call_price
+        exit_put_price = straddle.entry_put_price
+
         _, call_ask = await market.get_option_bid_ask(
             straddle.call_leg.instrument,
         )
-        if call_ask > 0:
-            result = await exchange.chase_sell(
-                straddle.call_leg.instrument,
-                straddle.call_leg.qty, call_ask,
-            )
-            if result:
-                exit_call_price = float(
-                    result.get("average_price", call_ask),
-                )
-                straddle.call_leg.exit_metrics = result.get("metrics", {})
-                log.info("call_sold", price=exit_call_price)
-            else:
-                log.warning("call_sell_failed",
-                            instrument=straddle.call_leg.instrument)
-
-        exit_put_price = straddle.entry_put_price
         _, put_ask = await market.get_option_bid_ask(
             straddle.put_leg.instrument,
         )
-        if put_ask > 0:
-            result = await exchange.chase_sell(
-                straddle.put_leg.instrument,
-                straddle.put_leg.qty, put_ask,
+
+        async def _sell_leg(symbol: str, qty: float, ref_ask: float):
+            if ref_ask <= 0:
+                return None
+            return await exchange.chase_sell(symbol, qty, ref_ask)
+
+        call_task = asyncio.create_task(_sell_leg(
+            straddle.call_leg.instrument,
+            straddle.call_leg.qty, call_ask,
+        ), name=f"chase_sell_call_{straddle.id}")
+        put_task = asyncio.create_task(_sell_leg(
+            straddle.put_leg.instrument,
+            straddle.put_leg.qty, put_ask,
+        ), name=f"chase_sell_put_{straddle.id}")
+
+        results = await asyncio.gather(
+            call_task, put_task, return_exceptions=True,
+        )
+        call_result, put_result = results
+
+        if isinstance(call_result, BaseException):
+            log.error("call_unwind_exception", exc_info=call_result)
+            call_result = None
+        if isinstance(put_result, BaseException):
+            log.error("put_unwind_exception", exc_info=put_result)
+            put_result = None
+
+        if call_result:
+            exit_call_price = float(
+                call_result.get("average_price", call_ask),
             )
-            if result:
-                exit_put_price = float(
-                    result.get("average_price", put_ask),
-                )
-                straddle.put_leg.exit_metrics = result.get("metrics", {})
-                log.info("put_sold", price=exit_put_price)
-            else:
-                log.warning("put_sell_failed",
-                            instrument=straddle.put_leg.instrument)
+            straddle.call_leg.exit_metrics = call_result.get("metrics", {})
+            log.info("call_sold", price=exit_call_price)
+        else:
+            log.warning("call_sell_failed",
+                        instrument=straddle.call_leg.instrument)
+            await notifier.send(
+                f"<b>⚠️ CALL UNWIND FAILED</b> [{straddle.id}]\n"
+                f"Symbol: {straddle.call_leg.instrument}\n"
+                f"Could not sell within deadline. Manual action may be needed."
+            )
+
+        if put_result:
+            exit_put_price = float(
+                put_result.get("average_price", put_ask),
+            )
+            straddle.put_leg.exit_metrics = put_result.get("metrics", {})
+            log.info("put_sold", price=exit_put_price)
+        else:
+            log.warning("put_sell_failed",
+                        instrument=straddle.put_leg.instrument)
+            await notifier.send(
+                f"<b>⚠️ PUT UNWIND FAILED</b> [{straddle.id}]\n"
+                f"Symbol: {straddle.put_leg.instrument}\n"
+                f"Could not sell within deadline. Manual action may be needed."
+            )
 
     pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
     log.info("straddle_unwound", id=straddle.id, reason=reason,
