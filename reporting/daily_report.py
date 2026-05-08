@@ -157,6 +157,22 @@ def _exec_from_row(
     )
 
 
+def _inception_equity(trades: list["TradeRow"]) -> float:
+    """Return the actual starting equity (i.e. equity just before the
+    first-ever trade), falling back to INITIAL_CAPITAL_USD if no history.
+
+    Why: config.INITIAL_CAPITAL_USD is a default placeholder — the user's
+    real starting balance can differ (e.g., the OKX live-equity sync on
+    first boot returned $7,786 vs the $8,000 default). Anchoring
+    cumulative return on this true starting equity gives an honest
+    since-inception number; anchoring on the placeholder bakes a phantom
+    return into day-1 reporting.
+    """
+    if trades and trades[0].capital_before > 0:
+        return trades[0].capital_before
+    return config.INITIAL_CAPITAL_USD
+
+
 def _load_trades() -> list[TradeRow]:
     path = config.TRADE_LOG_FILE
     if not os.path.exists(path):
@@ -246,12 +262,13 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
     if latest.date[:10] != today_str:
         return None
 
+    inception = _inception_equity(trades)
     pnls = [t.net_pnl for t in trades]
     returns = [
         t.net_pnl / t.capital_before if t.capital_before > 0 else 0.0
         for t in trades
     ]
-    equities = [config.INITIAL_CAPITAL_USD]
+    equities = [inception]
     for t in trades:
         equities.append(t.capital_after)
 
@@ -297,8 +314,8 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
     )
 
     ann_return = (
-        (equity / config.INITIAL_CAPITAL_USD)
-        ** (TRADING_DAYS_PER_YEAR / max(total, 1)) - 1
+        (equity / inception) ** (TRADING_DAYS_PER_YEAR / max(total, 1)) - 1
+        if inception > 0 else 0.0
     )
     calmar = ann_return / max_dd if max_dd > 0 else 0.0
 
@@ -309,9 +326,7 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         latest.net_pnl / latest.capital_before
         if latest.capital_before > 0 else 0.0
     )
-    cum_return = (
-        (equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
-    )
+    cum_return = (equity - inception) / inception if inception > 0 else 0.0
 
     return DailyMetrics(
         trade_date=latest.date,
@@ -320,7 +335,7 @@ def compute_report(equity: float) -> Optional[DailyMetrics]:
         strike=latest.strike,
         num_straddles=latest.num_straddles,
         equity=equity,
-        initial_capital=config.INITIAL_CAPITAL_USD,
+        initial_capital=inception,
         total_trades=total,
         total_pnl=sum(pnls),
         cumulative_return_pct=cum_return,
@@ -659,9 +674,8 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
     expectancy_ratio = expectancy / abs(avg_loss) if avg_loss != 0 else 0.0
 
     latest = trades[-1]
-    cum_return = (
-        (equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
-    )
+    inception = _inception_equity(all_trades)
+    cum_return = (equity - inception) / inception if inception > 0 else 0.0
 
     total_straddles = sum(t.num_straddles for t in trades)
 
@@ -672,7 +686,7 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
         strike=latest.strike,
         num_straddles=total_straddles,
         equity=equity,
-        initial_capital=config.INITIAL_CAPITAL_USD,
+        initial_capital=inception,
         total_trades=total,
         total_pnl=sum(pnls),
         cumulative_return_pct=cum_return,

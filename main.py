@@ -754,9 +754,20 @@ class Algo:
 
             actual_pnl = self.portfolio.equity - equity_before
             if actual_pnl != 0.0:
+                # Cumulative return is anchored on the *actual* starting
+                # equity recorded in the trade log (first row's
+                # capital_before), not on the placeholder
+                # INITIAL_CAPITAL_USD config default. This avoids day-1
+                # phantom returns when the live OKX balance differs from
+                # the default ($8,000).
+                from reporting.daily_report import (
+                    _load_trades, _inception_equity,
+                )
+                trades = _load_trades()
+                inception = _inception_equity(trades)
                 cum_return = (
-                    (self.portfolio.equity - config.INITIAL_CAPITAL_USD)
-                    / config.INITIAL_CAPITAL_USD
+                    (self.portfolio.equity - inception) / inception
+                    if inception > 0 else 0.0
                 )
                 await notifier.notify_daily_summary(
                     self.portfolio.equity, actual_pnl, cum_return,
