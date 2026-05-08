@@ -568,16 +568,20 @@ class OKXExchange:
     async def get_account_equity(self, ccy: str = "USDT") -> float:
         """Return total trading-account equity in USD-equivalent.
 
-        OKX BTC-USD inverse options are coin-margined — the user typically
-        funds the account in BTC, not USDT. Reading only the `ccy=USDT`
-        balance would return 0 (or a tiny residual) and starve the
-        collateral / pre-flight checks.
+        Designed to work with all OKX account-mode/funding combinations:
+          • USDT-only account with auto-borrow (BTC borrowed for BTC-USD
+            inverse options — totalEq reflects USDT minus borrow value).
+          • BTC-funded account (totalEq reflects BTC × spot).
+          • Mixed (USDT + BTC) — totalEq sums them in USD.
 
         Strategy:
           1. Read the FULL account (no ccy filter) and use `totalEq` —
-             OKX reports this in USD across all currencies.
-          2. Fall back to the per-ccy `eq` field only if totalEq is
-             missing AND we find a meaningful per-ccy balance.
+             OKX reports this in USD across all currencies, so it
+             correctly accounts for any auto-borrow loan as a negative.
+          2. Fall back to the largest per-currency `eqUsd` if totalEq is
+             missing.
+          3. Final fallback: explicit ccy filter (matches the pre-2026-05-08
+             behavior that read $7,776 USDT directly).
         """
         try:
             resp = await self._call(self._account.get_account_balance)
