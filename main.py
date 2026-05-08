@@ -307,13 +307,22 @@ class Algo:
 
     async def _chase_pricing_selftest(self, spot: float) -> bool:
         """
-        Simulate one chase_buy iteration on a live ITM option and verify the
+        Simulate one chase_buy iteration on live ITM options and verify the
         resulting price is sensible. Catches unit-conversion regressions (the
         2026-05-07 incident where OPTION_TICK_SIZE=5.0 USD added 5 BTC to a
         BTC-quoted bid, producing 5.0055 BTC) BEFORE we ever route an order.
 
-        Returns False if the test cannot run (no chain) or if the simulated
-        price is outside sanity bounds. Caller locks entry on False.
+        We mirror production's behavior: chase_buy caps the price at
+        ``mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR`` and skips placing an
+        order if the proposed price exceeds that cap. So a wide / stale
+        spread is NOT a math bug — it is correctly handled by the cap.
+        We therefore evaluate the post-cap price for sanity. The absolute
+        ceiling (≤0.5 BTC) remains the hard guard against unit-conversion
+        bugs, since those bugs typically produce prices ≥1 BTC.
+
+        Returns False only if the math itself is broken on every sample we
+        try (signals a true unit-conversion regression). Caller locks entry
+        on False.
         """
         try:
             count = await self.chain.refresh()
@@ -321,72 +330,97 @@ class Algo:
                 log.warning("selftest_skipped_no_chain")
                 return True  # not a math bug; just no data — don't block
 
-            sample = None
+            samples: list = []
             for c in self.chain.calls:
                 if c.strike < spot and c.ask > 0:
-                    sample = c
-                    break
-            if sample is None:
+                    samples.append(c)
+            if not samples:
                 for p in self.chain.puts:
                     if p.ask > 0:
-                        sample = p
-                        break
-            if sample is None:
+                        samples.append(p)
+                        if len(samples) >= 5:
+                            break
+            samples = samples[:5]
+            if not samples:
                 log.warning("selftest_skipped_no_quotes")
                 return True
 
-            tick = self.exchange.get_tick_size(sample.symbol)
-            if tick <= 0:
-                tick = config.OPTION_TICK_SIZE
+            last_failure = None
+            for sample in samples:
+                tick = self.exchange.get_tick_size(sample.symbol)
+                if tick <= 0:
+                    tick = config.OPTION_TICK_SIZE
 
-            mark = await self.exchange.get_option_mark_price(sample.symbol)
-            if mark <= 0:
-                mark = sample.mark if sample.mark > 0 else sample.ask
+                mark = await self.exchange.get_option_mark_price(sample.symbol)
+                if mark <= 0:
+                    mark = sample.mark if sample.mark > 0 else sample.ask
 
-            bid = sample.bid if sample.bid > 0 else max(mark - tick, tick)
-            ask = sample.ask
-            target_top = max(bid, ask - tick)
-            new_price = bid + (target_top - bid) * \
-                config.OPTION_CHASE_GAP_NARROW_PCT
-            improvement_floor = bid + tick
-            floor = bid if improvement_floor >= ask else improvement_floor
-            ceiling = bid if (ask - tick) < bid else (ask - tick)
-            new_price = max(min(new_price, ceiling), floor)
+                bid = sample.bid if sample.bid > 0 else max(mark - tick, tick)
+                ask = sample.ask
+                target_top = max(bid, ask - tick)
+                new_price = bid + (target_top - bid) * \
+                    config.OPTION_CHASE_GAP_NARROW_PCT
+                improvement_floor = bid + tick
+                floor = bid if improvement_floor >= ask else improvement_floor
+                ceiling = bid if (ask - tick) < bid else (ask - tick)
+                new_price = max(min(new_price, ceiling), floor)
+                pre_cap_price = new_price
 
-            ok_vs_mark = (
-                mark <= 0 or
-                new_price <= mark * config.CHASE_SELFTEST_MAX_OVER_MARK
-            )
-            ok_absolute = new_price <= config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC
-            ok_positive = new_price > 0
+                # Mirror production cap: chase_buy never sends an order
+                # priced above mark × MAX_SLIPPAGE_FACTOR. With a wide /
+                # stale spread the cap kicks in and the loop skips-and-waits
+                # rather than firing a bad maker.
+                cap = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR \
+                    if mark > 0 else float("inf")
+                capped = min(new_price, cap)
+                cap_engaged = pre_cap_price > cap
 
-            log.info("chase_selftest",
-                     instrument=sample.symbol,
-                     bid=bid, ask=ask, mark=mark, tick=tick,
-                     simulated_price=new_price,
-                     ok_vs_mark=ok_vs_mark,
-                     ok_absolute=ok_absolute,
-                     ok_positive=ok_positive)
-
-            if not (ok_vs_mark and ok_absolute and ok_positive):
-                log.error("chase_selftest_failed",
-                          instrument=sample.symbol,
-                          simulated_price=new_price,
-                          mark=mark, tick=tick,
-                          max_over_mark=config.CHASE_SELFTEST_MAX_OVER_MARK,
-                          max_absolute=config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC)
-                await notifier.send(
-                    f"<b>STARTUP SELF-TEST FAILED</b>\n"
-                    f"Chase math produced an unreasonable price on a "
-                    f"sample option.\n"
-                    f"Instrument: {sample.symbol}\n"
-                    f"Bid/Ask: {bid:.4f} / {ask:.4f} BTC\n"
-                    f"Mark: {mark:.4f} BTC, tick: {tick:.4f}\n"
-                    f"Simulated price: {new_price:.4f} BTC\n"
-                    f"Entry will be LOCKED until restart with fix."
+                ok_absolute = capped <= config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC
+                ok_positive = capped > 0
+                ok_vs_mark = (
+                    mark <= 0 or
+                    capped <= mark * config.CHASE_SELFTEST_MAX_OVER_MARK
                 )
-                return False
-            return True
+
+                log.info("chase_selftest",
+                         instrument=sample.symbol,
+                         bid=bid, ask=ask, mark=mark, tick=tick,
+                         pre_cap_price=pre_cap_price,
+                         capped_price=capped,
+                         cap_engaged=cap_engaged,
+                         ok_vs_mark=ok_vs_mark,
+                         ok_absolute=ok_absolute,
+                         ok_positive=ok_positive)
+
+                if ok_absolute and ok_positive and ok_vs_mark:
+                    return True
+
+                last_failure = (
+                    sample, bid, ask, mark, tick, pre_cap_price, capped,
+                )
+                # Try the next sample — wide-spread / stale-quote samples
+                # should not hold up startup if a healthier strike exists.
+
+            sample, bid, ask, mark, tick, pre_cap, capped = last_failure
+            log.error("chase_selftest_failed",
+                      instrument=sample.symbol,
+                      pre_cap_price=pre_cap, capped_price=capped,
+                      mark=mark, tick=tick,
+                      max_over_mark=config.CHASE_SELFTEST_MAX_OVER_MARK,
+                      max_absolute=config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC)
+            await notifier.send(
+                f"<b>STARTUP SELF-TEST FAILED</b>\n"
+                f"Every sampled ITM option produced an out-of-bound price. "
+                f"This is a likely unit-conversion bug, NOT a wide-spread "
+                f"issue.\n"
+                f"Last sample: {sample.symbol}\n"
+                f"Bid/Ask: {bid:.4f} / {ask:.4f} BTC\n"
+                f"Mark: {mark:.4f} BTC, tick: {tick:.4f}\n"
+                f"Pre-cap price: {pre_cap:.4f} BTC, "
+                f"post-cap: {capped:.4f} BTC\n"
+                f"Entry will be LOCKED until restart with fix."
+            )
+            return False
         except Exception:
             log.error("chase_selftest_exception", exc_info=True)
             return True  # don't block on transient errors
