@@ -37,6 +37,61 @@ from utils.time_utils import now_utc
 log = structlog.get_logger(__name__)
 
 
+def _format_leg_fill_message(
+    *,
+    leg: str,
+    side: str,
+    straddle_id: str,
+    symbol: str,
+    result: dict,
+) -> str:
+    """
+    Format a per-leg Telegram fill message with execution-quality metrics.
+
+    `side` is the human-friendly action label ("entry" for buys at the
+    open, "exit" for sells at the close). The metrics dict is produced by
+    core.exchange._build_fill_metrics; we surface the four numbers that
+    matter most to a desk: avg fill, slippage vs mark, time to fill,
+    attempts, and dollars saved vs taker.
+    """
+    metrics = result.get("metrics") or {}
+    avg = float(result.get("average_price", 0) or 0)
+    mark = float(metrics.get("ref_mark", 0) or 0)
+    slip = float(metrics.get("slippage_vs_mark_pct", 0) or 0)
+    duration = float(metrics.get("duration_sec", 0) or 0)
+    attempts = int(metrics.get("attempts", 0) or 0)
+    saved_usd = float(metrics.get("saved_vs_taker_total_usd", 0) or 0)
+    fully = bool(result.get("fully_filled", True))
+    qty_btc = float(result.get("filled_qty_btc", 0) or 0)
+
+    header = f"LEG {'FILLED' if side == 'entry' else 'UNWOUND'} — {leg}"
+    fill_line = f"Avg fill: {avg:.4f} BTC"
+    if mark > 0:
+        fill_line += f"  (mark {mark:.4f})"
+    slip_line = (
+        f"Slippage vs mark: {slip:+.2f}%"
+        if mark > 0 else "Slippage vs mark: n/a"
+    )
+    timing_line = f"Time to fill: {duration:.1f}s, attempts: {attempts}"
+    saved_line = (
+        f"Saved vs taker: ${saved_usd:+.2f}"
+        if saved_usd != 0 else "Saved vs taker: $0.00"
+    )
+    qty_line = f"Filled qty: {qty_btc:.4f} BTC"
+    fully_line = "" if fully else "  ⚠️ PARTIAL"
+
+    return (
+        f"<b>{header}</b>{fully_line} [{straddle_id}]\n"
+        f"Symbol: {symbol}\n"
+        f"{fill_line}\n"
+        f"{slip_line}\n"
+        f"{timing_line}\n"
+        f"{qty_line}\n"
+        f"{saved_line}\n"
+        f"Order id: {result.get('order_id', '')}"
+    )
+
+
 def _spread_pct(bid: float, ask: float, mark: float = 0.0) -> float:
     """
     Bid-ask spread as a fraction of mid (or mark if bid is missing).
@@ -171,17 +226,23 @@ async def build_straddle(
         # then the partial-leg-failure handling below.
         if put_result is not None:
             await notifier.send(
-                f"<b>LEG FILLED — PUT</b> [{straddle_id}]\n"
-                f"Symbol: {pair.put.symbol}\n"
-                f"Avg fill: {put_result.get('average_price', 0):.4f} BTC\n"
-                f"Order id: {put_result.get('order_id', '')}"
+                _format_leg_fill_message(
+                    leg="PUT",
+                    side="entry",
+                    straddle_id=straddle_id,
+                    symbol=pair.put.symbol,
+                    result=put_result,
+                )
             )
         if call_result is not None:
             await notifier.send(
-                f"<b>LEG FILLED — CALL</b> [{straddle_id}]\n"
-                f"Symbol: {pair.call.symbol}\n"
-                f"Avg fill: {call_result.get('average_price', 0):.4f} BTC\n"
-                f"Order id: {call_result.get('order_id', '')}"
+                _format_leg_fill_message(
+                    leg="CALL",
+                    side="entry",
+                    straddle_id=straddle_id,
+                    symbol=pair.call.symbol,
+                    result=call_result,
+                )
             )
 
         # ── Outcome dispatch: 4 cases ──
@@ -407,6 +468,15 @@ async def unwind_straddle(
                      fully_filled=call_fully,
                      filled_btc=call_filled_btc,
                      target_btc=straddle.call_leg.qty)
+            await notifier.send(
+                _format_leg_fill_message(
+                    leg="CALL",
+                    side="exit",
+                    straddle_id=straddle.id,
+                    symbol=straddle.call_leg.instrument,
+                    result=call_result,
+                )
+            )
             if not call_fully:
                 await notifier.send(
                     f"<b>⚠️ CALL UNWIND PARTIAL</b> [{straddle.id}]\n"
@@ -437,6 +507,15 @@ async def unwind_straddle(
                      fully_filled=put_fully,
                      filled_btc=put_filled_btc,
                      target_btc=straddle.put_leg.qty)
+            await notifier.send(
+                _format_leg_fill_message(
+                    leg="PUT",
+                    side="exit",
+                    straddle_id=straddle.id,
+                    symbol=straddle.put_leg.instrument,
+                    result=put_result,
+                )
+            )
             if not put_fully:
                 await notifier.send(
                     f"<b>⚠️ PUT UNWIND PARTIAL</b> [{straddle.id}]\n"
