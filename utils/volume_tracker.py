@@ -16,22 +16,31 @@ def _current_month_key() -> str:
     return datetime.utcnow().strftime("%Y-%m")
 
 
-def record_trade(num_straddles: int) -> None:
+def record_trade(num_straddles: int, qty_per_leg: float) -> None:
     """
     Append volume for one session's trades.
 
     Per straddle (pure: 1 call + 1 put):
       option_contracts = 4  (buy call + buy put + sell call + sell put)
-      option_btc       = 2 × QTY_PER_LEG × 2 (buy+sell for each leg)
+      option_btc       = qty_per_leg × 2 legs × 2 sides
+
+    qty_per_leg is the BTC notional per leg for the firing session
+    (afternoon = 0.5, morning = 0.25, etc.). Volume rows therefore
+    track the actual notional traded per session, not a global default.
     """
     contracts_per = 4
-    option_btc_per = 2 * config.QTY_PER_LEG * 2
+    option_btc_per = qty_per_leg * 2 * 2
 
+    # qty_per_leg lives at the END so existing volume.csv files (which
+    # were written before the multi-session refactor) stay column-aligned
+    # for the first four fields when appended to. New rows simply gain
+    # one extra column at the right; older rows have it blank when read.
     row = {
         "month": _current_month_key(),
         "num_straddles": num_straddles,
         "option_contracts": contracts_per * num_straddles,
         "option_btc_notional": option_btc_per * num_straddles,
+        "qty_per_leg": qty_per_leg,
     }
 
     os.makedirs(os.path.dirname(config.VOLUME_FILE), exist_ok=True)

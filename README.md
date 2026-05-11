@@ -1,11 +1,24 @@
 # OKX 0DTE Pure Straddle Algo
 
-Daily long-straddle on OKX BTC options.
+Multi-session long-straddle on OKX BTC options. Two entries per
+trading day, paired into 5 complete trading days per week (Tue–Sat) =
+**10 trades / week**.
 
-- **Position**: 1 ITM call + 1 put (same strike) per `QTY_PER_LEG` BTC.
-- **Schedule**: 12:00 UTC entry, 16:00 UTC close (Mon–Fri).
+- **Position**: 1 ITM call + 1 ITM put (same strike) per session's
+  `qty_per_leg` BTC.
+- **Schedule (UTC)**:
+  - **Afternoon (1st entry)**: 13:30 → 15:30 UTC, **Mon–Fri**, default
+    `0.50` BTC notional / leg
+  - **Morning (2nd entry)**: 01:00 → 02:00 UTC, **Tue–Sat**, default
+    `0.25` BTC notional / leg
+  - Each pair shares the same 0800 UTC expiry — e.g. Mon 13:30 UTC +
+    Tue 01:00 UTC both expire Tue 08:00 UTC and roll up into the Tue
+    trading-day report.
+- **Reporting**: chained off the morning close (the last close of each
+  trading day). Tue–Sat at 02:00 UTC: `SESSION CLOSE → DAILY REPORT`.
+  Saturday additionally fires `WEEKLY REPORT` after the daily.
 - **Execution**: Maker-only (post-only) with 50% bid-ask gap-narrowing
-  chase, fair-value cap (mark × 1.15), 10-minute deadline.
+  chase, fair-value cap (mark × 1.15), 60-minute deadline.
 - **Default mode**: Demo Trading (`OKX_FLAG=1`) + `DRY_RUN=true`. Set
   both to `0`/`false` in `.env` only when you are ready for live.
 
@@ -54,7 +67,8 @@ cp .env.example .env
 Default `.env.example` is set to:
 - `OKX_FLAG=1` (demo trading)
 - `DRY_RUN=true` (no orders sent)
-- `QTY_PER_LEG=0.5`
+- `MORNING_QTY_PER_LEG=0.25`
+- `AFTERNOON_QTY_PER_LEG=0.5`
 - `NUM_STRADDLES_OVERRIDE=1`
 
 ### 3. First run — DRY_RUN smoke test
@@ -65,10 +79,16 @@ This connects to OKX demo, pulls the option chain, runs the pre-flight check, bu
 docker-compose up --build
 ```
 
-To trigger entry immediately for testing:
+To trigger entry immediately for testing (auto-disables after firing):
 
 ```bash
+# Fire whichever session is listed first in config.SESSIONS
+# (currently the afternoon session, 13:30-15:30 UTC, 0.5 BTC/leg)
 ENTRY_NOW=true docker-compose up --build
+
+# Or fire a specific session by name
+ENTRY_NOW=afternoon docker-compose up --build
+ENTRY_NOW=morning   docker-compose up --build
 ```
 
 ### 4. Demo trading run (real demo orders)
@@ -126,6 +146,4 @@ ENTRY_NOW=true docker-compose up -d --build
 
 - RFQ (block trading) is stubbed. If your account has it, plug it in via
   `core/exchange.py::send_rfq()`.
-- `ENTRY_NOW=true` does not auto-disable after firing — you must edit .env.
-- No auto-circuit-breaker on consecutive failed sessions.
 - No top-of-book size check (could post larger than the displayed bid).

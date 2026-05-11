@@ -5,11 +5,15 @@ OKX BTC-USD options are coin-margined inverse contracts:
   • Premium px is quoted in BTC (per BTC of underlying notional)
   • To compare to a USD equity figure, we must multiply by spot:
         usd_premium_per_btc_notional = btc_premium × spot
-        usd_cost_per_straddle = QTY_PER_LEG × (usd_call + usd_put)
+        usd_cost_per_straddle = qty_per_leg × (usd_call + usd_put)
 
 Sizing math (all in USD):
     straddle_cost_usd = call_cost_per_usd + put_cost_per_usd
     num_straddles = floor(ALLOC_PCT × equity_usd / buffered_straddle_cost_usd)
+
+`qty_per_leg` is supplied by the caller from the Session that fired the
+entry (see config.SESSIONS) — afternoon may use 0.5 BTC while morning
+uses 0.25 BTC, etc.
 """
 from __future__ import annotations
 
@@ -43,6 +47,7 @@ def size_position(
     call_premium_btc: float,
     put_premium_btc: float,
     spot_usd: float,
+    qty_per_leg: float,
 ) -> SizingResult:
     """
     Compute sizing in USD given BTC-quoted premiums and spot price.
@@ -52,6 +57,7 @@ def size_position(
         call_premium_btc: Call ask in BTC (per BTC of notional).
         put_premium_btc: Put ask in BTC (per BTC of notional).
         spot_usd: BTC spot in USD, used to translate BTC premiums → USD.
+        qty_per_leg: BTC notional per leg for the firing session.
 
     Returns:
         SizingResult with all fields denominated in USD.
@@ -70,8 +76,8 @@ def size_position(
     call_premium_usd = call_premium_btc * spot_usd
     put_premium_usd = put_premium_btc * spot_usd
 
-    call_cost_per = config.QTY_PER_LEG * call_premium_usd
-    put_cost_per = config.QTY_PER_LEG * put_premium_usd
+    call_cost_per = qty_per_leg * call_premium_usd
+    put_cost_per = qty_per_leg * put_premium_usd
     straddle_cost = call_cost_per + put_cost_per
 
     if straddle_cost <= 0:
@@ -109,6 +115,7 @@ def size_position(
         spot=f"${spot_usd:,.0f}",
         available=f"${available:,.0f}",
         num_straddles=n,
+        qty_per_leg=qty_per_leg,
         call_premium_btc=call_premium_btc,
         put_premium_btc=put_premium_btc,
         call_cost_per=f"${call_cost_per:,.2f}",

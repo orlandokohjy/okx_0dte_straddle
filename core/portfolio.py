@@ -19,7 +19,8 @@ from utils.time_utils import now_utc
 log = structlog.get_logger(__name__)
 
 TRADE_LOG_FIELDS = [
-    "date", "entry_time", "exit_time", "exit_reason",
+    "date", "session", "qty_per_leg",
+    "entry_time", "exit_time", "exit_reason",
     "num_straddles", "strike",
     "entry_spot", "exit_spot",
     "call_premium_entry", "call_premium_exit",
@@ -77,6 +78,11 @@ class Straddle:
     entry_put_price: float
     straddle_cost: float
     num_straddles: int
+
+    # Which Session fired this straddle (e.g. "morning" / "afternoon").
+    # Empty for legacy single-session state files; reports treat empty
+    # as "unknown" but still display the row.
+    session_name: str = ""
 
     # Spot prices captured for context (verify strike selection, exit
     # context). Optional — older state files may not have them.
@@ -157,6 +163,7 @@ class Straddle:
             "entry_put_price": self.entry_put_price,
             "straddle_cost": self.straddle_cost,
             "num_straddles": self.num_straddles,
+            "session_name": self.session_name,
             "entry_spot_price": self.entry_spot_price,
             "exit_spot_price": self.exit_spot_price,
             "status": self.status,
@@ -175,6 +182,7 @@ class Portfolio:
         self._straddle: Optional[Straddle] = None
         self._daily_pnl: float = 0.0
         self._load_equity()
+        self._migrate_trade_log()
 
     @property
     def equity(self) -> float:
@@ -293,6 +301,8 @@ class Portfolio:
 
         row = {
             "date": s.entry_time[:10],
+            "session": s.session_name,
+            "qty_per_leg": s.qty_per_leg,
             "entry_time": s.entry_time,
             "exit_time": s.exit_time,
             "exit_reason": exit_reason,
@@ -347,3 +357,71 @@ class Portfolio:
             if needs_header:
                 writer.writeheader()
             writer.writerow(row)
+
+    def _migrate_trade_log(self) -> None:
+        """Rewrite an older trade-log CSV in place when the schema grows.
+
+        Pre-multi-session deployments wrote rows without ``session`` /
+        ``qty_per_leg`` columns. Appending new-format rows to such a
+        file with csv.DictWriter would silently misalign columns with
+        the header. This one-shot migration:
+
+          • Detects an existing header missing the new columns.
+          • Backfills the new columns: session = "" (legacy single
+            session), qty_per_leg = legacy config.QTY_PER_LEG default.
+          • Rewrites the file in-place with the new TRADE_LOG_FIELDS
+            order so future appends line up.
+
+        Safe to run on every boot — no-op when the schema already
+        matches.
+        """
+        path = config.TRADE_LOG_FILE
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, newline="") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+        except Exception:
+            log.warning("trade_log_migration_read_failed",
+                        path=path, exc_info=True)
+            return
+
+        if not rows:
+            return
+
+        existing_header = rows[0]
+        if existing_header == TRADE_LOG_FIELDS:
+            return
+
+        missing = [c for c in TRADE_LOG_FIELDS if c not in existing_header]
+        if not missing:
+            log.info("trade_log_migration_skip_reorder_only",
+                     existing=len(existing_header),
+                     target=len(TRADE_LOG_FIELDS))
+
+        old_rows = []
+        for raw in rows[1:]:
+            if len(raw) < len(existing_header):
+                raw = raw + [""] * (len(existing_header) - len(raw))
+            d = dict(zip(existing_header, raw))
+            d.setdefault("session", "")
+            d.setdefault("qty_per_leg", str(config.QTY_PER_LEG))
+            old_rows.append(d)
+
+        try:
+            tmp_path = path + ".migrating"
+            with open(tmp_path, "w", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=TRADE_LOG_FIELDS, extrasaction="ignore",
+                )
+                writer.writeheader()
+                for d in old_rows:
+                    writer.writerow({k: d.get(k, "") for k in TRADE_LOG_FIELDS})
+            os.replace(tmp_path, path)
+            log.info("trade_log_migrated",
+                     path=path, rows=len(old_rows),
+                     added_columns=missing)
+        except Exception:
+            log.warning("trade_log_migration_write_failed",
+                        path=path, exc_info=True)

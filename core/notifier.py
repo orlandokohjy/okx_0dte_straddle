@@ -46,12 +46,24 @@ async def notify_entry(
     num_straddles: int, equity: float, straddle_cost: float,
     strike: float, call_fill: float, put_fill: float,
     call_cost_total: float, put_cost_total: float,
+    session_label: str = "",
+    qty_per_leg: float = 0.0,
 ) -> None:
     """All money values are USD. The caller is responsible for converting
-    BTC-quoted OKX premiums to USD via spot before invoking this."""
+    BTC-quoted OKX premiums to USD via spot before invoking this.
+
+    session_label is a user-visible window such as ``13:30-15:30 UTC``.
+    """
+    header = "<b>SESSION ENTRY</b>"
+    if session_label:
+        header = f"<b>SESSION ENTRY [{session_label}]</b>"
+    qty_line = (
+        f"BTC per leg: {qty_per_leg:.4f}\n" if qty_per_leg > 0 else ""
+    )
     await send(
-        f"<b>SESSION ENTRY</b>\n"
+        f"{header}\n"
         f"Straddles: {num_straddles}\n"
+        f"{qty_line}"
         f"Equity: ${equity:,.2f}\n"
         f"\n<b>Fills</b>\n"
         f"Strike: ${strike:,.0f}\n"
@@ -64,10 +76,15 @@ async def notify_entry(
     )
 
 
-async def notify_close(pnl: float, exit_reason: str) -> None:
+async def notify_close(
+    pnl: float, exit_reason: str, session_label: str = "",
+) -> None:
     pnl_sign = "+" if pnl >= 0 else ""
+    header = "<b>SESSION CLOSE</b>"
+    if session_label:
+        header = f"<b>SESSION CLOSE [{session_label}]</b>"
     await send(
-        f"<b>SESSION CLOSE</b>\n"
+        f"{header}\n"
         f"P&L: {pnl_sign}${pnl:,.2f}\n"
     )
 
@@ -80,27 +97,25 @@ async def notify_error(context: str, message: str) -> None:
     await send(f"<b>ERROR</b> [{context}]\n{message}")
 
 
-async def notify_daily_summary(
-    equity: float, daily_pnl: float, cum_return: float,
+async def send_daily_report(
+    equity: float, trading_day: str | None = None,
 ) -> None:
-    await send(
-        f"<b>DAILY SUMMARY</b>\n"
-        f"Equity: ${equity:,.2f}\n"
-        f"Today P&L: ${daily_pnl:,.2f}\n"
-        f"Cumulative return: {cum_return:.1%}\n"
-    )
+    """Generate and send the full DAILY REPORT to the report group chat.
 
-
-async def send_daily_report(equity: float) -> None:
-    """Generate and send the slim Trade Summary to the report group chat."""
-    from reporting.daily_report import compute_report, format_telegram_summary
+    trading_day is the UTC expiry date (YYYY-MM-DD); when None, the
+    report is computed for the current UTC trading day inferred from
+    the 08:00 UTC cutoff.
+    """
+    from reporting.daily_report import compute_report, format_telegram_report
     try:
-        metrics = compute_report(equity)
+        metrics = compute_report(equity, trading_day=trading_day)
         if metrics is None:
-            log.info("daily_report_skipped", reason="no trades today")
+            log.info("daily_report_skipped",
+                     reason="no trades on trading day",
+                     trading_day=trading_day)
             return
-        await send_report(format_telegram_summary(metrics))
-        log.info("daily_report_sent")
+        await send_report(format_telegram_report(metrics))
+        log.info("daily_report_sent", trading_day=metrics.trade_date)
     except Exception:
         log.warning("daily_report_failed", exc_info=True)
 

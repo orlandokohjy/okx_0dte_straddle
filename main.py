@@ -1,8 +1,27 @@
 """
 OKX 0DTE BTC Pure Straddle Algo.
 
-Single daily session: 12:00–16:00 UTC, Mon–Fri.
-Position: 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
+Multi-session: every Session in `config.SESSIONS` has its own weekday
+filter, qty_per_leg and entry / close window. Default deployment fires
+ten trades per week, paired into five complete trading days (Tue-Sat):
+
+  • afternoon (1st entry) 13:30-15:30 UTC  Mon-Fri  @ 0.50 BTC / leg
+  • morning   (2nd entry) 01:00-02:00 UTC  Tue-Sat  @ 0.25 BTC / leg
+
+A "trading day" is the 0DTE expiry UTC date (08:00 UTC cutoff). The
+afternoon session that fires Mon 13:30 UTC and the morning session that
+fires Tue 01:00 UTC both expire Tue 08:00 UTC, so they roll up into ONE
+Tuesday trading-day report.
+
+Reports are CHAINED off the morning close (the last close of each
+trading day), not run on a separate cron. After the Tue 02:00 UTC
+morning close finishes you get, in order:
+    SESSION CLOSE → DAILY REPORT
+On the Saturday morning close (the last trading day of the week) you
+additionally get:
+    SESSION CLOSE → DAILY REPORT → WEEKLY REPORT
+
+Position: 1 ITM call + 1 put (same strike) per session's qty_per_leg.
 Compound sizing: 80% of current equity, override default = 1 straddle.
 Maker-only orders with 50%-gap-narrow chase, BOTH legs fired concurrently.
 
@@ -18,6 +37,7 @@ import os
 import re
 import signal
 import sys
+from datetime import datetime
 
 import structlog
 
@@ -272,21 +292,43 @@ class Algo:
             f"\n<b>⚠️ ENTRY LOCKED</b>: {self._lock_reason}"
             if self._entry_locked else ""
         )
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        def _days_str(weekdays: frozenset[int]) -> str:
+            ordered = sorted(weekdays)
+            if len(ordered) > 1 and ordered == list(
+                range(ordered[0], ordered[-1] + 1)
+            ):
+                return f"{day_names[ordered[0]]}-{day_names[ordered[-1]]}"
+            return ",".join(day_names[d] for d in ordered) or "—"
+
+        sessions_lines = "\n".join(
+            f"  • [{s.time_label}]  "
+            f"{_days_str(s.weekdays)}  @ {s.qty_per_leg} BTC/leg"
+            for s in config.SESSIONS
+        )
+        last_session = config.get_session(config.LAST_CLOSE_SESSION_NAME)
+        last_close_label = (
+            f"{last_session.close_utc.strftime('%H:%M')} UTC"
+            if last_session else "morning close"
+        )
         await notifier.send(
             f"<b>OKX STRADDLE ALGO STARTED</b>\n"
             f"Mode: {mode}"
             f"{' (DRY RUN)' if config.DRY_RUN else ''}\n"
             f"Spot: ${spot:,.2f}\n"
             f"Equity: ${self.portfolio.equity:,.2f}\n"
-            f"Time: {format_utc_sgt(now_utc())}"
+            f"Time: {format_utc_sgt(now_utc())}\n"
+            f"\n<b>Sessions:</b>\n"
+            f"{sessions_lines}\n"
+            f"  Reports: chained after the {last_close_label} close "
+            f"(daily on Tue-Sat, weekly on Sat)"
             f"{lock_line}\n"
         )
 
         self.scheduler.register_session(
             on_entry=self._on_entry,
             on_close=self._on_close,
-            on_report=self._on_report,
-            on_weekly_report=self._on_weekly_report,
         )
         self.scheduler.start()
 
@@ -295,10 +337,28 @@ class Algo:
             if ft:
                 log.info("next_fire", job=job_id, time=format_utc_sgt(ft))
 
-        if os.getenv("ENTRY_NOW", "").lower() == "true":
-            log.info("immediate_entry_triggered")
-            _disable_entry_now_in_env_file()
-            await self._on_entry()
+        # ENTRY_NOW supports either "true" (legacy single-session boolean)
+        # or a session name ("morning" / "afternoon"). Boolean form picks
+        # the first session in config.SESSIONS so it stays compatible
+        # with old ops runbooks. Auto-disabled after firing so a restart
+        # never silently re-fires.
+        entry_now_raw = os.getenv("ENTRY_NOW", "").strip().lower()
+        if entry_now_raw and entry_now_raw not in ("false", "0", "no"):
+            target: config.Session | None = None
+            if entry_now_raw in ("true", "1", "yes"):
+                target = config.SESSIONS[0] if config.SESSIONS else None
+            else:
+                target = config.get_session(entry_now_raw)
+            if target is None:
+                log.warning("immediate_entry_unknown_session",
+                            raw=entry_now_raw,
+                            valid=[s.name for s in config.SESSIONS])
+            else:
+                log.info("immediate_entry_triggered",
+                         session=target.name,
+                         qty_per_leg=target.qty_per_leg)
+                _disable_entry_now_in_env_file()
+                await self._on_entry(target)
 
         log.info("algo_running")
         await self._shutdown.wait()
@@ -509,52 +569,73 @@ class Algo:
 
     # ──────────────────── Entry ───────────────────────────────────
 
-    async def _on_entry(self) -> None:
+    async def _on_entry(self, session: config.Session) -> None:
+        label = session.time_label
         try:
-            await self._run_entry()
+            await self._run_entry(session)
         except Exception:
-            log.error("entry_error", exc_info=True)
+            log.error("entry_error", session=session.name,
+                      label=label, exc_info=True)
             await notifier.notify_error(
-                "Entry", "Unhandled exception — check logs",
+                f"Entry [{label}]",
+                "Unhandled exception — check logs",
             )
 
-    async def _run_entry(self) -> None:
-        log.info("session_entry_start")
+    async def _run_entry(self, session: config.Session) -> None:
+        label = session.time_label
+        log.info("session_entry_start",
+                 session=session.name,
+                 label=label,
+                 qty_per_leg=session.qty_per_leg)
 
         if self._entry_locked:
-            log.warning("entry_blocked_lock", reason=self._lock_reason)
+            log.warning("entry_blocked_lock",
+                        session=session.name, reason=self._lock_reason)
             await notifier.notify_skip(
-                f"Entry locked: {self._lock_reason}",
+                f"[{label}] Entry locked: {self._lock_reason}",
             )
             return
 
         api_check = self.risk.check_api_health(self.exchange.error_count)
         if not api_check.allowed:
-            log.warning("entry_blocked_api", reason=api_check.reason)
-            await notifier.notify_skip(api_check.reason)
+            log.warning("entry_blocked_api",
+                        session=session.name, reason=api_check.reason)
+            await notifier.notify_skip(
+                f"[{label}] {api_check.reason}",
+            )
             return
 
         loss_check = self.risk.check_daily_loss()
         if not loss_check.allowed:
-            log.warning("entry_blocked_loss", reason=loss_check.reason)
-            await notifier.notify_skip(loss_check.reason)
+            log.warning("entry_blocked_loss",
+                        session=session.name, reason=loss_check.reason)
+            await notifier.notify_skip(
+                f"[{label}] {loss_check.reason}",
+            )
             return
 
         if self.portfolio.has_open:
-            log.warning("already_has_open_straddle")
+            log.warning("already_has_open_straddle", session=session.name)
+            await notifier.notify_skip(
+                f"[{label}] A straddle from a prior session is still "
+                f"open — skipping entry.",
+            )
             return
 
         total_options = await self.chain.refresh()
         if total_options == 0:
-            log.error("no_0dte_options")
-            await notifier.notify_skip("No 0DTE options found on OKX")
+            log.error("no_0dte_options", session=session.name)
+            await notifier.notify_skip(
+                f"[{label}] No 0DTE options found on OKX",
+            )
             return
 
         spot = await self.exchange.get_spot_price()
         pair = select_straddle_pair(self.chain, spot)
         if pair is None:
             await notifier.notify_skip(
-                f"No valid ITM call + put pair near spot ${spot:,.0f}",
+                f"[{label}] No valid ITM call + put pair near "
+                f"spot ${spot:,.0f}",
             )
             return
 
@@ -565,7 +646,10 @@ class Algo:
 
         equity = self.portfolio.equity
         # Premium quotes are in BTC; sizer needs spot to compute USD costs.
-        sizing = size_position(equity, pair.call.ask, pair.put.ask, spot)
+        sizing = size_position(
+            equity, pair.call.ask, pair.put.ask, spot,
+            qty_per_leg=session.qty_per_leg,
+        )
 
         if config.NUM_STRADDLES_OVERRIDE > 0:
             sizing.num_straddles = config.NUM_STRADDLES_OVERRIDE
@@ -634,13 +718,14 @@ class Algo:
         )
 
         await notifier.send(
-            f"<b>PRE-FLIGHT CHECK</b>\n"
+            f"<b>PRE-FLIGHT CHECK [{label}]</b>\n"
             f"Straddles: {sizing.num_straddles}\n"
+            f"BTC per leg: {session.qty_per_leg}\n"
             f"Spot: ${spot:,.0f} | Strike: ${pair.strike:,.0f}\n"
             f"\n<b>Per straddle:</b>\n"
-            f"  Call cost ({config.QTY_PER_LEG} BTC): "
+            f"  Call cost ({session.qty_per_leg} BTC): "
             f"${sizing.call_cost_per:,.2f}\n"
-            f"  Put cost ({config.QTY_PER_LEG} BTC): "
+            f"  Put cost ({session.qty_per_leg} BTC): "
             f"${sizing.put_cost_per:,.2f}\n"
             f"  Total: ${sizing.straddle_cost:,.2f}\n"
             f"\n<b>All {sizing.num_straddles} straddles:</b>\n"
@@ -655,20 +740,24 @@ class Algo:
         straddle = await build_straddle(
             self.exchange, self.market, self.portfolio,
             pair, sizing.num_straddles,
+            qty_per_leg=session.qty_per_leg,
+            session_name=session.name,
             entry_spot=spot,
         )
         if straddle:
             self._consecutive_failures = 0
-            volume_tracker.record_trade(sizing.num_straddles)
+            volume_tracker.record_trade(
+                sizing.num_straddles, qty_per_leg=session.qty_per_leg,
+            )
             # Convert BTC-quoted premiums to USD for human-readable display.
-            entry_spot = straddle.entry_spot_price or spot
-            call_fill_usd = straddle.entry_call_price * entry_spot
-            put_fill_usd = straddle.entry_put_price * entry_spot
+            entry_spot_usd = straddle.entry_spot_price or spot
+            call_fill_usd = straddle.entry_call_price * entry_spot_usd
+            put_fill_usd = straddle.entry_put_price * entry_spot_usd
             call_cost_total_usd = (
-                call_fill_usd * config.QTY_PER_LEG * sizing.num_straddles
+                call_fill_usd * session.qty_per_leg * sizing.num_straddles
             )
             put_cost_total_usd = (
-                put_fill_usd * config.QTY_PER_LEG * sizing.num_straddles
+                put_fill_usd * session.qty_per_leg * sizing.num_straddles
             )
             await notifier.notify_entry(
                 num_straddles=sizing.num_straddles,
@@ -679,16 +768,22 @@ class Algo:
                 put_fill=put_fill_usd,
                 call_cost_total=call_cost_total_usd,
                 put_cost_total=put_cost_total_usd,
+                session_label=label,
+                qty_per_leg=session.qty_per_leg,
             )
             log.info("session_entry_done",
+                     session=session.name,
+                     qty_per_leg=session.qty_per_leg,
                      num_straddles=sizing.num_straddles,
                      call_fill_btc=straddle.entry_call_price,
                      put_fill_btc=straddle.entry_put_price,
                      call_fill_usd=call_fill_usd,
                      put_fill_usd=put_fill_usd)
         else:
-            log.error("straddle_build_failed")
-            self._register_session_failure("build_straddle returned None")
+            log.error("straddle_build_failed", session=session.name)
+            self._register_session_failure(
+                f"[{session.name}] build_straddle returned None",
+            )
 
     # ──────────────────── Failure tracking / circuit breaker ─────
 
@@ -741,10 +836,13 @@ class Algo:
 
     # ──────────────────── Close ───────────────────────────────────
 
-    async def _on_close(self) -> None:
+    async def _on_close(self, session: config.Session) -> None:
+        label = session.time_label
         try:
             equity_before = self.portfolio.equity
-            pnl = await self.exit_mgr.hard_close()
+            pnl = await self.exit_mgr.hard_close(
+                session_name=session.name, session_label=label,
+            )
 
             if config.HAS_OKX_CREDS:
                 live_equity = await self.exchange.get_account_equity()
@@ -753,57 +851,98 @@ class Algo:
                 await self._post_close_reconcile()
 
             actual_pnl = self.portfolio.equity - equity_before
-            if actual_pnl != 0.0:
-                # Cumulative return is anchored on the *actual* starting
-                # equity recorded in the trade log (first row's
-                # capital_before), not on the placeholder
-                # INITIAL_CAPITAL_USD config default. This avoids day-1
-                # phantom returns when the live OKX balance differs from
-                # the default ($8,000).
+
+            # The trading-day last close is configured in
+            # config.LAST_CLOSE_SESSION_NAME (currently the morning
+            # session, which closes at 02:00 UTC on the expiry day).
+            # That close fires the DAILY REPORT — earlier closes in
+            # the same trading day just emit a plain SESSION CLOSE.
+            is_last_close = session.name == config.LAST_CLOSE_SESSION_NAME
+
+            if is_last_close:
+                # Trading day = expiry date in UTC. We resolve it from
+                # NOW() using the 08:00 UTC cutoff so this gating works
+                # even if the close fired a few seconds early/late.
                 from reporting.daily_report import (
-                    _load_trades, _inception_equity,
+                    _load_trades,
+                    _trading_day_from_entry_time,
+                )
+                now_iso = now_utc().isoformat()
+                trading_day = _trading_day_from_entry_time(
+                    now_iso, fallback_date=now_utc().strftime("%Y-%m-%d"),
                 )
                 trades = _load_trades()
-                inception = _inception_equity(trades)
-                cum_return = (
-                    (self.portfolio.equity - inception) / inception
-                    if inception > 0 else 0.0
-                )
-                await notifier.notify_daily_summary(
-                    self.portfolio.equity, actual_pnl, cum_return,
-                )
+                day_trades = [
+                    t for t in trades if t.trading_day == trading_day
+                ]
+
+                if day_trades:
+                    # Send the comprehensive DAILY REPORT immediately
+                    # after the morning close. The combined trading-day
+                    # P&L breakdown is rendered inside the report.
+                    try:
+                        await notifier.send_daily_report(
+                            self.portfolio.equity,
+                            trading_day=trading_day,
+                        )
+                    except Exception:
+                        log.warning(
+                            "daily_report_chain_failed", exc_info=True,
+                        )
+
+                    # WEEKLY REPORT fires on the LAST trading day of the
+                    # week (= max trading-day weekday across all sessions
+                    # / weekday filters). For the default Mon-Fri / Tue-Sat
+                    # schedule this lands on the Saturday morning close.
+                    last_td_weekday = self._last_trading_day_weekday()
+                    try:
+                        td_dt = datetime.strptime(
+                            trading_day, "%Y-%m-%d",
+                        ).date()
+                    except ValueError:
+                        td_dt = None
+                    if td_dt is not None and \
+                            td_dt.weekday() == last_td_weekday:
+                        try:
+                            await notifier.send_weekly_report(
+                                self.portfolio.equity,
+                            )
+                        except Exception:
+                            log.warning(
+                                "weekly_report_chain_failed",
+                                exc_info=True,
+                            )
+
             self.portfolio.reset_daily()
             log.info("session_close_done",
+                     session=session.name,
+                     is_last_close=is_last_close,
                      pnl=f"${pnl:,.2f}",
                      actual_pnl=f"${actual_pnl:,.2f}",
                      equity=f"${self.portfolio.equity:,.2f}")
         except Exception:
-            log.error("close_error", exc_info=True)
+            log.error("close_error", session=session.name,
+                      label=label, exc_info=True)
             await notifier.notify_error(
-                "Close", "Unhandled exception — check logs",
+                f"Close [{label}]",
+                "Unhandled exception — check logs",
             )
 
-    # ──────────────────── Daily Report (17:00 UTC) ────────────────
+    @staticmethod
+    def _last_trading_day_weekday() -> int:
+        """Return the UTC weekday (0=Mon..6=Sun) of the LAST trading day
+        in a normal week, derived from config.SESSIONS.
 
-    async def _on_report(self) -> None:
-        try:
-            await notifier.send_daily_report(self.portfolio.equity)
-        except Exception:
-            log.error("report_error", exc_info=True)
-            await notifier.notify_error(
-                "Report", "Daily report failed — check logs",
-            )
-
-    # ──────────────────── Weekly Report (Fri 18:00 UTC) ──────────
-
-    async def _on_weekly_report(self) -> None:
-        try:
-            await notifier.send_weekly_report(self.portfolio.equity)
-        except Exception:
-            log.error("weekly_report_error", exc_info=True)
-            await notifier.notify_error(
-                "Weekly Report", "Weekly report failed — check logs",
-            )
+        For the default Mon-Fri / Tue-Sat schedule this is Saturday (5).
+        Used to decide when to chain the WEEKLY REPORT off the morning
+        close — only the Saturday close fires it.
+        """
+        weekdays_with_close = {
+            (d + s.trading_day_offset_days) % 7
+            for s in config.SESSIONS
+            for d in s.weekdays
+        }
+        return max(weekdays_with_close) if weekdays_with_close else 4
 
     # ──────────────────── Shutdown ────────────────────────────────
 

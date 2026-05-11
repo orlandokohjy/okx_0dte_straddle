@@ -9,7 +9,8 @@ For production, set OKX_FLAG=0 in .env.
 from __future__ import annotations
 
 import os
-from datetime import time
+from dataclasses import dataclass, field
+from datetime import datetime, date, time, timedelta
 
 # ──────────────────── OKX Credentials ─────────────────────────────
 OKX_API_KEY: str = os.getenv("OKX_API_KEY", "")
@@ -44,6 +45,9 @@ HAS_OKX_CREDS: bool = bool(OKX_API_KEY and OKX_API_SECRET and OKX_PASSPHRASE)
 # ──────────────────── Strategy Constants ──────────────────────────
 BASE_COIN: str = "BTC"
 QUOTE_COIN: str = os.getenv("QUOTE_COIN", "USD")  # "USD" (coin-margined) or "USDT"
+# Legacy single-session BTC notional. Kept ONLY as a fallback for older
+# trade-log rows that pre-date per-session qty_per_leg. New entries source
+# qty_per_leg from the Session that fired them — see SESSIONS below.
 QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "0.5"))
 
 # OKX BTC options: 1 contract = 0.01 BTC (coin-margined). Verify per instrument
@@ -65,12 +69,147 @@ INITIAL_CAPITAL_USD: float = float(os.getenv("INITIAL_CAPITAL_USD", "8000.0"))
 ALLOC_PCT: float = 0.80
 NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))
 
-# ──────────────────── Session Schedule (UTC) ──────────────────────
-SESSION_ENTRY_UTC: time = time(12, 0)
-SESSION_CLOSE_UTC: time = time(16, 0)
-REPORT_UTC: time = time(17, 0)
-WEEKLY_REPORT_UTC: time = time(18, 0)
-ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
+
+# ──────────────────── Multi-Session Schedule (UTC) ────────────────
+#
+# OKX BTC 0DTE options expire daily at 08:00 UTC. We define a "trading
+# day" as the calendar UTC date of that expiry. A trading day's two
+# entries straddle the previous-day boundary:
+#
+#   • FIRST entry  : afternoon, 13:30-15:30 UTC the day BEFORE expiry
+#                    (size = 0.50 BTC notional / leg)
+#   • SECOND entry : morning,   01:00-02:00 UTC the day OF expiry
+#                    (size = 0.25 BTC notional / leg)
+#
+# Both sessions share the SAME straddle structure (1 ITM call + 1 ITM
+# put at the same strike) and post to the same trade log so the daily
+# report and combined DAILY SUMMARY telegram aggregate by trading_day.
+#
+# Per-session weekday filters give us 5 complete trading-day pairs
+# per week (Tue, Wed, Thu, Fri, Sat) for a total of 10 trades:
+#   • afternoon (1st) fires Mon-Fri UTC  (covers Tue-Sat trading days)
+#   • morning   (2nd) fires Tue-Sat UTC  (covers Tue-Sat trading days)
+# Mon and Sun are dark by design — they would only ever produce
+# half-pair trading days otherwise.
+EXPIRY_CUTOFF_UTC: time = time(8, 0)
+
+
+@dataclass(frozen=True)
+class Session:
+    name: str               # short identifier ("morning", "afternoon")
+    entry_utc: time         # cron-style UTC hh:mm to fire entry
+    close_utc: time         # cron-style UTC hh:mm to fire hard close
+    qty_per_leg: float      # BTC notional per leg for THIS session
+    weekdays: frozenset[int] = field(  # UTC weekdays (0=Mon..6=Sun) on
+        default_factory=lambda: frozenset({0, 1, 2, 3, 4}),  # which to fire
+    )
+
+    @property
+    def trading_day_offset_days(self) -> int:
+        """Calendar-day offset from entry UTC date to expiry/trading day.
+
+        Sessions that fire AT or AFTER the 08:00 UTC expiry cutoff
+        trade options that expire the NEXT calendar day, so trading
+        day = entry_date + 1. Sessions firing before 08:00 UTC trade
+        same-day expiry, so trading day = entry_date.
+        """
+        return 1 if self.entry_utc >= EXPIRY_CUTOFF_UTC else 0
+
+    @property
+    def trading_day_close_position(self) -> tuple[int, int, int]:
+        """Sortable key for ordering sessions WITHIN a trading day.
+
+        Combines the trading-day offset with the close-time so we can
+        identify which session closes LAST on a given trading day —
+        that's the one that triggers the combined DAILY SUMMARY.
+        """
+        return (
+            -self.trading_day_offset_days,  # earlier-day fires first
+            self.close_utc.hour,
+            self.close_utc.minute,
+        )
+
+    @property
+    def time_label(self) -> str:
+        """Human-friendly entry/close window for telegram messages.
+
+        Example: ``13:30-15:30 UTC``. We use the timing window as the
+        primary user-visible identifier (instead of "morning" /
+        "afternoon") so the labels are unambiguous across timezones.
+        """
+        return (
+            f"{self.entry_utc.strftime('%H:%M')}-"
+            f"{self.close_utc.strftime('%H:%M')} UTC"
+        )
+
+
+SESSIONS: list[Session] = [
+    # FIRST entry of each trading day — fires the day BEFORE expiry.
+    # Mon-Fri UTC, so each fire creates a Tue-Sat trading day.
+    Session(
+        name="afternoon",
+        entry_utc=time(13, 30),
+        close_utc=time(15, 30),
+        qty_per_leg=float(os.getenv("AFTERNOON_QTY_PER_LEG", "0.5")),
+        weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
+    ),
+    # SECOND entry of each trading day — fires the same day as expiry.
+    # Tue-Sat UTC, pairs 1:1 with the afternoon entries above.
+    Session(
+        name="morning",
+        entry_utc=time(1, 0),
+        close_utc=time(2, 0),
+        qty_per_leg=float(os.getenv("MORNING_QTY_PER_LEG", "0.25")),
+        weekdays=frozenset({1, 2, 3, 4, 5}),  # Tue-Sat UTC
+    ),
+]
+
+
+def trading_day_for(entry_dt: datetime) -> date:
+    """Return the trading day (= 0DTE expiry date) for a given UTC
+    entry timestamp.
+
+    Sessions firing at/after 08:00 UTC trade NEXT-day expiry options,
+    so trading day = entry_dt.date() + 1. Sessions firing before 08:00
+    UTC trade SAME-day expiry, so trading day = entry_dt.date().
+    """
+    cutoff = EXPIRY_CUTOFF_UTC
+    if (entry_dt.hour, entry_dt.minute) >= (cutoff.hour, cutoff.minute):
+        return (entry_dt + timedelta(days=1)).date()
+    return entry_dt.date()
+
+
+def _last_close_session_name(sessions: list[Session]) -> str:
+    """The session whose close time is the LAST event of a trading day.
+
+    Sorted by trading-day position so afternoon (-1d, 15:30) ranks
+    BEFORE morning (0d, 02:00). The maximum of that ordering is the
+    last close — that's the only session that triggers the combined
+    daily summary.
+    """
+    if not sessions:
+        return ""
+    return max(sessions, key=lambda s: s.trading_day_close_position).name
+
+
+LAST_CLOSE_SESSION_NAME: str = _last_close_session_name(SESSIONS)
+
+
+def get_session(name: str) -> Session | None:
+    """Lookup a session by name, or None if not configured."""
+    for s in SESSIONS:
+        if s.name == name:
+            return s
+    return None
+
+
+# Reports are chained off the morning close (= last close of each
+# trading day) by main._on_close — see scheduler.py for the entry/close
+# cron jobs and main.py for the chained-report logic. These two values
+# are kept for backward compatibility / introspection only.
+REPORT_UTC: time = time(2, 5)        # informational: ~5 min after morning close
+WEEKLY_REPORT_UTC: time = time(2, 10) # informational: ~10 min after Sat morning close
+ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri (legacy default)
 
 # ──────────────────── Execution Settings ──────────────────────────
 OPTION_CHASE_INTERVAL_SEC: float = 5.0

@@ -1,7 +1,9 @@
 """
 Straddle construction and teardown on OKX.
 
-One straddle = 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
+One straddle = 1 ITM call + 1 put (same strike) per `qty_per_leg` BTC.
+The qty is sourced from the firing Session (config.SESSIONS) — the
+afternoon session may use 0.5 BTC while the morning uses 0.25 BTC.
 
 Entry strategy:
   1. Pre-entry spread gate — skip session if either leg's spread is too wide
@@ -114,6 +116,8 @@ async def build_straddle(
     portfolio: Portfolio,
     pair: StraddlePair,
     num_straddles: int,
+    qty_per_leg: float,
+    session_name: str,
     entry_spot: float = 0.0,
 ) -> Optional[Straddle]:
     """
@@ -122,11 +126,17 @@ async def build_straddle(
     Order: PUT first, then CALL. If puts fail, the session is skipped
     entirely (no spot/call exposure). If calls fail after puts filled, the
     puts are sold back via emergency unwind.
-    """
-    straddle_id = f"OKX-{uuid.uuid4().hex[:8]}"
-    total_qty = config.QTY_PER_LEG * num_straddles
 
-    log.info("building_straddle", id=straddle_id, strike=pair.strike,
+    qty_per_leg is the BTC notional for a single leg unit and comes from
+    the Session that fired the entry. session_name is stamped onto the
+    resulting Straddle so close handlers and the daily report can keep
+    each session's results separable.
+    """
+    straddle_id = f"OKX-{session_name[:1].upper()}-{uuid.uuid4().hex[:8]}"
+    total_qty = qty_per_leg * num_straddles
+
+    log.info("building_straddle", id=straddle_id, session=session_name,
+             strike=pair.strike, qty_per_leg=qty_per_leg,
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles)
 
     # ── Pre-entry spread gate ──
@@ -351,7 +361,7 @@ async def build_straddle(
         )
 
     # ── Register ──
-    straddle_cost = config.QTY_PER_LEG * (call_fill + put_fill)
+    straddle_cost = qty_per_leg * (call_fill + put_fill)
 
     # Capture spot if caller didn't provide it (rare path).
     if entry_spot <= 0:
@@ -365,16 +375,18 @@ async def build_straddle(
         call_leg=call_leg,
         put_leg=put_leg,
         strike=pair.strike,
-        qty_per_leg=config.QTY_PER_LEG,
+        qty_per_leg=qty_per_leg,
         entry_time=now_utc().isoformat(),
         entry_call_price=call_fill,
         entry_put_price=put_fill,
         straddle_cost=straddle_cost,
         num_straddles=num_straddles,
         entry_spot_price=entry_spot,
+        session_name=session_name,
     )
     portfolio.set_straddle(straddle)
-    log.info("straddle_built", id=straddle_id, num=num_straddles,
+    log.info("straddle_built", id=straddle_id, session=session_name,
+             num=num_straddles,
              cost=f"${straddle_cost * num_straddles:,.2f}",
              call=call_fill, put=put_fill, strike=pair.strike,
              spot=entry_spot)

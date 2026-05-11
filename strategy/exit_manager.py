@@ -20,14 +20,24 @@ class ExitManager:
         self._market = market
         self._portfolio = portfolio
 
-    async def hard_close(self) -> float:
+    async def hard_close(
+        self, session_name: str = "", session_label: str = "",
+    ) -> float:
+        """Unwind any open straddle. session_label (e.g.
+        ``13:30-15:30 UTC``) is shown in the SESSION CLOSE telegram so
+        multi-session deployments can tell which window triggered the
+        close. session_name is kept for structured logging only.
+        """
         if not self._portfolio.has_open:
-            log.info("nothing_to_close")
+            log.info("nothing_to_close",
+                     session=session_name, label=session_label)
             return 0.0
 
         pnl = await unwind_straddle(
             self._exchange, self._market, self._portfolio,
             reason="session_close",
         )
-        await notifier.notify_close(pnl, "session_close")
+        await notifier.notify_close(
+            pnl, "session_close", session_label=session_label,
+        )
         return pnl

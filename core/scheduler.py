@@ -1,7 +1,21 @@
-"""APScheduler wrapper — single session: entry at 12:00, close at 16:00 UTC."""
+"""APScheduler wrapper — registers entry+close jobs for every Session
+in config.SESSIONS.
+
+Multi-session support: each Session gets its own entry job and close
+job, scheduled on its own UTC weekday filter. The handler callbacks
+accept the Session as their only argument so the same callback handles
+every session, looking up qty_per_leg and metadata from the Session.
+
+Reports are NOT scheduled here. The DAILY SUMMARY, DAILY REPORT and
+(on the last trading day of the week) WEEKLY REPORT are all chained
+directly off the morning close handler so they arrive within seconds
+of each other rather than spread across the day. See main.py
+``_on_close`` for the chained-report logic.
+"""
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -14,78 +28,78 @@ from utils.time_utils import UTC
 log = structlog.get_logger(__name__)
 
 
+SessionHandler = Callable[[config.Session], Awaitable[None]]
+
+
 class Scheduler:
     def __init__(self) -> None:
         self._scheduler = AsyncIOScheduler(timezone=UTC)
 
     def register_session(
-        self, on_entry: callable, on_close: callable, on_report: callable,
-        on_weekly_report: callable | None = None,
+        self,
+        on_entry: SessionHandler,
+        on_close: SessionHandler,
     ) -> None:
-        weekdays = ",".join(
-            ["mon", "tue", "wed", "thu", "fri"][d]
-            for d in sorted(config.ALLOWED_WEEKDAYS)
-        )
+        """Register entry+close cron jobs for every Session.
 
-        entry_t = config.SESSION_ENTRY_UTC
-        self._scheduler.add_job(
-            on_entry,
-            CronTrigger(
-                hour=entry_t.hour, minute=entry_t.minute,
-                day_of_week=weekdays, timezone=UTC,
-            ),
-            id="session_entry",
-            name=f"Session Entry ({entry_t.hour:02d}:{entry_t.minute:02d} UTC)",
-            replace_existing=True,
-        )
+        Reports are emitted from inside ``on_close`` (right after the
+        trading-day's morning close), so this method only schedules
+        entries and closes.
+        """
+        def _wd_str(weekdays_set) -> str:
+            names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            return ",".join(names[d] for d in sorted(weekdays_set))
 
-        close_t = config.SESSION_CLOSE_UTC
-        self._scheduler.add_job(
-            on_close,
-            CronTrigger(
-                hour=close_t.hour, minute=close_t.minute,
-                day_of_week=weekdays, timezone=UTC,
-            ),
-            id="session_close",
-            name=f"Session Close ({close_t.hour:02d}:{close_t.minute:02d} UTC)",
-            replace_existing=True,
-        )
+        for session in config.SESSIONS:
+            entry_t = session.entry_utc
+            close_t = session.close_utc
+            sess_days = _wd_str(session.weekdays)
 
-        report_t = config.REPORT_UTC
-        self._scheduler.add_job(
-            on_report,
-            CronTrigger(
-                hour=report_t.hour, minute=report_t.minute,
-                day_of_week=weekdays, timezone=UTC,
-            ),
-            id="daily_report",
-            name=f"Daily Report ({report_t.hour:02d}:{report_t.minute:02d} UTC)",
-            replace_existing=True,
-        )
-
-        if on_weekly_report is not None:
-            weekly_t = config.WEEKLY_REPORT_UTC
             self._scheduler.add_job(
-                on_weekly_report,
+                on_entry,
                 CronTrigger(
-                    hour=weekly_t.hour, minute=weekly_t.minute,
-                    day_of_week="fri", timezone=UTC,
+                    hour=entry_t.hour, minute=entry_t.minute,
+                    day_of_week=sess_days, timezone=UTC,
                 ),
-                id="weekly_report",
-                name=f"Weekly Report (Fri {weekly_t.hour:02d}:{weekly_t.minute:02d} UTC)",
+                id=f"session_entry_{session.name}",
+                name=(
+                    f"Session Entry [{session.name}] "
+                    f"({entry_t.hour:02d}:{entry_t.minute:02d} UTC)"
+                ),
+                args=[session],
                 replace_existing=True,
             )
 
+            self._scheduler.add_job(
+                on_close,
+                CronTrigger(
+                    hour=close_t.hour, minute=close_t.minute,
+                    day_of_week=sess_days, timezone=UTC,
+                ),
+                id=f"session_close_{session.name}",
+                name=(
+                    f"Session Close [{session.name}] "
+                    f"({close_t.hour:02d}:{close_t.minute:02d} UTC)"
+                ),
+                args=[session],
+                replace_existing=True,
+            )
+
+            log.info(
+                "session_scheduled",
+                name=session.name,
+                entry=f"{entry_t.hour:02d}:{entry_t.minute:02d} UTC",
+                close=f"{close_t.hour:02d}:{close_t.minute:02d} UTC",
+                qty_per_leg=session.qty_per_leg,
+                days=sess_days,
+                trading_day_offset_days=session.trading_day_offset_days,
+            )
+
         log.info(
-            "session_scheduled",
-            entry=f"{entry_t.hour:02d}:{entry_t.minute:02d} UTC",
-            close=f"{close_t.hour:02d}:{close_t.minute:02d} UTC",
-            report=f"{report_t.hour:02d}:{report_t.minute:02d} UTC",
-            weekly_report=(
-                f"Fri {config.WEEKLY_REPORT_UTC.hour:02d}:"
-                f"{config.WEEKLY_REPORT_UTC.minute:02d} UTC"
-            ),
-            days=weekdays,
+            "all_sessions_scheduled",
+            sessions=[s.name for s in config.SESSIONS],
+            last_close_session=config.LAST_CLOSE_SESSION_NAME,
+            reports="chained off morning close (see main._on_close)",
         )
 
     def start(self) -> None:
