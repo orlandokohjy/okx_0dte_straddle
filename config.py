@@ -236,9 +236,37 @@ OPTION_CHASE_GAP_NARROW_PCT: float = float(
 OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(
     os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "1.15")
 )
-OPTION_CHASE_DEADLINE_MIN: float = float(
-    os.getenv("OPTION_CHASE_DEADLINE_MIN", "10.0")
+# ── Maker-chase deadlines: split per direction ──
+# Entry chase (chase_buy) MUST finish within the session window. The
+# morning session is only 60 minutes long (01:00 → 02:00 UTC), so the
+# entry deadline cannot exceed 60 min without risking a race where the
+# entry completes after the scheduled session close, leaving us holding
+# a straddle with no scheduled unwind handler.
+#
+# Exit chase (chase_sell) is free to run past session close — there is
+# no scheduler race, only the underlying option's 08:00 UTC expiry as
+# the hard ceiling. Giving it ~2 hours dramatically improves fill quality
+# in dying 0DTE books where the spread can sit one tick wide for tens of
+# minutes before the ask collapses.
+#
+# Legacy single-knob `OPTION_CHASE_DEADLINE_MIN` is honored as a
+# fallback so existing deployments keep working without an env edit.
+_LEGACY_CHASE_DEADLINE_MIN = os.getenv("OPTION_CHASE_DEADLINE_MIN")
+OPTION_ENTRY_CHASE_DEADLINE_MIN: float = float(
+    os.getenv(
+        "OPTION_ENTRY_CHASE_DEADLINE_MIN",
+        _LEGACY_CHASE_DEADLINE_MIN if _LEGACY_CHASE_DEADLINE_MIN else "60.0",
+    )
 )
+OPTION_EXIT_CHASE_DEADLINE_MIN: float = float(
+    os.getenv(
+        "OPTION_EXIT_CHASE_DEADLINE_MIN",
+        _LEGACY_CHASE_DEADLINE_MIN if _LEGACY_CHASE_DEADLINE_MIN else "120.0",
+    )
+)
+# Kept for backward-compatibility imports; new code should reference
+# OPTION_ENTRY_CHASE_DEADLINE_MIN or OPTION_EXIT_CHASE_DEADLINE_MIN.
+OPTION_CHASE_DEADLINE_MIN: float = OPTION_EXIT_CHASE_DEADLINE_MIN
 
 # Pre-entry spread gate: skip session if put or call (ask − bid) / mid > this
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(

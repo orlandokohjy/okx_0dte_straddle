@@ -982,7 +982,7 @@ class OKXExchange:
         The caller checks `fully_filled` to decide whether the leg is
         usable as-is or needs to be flattened (partial-fill failure).
         """
-        deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
+        deadline = time.time() + config.OPTION_ENTRY_CHASE_DEADLINE_MIN * 60
         ct_val = config.OKX_CONTRACT_SIZE_BTC
         target_contracts = int(round(qty_btc / ct_val))
         if target_contracts <= 0:
@@ -1314,7 +1314,7 @@ class OKXExchange:
         fully_filled, metrics} on any fill, else None on zero fill.
         Caller checks fully_filled to detect under-unwound positions.
         """
-        deadline = time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60
+        deadline = time.time() + config.OPTION_EXIT_CHASE_DEADLINE_MIN * 60
         ct_val = config.OKX_CONTRACT_SIZE_BTC
         target_contracts = int(round(qty_btc / ct_val))
         if target_contracts <= 0:
