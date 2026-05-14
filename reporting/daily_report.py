@@ -688,6 +688,16 @@ def _format_today_block(m: DailyMetrics) -> list[str]:
     return lines
 
 
+def _usd_bracket(usd: float) -> str:
+    """Return ' ($X,XXX)' or '' (when spot unknown / sum is zero).
+
+    The USD figure is suppressed (rather than printed as $0) when the
+    underlying trade rows are missing entry_spot/exit_spot, so legacy
+    CSV rows pre-multi-session don't render misleading "$0" volumes.
+    """
+    return f" (${usd:,.0f})" if usd > 0 else ""
+
+
 def _format_volume_block(m: DailyMetrics) -> list[str]:
     """Render the Volume section.
 
@@ -696,24 +706,39 @@ def _format_volume_block(m: DailyMetrics) -> list[str]:
     straddle (call open, put open, call close, put close), each at
     qty_per_leg BTC of underlying notional. We surface:
 
-      • per-session round-trip notional (`opened` and `closed` sides)
+      • per-session round-trip notional in BTC, with USD valued at
+        each session's own entry_spot (opens) + exit_spot (closes)
       • aggregate opened / closed totals across all sessions
-      • total traded notional (opened + closed) — this is the figure
-        that matches OKX VIP tier monthly volume reporting.
+      • total traded notional (opened + closes) — the figure that
+        matches OKX VIP tier monthly volume reporting
+
+    USD figures are computed per-session using that session's spot
+    prices, NOT a single reference price, so a multi-session day
+    where BTC moved between sessions reports volume accurately.
     """
     today = m.today_trades or []
     if today:
-        # Per-side notional summed across sessions. opened == closed
-        # by construction because every straddle entry is unwound.
         opened_calls = sum(t.qty_per_leg * t.num_straddles for t in today)
         opened_puts = opened_calls
+        # Aggregate USD: sum each session's contribution at its own spot.
+        opened_usd = sum(
+            2 * t.qty_per_leg * t.num_straddles * (t.entry_spot or 0.0)
+            for t in today
+        )
+        closed_usd = sum(
+            2 * t.qty_per_leg * t.num_straddles * (t.exit_spot or 0.0)
+            for t in today
+        )
     else:
         opened_calls = m.qty_per_leg * m.num_straddles
         opened_puts = opened_calls
+        opened_usd = 2 * opened_calls * (m.entry_spot or 0.0)
+        closed_usd = 2 * opened_calls * (m.exit_spot or m.entry_spot or 0.0)
     closed_calls, closed_puts = opened_calls, opened_puts
     open_total = opened_calls + opened_puts
     close_total = closed_calls + closed_puts
     traded_total = open_total + close_total
+    traded_usd = opened_usd + closed_usd
 
     if len(today) > 1:
         per_session_lines = []
@@ -724,34 +749,37 @@ def _format_volume_block(m: DailyMetrics) -> list[str]:
             ordinal = _LEG_ORDINAL.get(t.session, "")
             session_open = t.qty_per_leg * t.num_straddles  # per leg
             session_traded = 4 * session_open  # 2 legs × open + close
+            session_traded_usd = (
+                2 * session_open * (t.entry_spot or 0.0)
+                + 2 * session_open * (t.exit_spot or 0.0)
+            )
             per_session_lines.append(
                 f"  [{label}] {ordinal}: {t.num_straddles} straddle × "
-                f"{t.qty_per_leg:.4f} BTC/leg → opened "
-                f"{2 * session_open:.4f} BTC + closed "
-                f"{2 * session_open:.4f} BTC = "
+                f"{t.qty_per_leg:.4f} BTC/leg → "
                 f"{session_traded:.4f} BTC traded"
+                f"{_usd_bracket(session_traded_usd)}"
             )
         return [
             "<b>Volume</b>",
             *per_session_lines,
-            f"  Opened total:  {open_total:.4f} BTC "
+            f"  Opened total: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
             f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-            f"  Closed total:  {close_total:.4f} BTC "
+            f"  Closed total: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
             f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-            f"  <b>Total traded notional: {traded_total:.4f} BTC</b>  "
-            f"(opens + closes)",
+            f"  <b>Total traded notional: {traded_total:.4f} BTC"
+            f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
         ]
 
     qpl = m.qty_per_leg or config.QTY_PER_LEG
     return [
         "<b>Volume</b>",
         f"  Position: {m.num_straddles} straddle × {qpl:.4f} BTC/leg",
-        f"  Opened: {open_total:.4f} BTC "
+        f"  Opened: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
         f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-        f"  Closed: {close_total:.4f} BTC "
+        f"  Closed: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
         f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-        f"  <b>Total traded notional: {traded_total:.4f} BTC</b>  "
-        f"(opens + closes)",
+        f"  <b>Total traded notional: {traded_total:.4f} BTC"
+        f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
     ]
 
 
@@ -972,19 +1000,33 @@ def format_weekly_report(m: DailyMetrics) -> str:
     # sessions with different sizes both count correctly. Each
     # straddle round-trips (open + close) for both legs, so total
     # traded notional = 4 × qty_per_leg × num_straddles per session.
+    # USD values are computed per-trade using each row's own
+    # entry_spot/exit_spot so weekly totals are accurate across the
+    # spot moves between sessions.
     week_trades = m.today_trades or []
     if week_trades:
         opened_calls = sum(
             t.qty_per_leg * t.num_straddles for t in week_trades
         )
+        opened_usd = sum(
+            2 * t.qty_per_leg * t.num_straddles * (t.entry_spot or 0.0)
+            for t in week_trades
+        )
+        closed_usd = sum(
+            2 * t.qty_per_leg * t.num_straddles * (t.exit_spot or 0.0)
+            for t in week_trades
+        )
     else:
         qpl = m.qty_per_leg or config.QTY_PER_LEG
         opened_calls = qpl * m.num_straddles
+        opened_usd = 2 * opened_calls * (m.entry_spot or 0.0)
+        closed_usd = 2 * opened_calls * (m.exit_spot or m.entry_spot or 0.0)
     opened_puts = opened_calls
     closed_calls, closed_puts = opened_calls, opened_puts
     open_total = opened_calls + opened_puts
     close_total = closed_calls + closed_puts
     traded_total = open_total + close_total
+    traded_usd = opened_usd + closed_usd
 
     lines = [
         f"<b>WEEKLY REPORT — Week of {m.trade_date}</b>",
@@ -997,11 +1039,11 @@ def format_weekly_report(m: DailyMetrics) -> str:
         "",
         "<b>Volume (this week)</b>",
         f"  Straddles: {m.num_straddles}",
-        f"  Opened: {open_total:.4f} BTC "
+        f"  Opened: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
         f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-        f"  Closed: {close_total:.4f} BTC "
+        f"  Closed: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
         f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-        f"  <b>Total traded notional: {traded_total:.4f} BTC</b>  "
-        f"(opens + closes)",
+        f"  <b>Total traded notional: {traded_total:.4f} BTC"
+        f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
     ]
     return "\n".join(lines)
