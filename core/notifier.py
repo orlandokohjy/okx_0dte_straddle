@@ -132,3 +132,73 @@ async def send_weekly_report(equity: float) -> None:
         log.info("weekly_report_sent")
     except Exception:
         log.warning("weekly_report_failed", exc_info=True)
+
+
+async def send_month_end_report(equity: float, trading_day: str) -> None:
+    """Comprehensive MONTH-END REPORT — fires after the last close
+    of the last trading day of the month.
+
+    ``trading_day`` is the UTC expiry date of the trading day that
+    closes the month (e.g. ``2026-05-30``). Period membership is keyed
+    off the trade row's ``trading_day`` field, so afternoon entries
+    that fired the previous calendar day but settled into this month
+    are correctly attributed.
+    """
+    from datetime import datetime
+    from reporting.daily_report import _load_trades
+    from reporting.period_metrics import (
+        compute_period_metrics, format_period_report,
+        month_window, month_label,
+    )
+    try:
+        td_dt = datetime.strptime(trading_day, "%Y-%m-%d").date()
+        m_start, m_end = month_window(td_dt)
+        trades = _load_trades()
+        metrics = compute_period_metrics(
+            all_trades=trades,
+            period_start=m_start,
+            period_end=m_end,
+            label=month_label(td_dt),
+            current_equity=equity,
+        )
+        header = f"MONTH-END REPORT — {month_label(td_dt)}"
+        await send_report(format_period_report(metrics, header=header))
+        log.info(
+            "month_end_report_sent",
+            month=td_dt.strftime("%Y-%m"),
+            trades=metrics.total_trades,
+        )
+    except Exception:
+        log.warning("month_end_report_failed", exc_info=True)
+
+
+async def send_year_end_report(equity: float, trading_day: str) -> None:
+    """Comprehensive YEAR-END REPORT — fires after the last close
+    of the last trading day of the calendar year (typically Dec 31).
+    """
+    from datetime import datetime
+    from reporting.daily_report import _load_trades
+    from reporting.period_metrics import (
+        compute_period_metrics, format_period_report,
+        year_window, year_label,
+    )
+    try:
+        td_dt = datetime.strptime(trading_day, "%Y-%m-%d").date()
+        y_start, y_end = year_window(td_dt)
+        trades = _load_trades()
+        metrics = compute_period_metrics(
+            all_trades=trades,
+            period_start=y_start,
+            period_end=y_end,
+            label=year_label(td_dt),
+            current_equity=equity,
+        )
+        header = f"YEAR-END REPORT — {year_label(td_dt)}"
+        await send_report(format_period_report(metrics, header=header))
+        log.info(
+            "year_end_report_sent",
+            year=td_dt.year,
+            trades=metrics.total_trades,
+        )
+    except Exception:
+        log.warning("year_end_report_failed", exc_info=True)

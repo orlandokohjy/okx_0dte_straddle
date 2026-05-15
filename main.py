@@ -913,6 +913,38 @@ class Algo:
                                 exc_info=True,
                             )
 
+                    # MONTH-END / YEAR-END deep reports — fire on the
+                    # last scheduled trading day of the month/year so
+                    # operators receive a comprehensive period recap
+                    # in addition to the inline MTD/YTD lines on the
+                    # daily report. Both can fire on the same close
+                    # (Dec 31 lands a MONTH-END + YEAR-END pair).
+                    if td_dt is not None:
+                        from reporting.period_metrics import (
+                            is_last_trading_day_of_month,
+                            is_last_trading_day_of_year,
+                        )
+                        if is_last_trading_day_of_month(td_dt):
+                            try:
+                                await notifier.send_month_end_report(
+                                    self.portfolio.equity, trading_day,
+                                )
+                            except Exception:
+                                log.warning(
+                                    "month_end_report_chain_failed",
+                                    exc_info=True,
+                                )
+                        if is_last_trading_day_of_year(td_dt):
+                            try:
+                                await notifier.send_year_end_report(
+                                    self.portfolio.equity, trading_day,
+                                )
+                            except Exception:
+                                log.warning(
+                                    "year_end_report_chain_failed",
+                                    exc_info=True,
+                                )
+
             self.portfolio.reset_daily()
             log.info("session_close_done",
                      session=session.name,

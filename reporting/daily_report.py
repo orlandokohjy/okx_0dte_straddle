@@ -154,6 +154,14 @@ class DailyMetrics:
     inception_equity: float = 0.0
     inception_date: str = ""
 
+    # Period aggregates for the brief MTD / YTD blocks rendered
+    # alongside the cumulative line. Computed from the same trade-log
+    # pass that built the daily/weekly metrics so we never re-load the
+    # CSV. Optional so legacy callers that build DailyMetrics by hand
+    # still work.
+    mtd: object = None  # PeriodMetrics
+    ytd: object = None  # PeriodMetrics
+
 
 def _f(row: dict, key: str, default: float = 0.0) -> float:
     """Best-effort float parse — returns default if blank or invalid."""
@@ -435,6 +443,34 @@ def compute_report(
     today_pnl = sum(t.net_pnl for t in today_trades)
     today_capital = sum(t.total_capital_used for t in today_trades)
     today_straddles = sum(t.num_straddles for t in today_trades)
+
+    # MTD / YTD aggregates (rendered as brief blocks under Portfolio).
+    # Trading day, not calendar entry date, anchors period membership.
+    from reporting.period_metrics import (
+        compute_period_metrics, month_window, year_window,
+    )
+    try:
+        td_for_period = datetime.strptime(
+            trading_day, "%Y-%m-%d",
+        ).date()
+    except ValueError:
+        td_for_period = datetime.utcnow().date()
+    m_start, m_end = month_window(td_for_period)
+    y_start, y_end = year_window(td_for_period)
+    mtd = compute_period_metrics(
+        all_trades=trades,
+        period_start=m_start,
+        period_end=m_end,
+        label=f"MTD ({td_for_period.strftime('%Y-%m')})",
+        current_equity=equity,
+    )
+    ytd = compute_period_metrics(
+        all_trades=trades,
+        period_start=y_start,
+        period_end=y_end,
+        label=f"YTD ({td_for_period.year})",
+        current_equity=equity,
+    )
     starting_equity = (
         today_trades[0].capital_before
         if today_trades and today_trades[0].capital_before > 0
@@ -493,6 +529,8 @@ def compute_report(
         qty_per_leg=latest.qty_per_leg or config.QTY_PER_LEG,
         inception_equity=inception,
         inception_date=trades[0].date if trades else "",
+        mtd=mtd,
+        ytd=ytd,
     )
 
 
@@ -925,6 +963,19 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"  Streaks: {m.max_win_streak}W max / {m.max_loss_streak}L max",
     ]
 
+    # ── MTD / YTD brief blocks ───────────────────────────────────
+    # The dedicated MONTH-END / YEAR-END deep reports fire on the
+    # last trading day of the month/year (see core/notifier.py and
+    # main._on_close); these inline blocks are the always-on
+    # summary so the operator can monitor period progress daily.
+    from reporting.period_metrics import format_brief_period_block
+    if m.mtd is not None:
+        lines.append("")
+        lines.extend(format_brief_period_block(m.mtd))
+    if m.ytd is not None:
+        lines.append("")
+        lines.extend(format_brief_period_block(m.ytd))
+
     exec_lines = _format_execution_quality(m)
     if exec_lines:
         lines.append("")
@@ -1048,6 +1099,34 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
 
     total_straddles = sum(t.num_straddles for t in trades)
 
+    # MTD / YTD aggregates for the weekly report — anchored to "today"
+    # so end-of-week reports always carry the up-to-date period summary.
+    from reporting.period_metrics import (
+        compute_period_metrics, month_window, year_window,
+    )
+    try:
+        td_for_period = datetime.strptime(
+            latest.trading_day or week_start, "%Y-%m-%d",
+        ).date()
+    except ValueError:
+        td_for_period = datetime.utcnow().date()
+    m_start, m_end = month_window(td_for_period)
+    y_start, y_end = year_window(td_for_period)
+    mtd = compute_period_metrics(
+        all_trades=all_trades,
+        period_start=m_start,
+        period_end=m_end,
+        label=f"MTD ({td_for_period.strftime('%Y-%m')})",
+        current_equity=equity,
+    )
+    ytd = compute_period_metrics(
+        all_trades=all_trades,
+        period_start=y_start,
+        period_end=y_end,
+        label=f"YTD ({td_for_period.year})",
+        current_equity=equity,
+    )
+
     return DailyMetrics(
         trade_date=week_start,
         trade_pnl=sum(pnls),
@@ -1094,6 +1173,8 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
         qty_per_leg=latest.qty_per_leg or config.QTY_PER_LEG,
         inception_equity=inception,
         inception_date=trades[0].date if trades else "",
+        mtd=mtd,
+        ytd=ytd,
     )
 
 
@@ -1161,4 +1242,16 @@ def format_weekly_report(m: DailyMetrics) -> str:
         f"  <b>Total traded notional: {traded_total:.4f} BTC"
         f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
     ]
+
+    # MTD / YTD brief blocks for the weekly report too — same content
+    # as the daily push so operators get a consistent summary regardless
+    # of which scheduled message they're looking at.
+    from reporting.period_metrics import format_brief_period_block
+    if m.mtd is not None:
+        lines.append("")
+        lines.extend(format_brief_period_block(m.mtd))
+    if m.ytd is not None:
+        lines.append("")
+        lines.extend(format_brief_period_block(m.ytd))
+
     return "\n".join(lines)
