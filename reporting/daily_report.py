@@ -148,6 +148,12 @@ class DailyMetrics:
     today_trades: list = None
     qty_per_leg: float = 0.0
 
+    # Inception (the very first trade in the trade log) — surfaces
+    # what the cumulative-return % is anchored against so the operator
+    # can reconcile the line with their actual deposit.
+    inception_equity: float = 0.0
+    inception_date: str = ""
+
 
 def _f(row: dict, key: str, default: float = 0.0) -> float:
     """Best-effort float parse — returns default if blank or invalid."""
@@ -485,6 +491,8 @@ def compute_report(
         put_exit_exec=latest.put_exit_exec,
         today_trades=today_trades,
         qty_per_leg=latest.qty_per_leg or config.QTY_PER_LEG,
+        inception_equity=inception,
+        inception_date=trades[0].date if trades else "",
     )
 
 
@@ -518,60 +526,139 @@ def _format_exec_block(
     ]
 
 
+def _legs_for_trade(t: TradeRow) -> list[tuple[str, ExecutionMetrics, float, float]]:
+    """Return the leg execution metrics for a trade row, in display order.
+
+    Returns list of (label, metrics, fill_usd, spot_usd). Skips entries with
+    no recorded execution metrics (legacy rows or RFQ unwinds).
+    """
+    out: list[tuple[str, ExecutionMetrics, float, float]] = []
+    entry_spot = t.entry_spot or 0.0
+    exit_spot = t.exit_spot or entry_spot
+    legs = [
+        ("PUT (entry)",  t.put_entry_exec,  t.put_premium_entry,  entry_spot),
+        ("CALL (entry)", t.call_entry_exec, t.call_premium_entry, entry_spot),
+        ("CALL (exit)",  t.call_exit_exec,  t.call_premium_exit,  exit_spot),
+        ("PUT (exit)",   t.put_exit_exec,   t.put_premium_exit,   exit_spot),
+    ]
+    for label, exec_m, fill_usd, spot in legs:
+        if exec_m and exec_m.duration_sec > 0:
+            out.append((label, exec_m, fill_usd, spot))
+    return out
+
+
+def _format_leg_compact(
+    label: str, e: ExecutionMetrics, fill_usd: float, spot_usd: float,
+) -> list[str]:
+    """One leg's execution metrics, compact format used for per-session blocks."""
+    quote_label = "Ask" if "(entry)" in label else "Bid"
+    ref_mark_usd = e.ref_mark * spot_usd if spot_usd > 0 else e.ref_mark
+    ref_quote_usd = e.ref_quote * spot_usd if spot_usd > 0 else e.ref_quote
+    return [
+        f"    {label}",
+        f"      Time to fill: {e.duration_sec:.1f}s, {e.attempts} attempt(s)",
+        f"      Mark at start: ${ref_mark_usd:,.2f} -> Fill: ${fill_usd:,.2f}"
+        f"  (slip {e.slippage_vs_mark_pct:+.2f}%)",
+        f"      {quote_label} at start: ${ref_quote_usd:,.2f}  "
+        f"Saved vs taker: ${e.saved_vs_taker_usd:+,.2f}",
+    ]
+
+
 def _format_execution_quality(m: DailyMetrics) -> list[str]:
-    """Build the execution-quality section for the daily report."""
+    """Build the execution-quality section.
+
+    Multi-session days render per-session blocks with all four legs
+    inline (PUT/CALL entry + CALL/PUT exit), then a daily aggregate
+    averaging across every leg of the day. Single-session / legacy
+    rows fall back to the simpler split-by-side layout.
+    """
+    today = m.today_trades or []
     blocks: list[str] = []
-    entry_spot = m.entry_spot or 0.0
-    exit_spot = m.exit_spot or entry_spot
 
-    entry_blocks = []
-    entry_blocks += _format_exec_block(
-        "put", "entry",
-        m.put_premium_entry, m.put_premium_entry, m.put_entry_exec,
-        spot_usd=entry_spot,
-    )
-    entry_blocks += _format_exec_block(
-        "call", "entry",
-        m.call_premium_entry, m.call_premium_entry, m.call_entry_exec,
-        spot_usd=entry_spot,
-    )
-    if entry_blocks:
-        blocks.append("<b>Entry execution</b>")
-        blocks += entry_blocks
+    # ── Multi-session: per-session blocks ────────────────────────
+    if len(today) > 1:
+        for t in today:
+            legs = _legs_for_trade(t)
+            if not legs:
+                continue
+            label = _session_time_label(t.session) or (
+                t.session or "session"
+            ).upper()
+            ordinal = _LEG_ORDINAL.get(t.session, "")
+            if blocks:
+                blocks.append("")
+            blocks.append(
+                f"<b>Execution — [{label}] {ordinal}</b>"
+            )
+            for leg_label, exec_m, fill_usd, spot in legs:
+                blocks += _format_leg_compact(
+                    leg_label, exec_m, fill_usd, spot,
+                )
 
-    exit_blocks = []
-    exit_blocks += _format_exec_block(
-        "call", "exit",
-        m.call_premium_exit, m.call_premium_exit, m.call_exit_exec,
-        spot_usd=exit_spot,
-    )
-    exit_blocks += _format_exec_block(
-        "put", "exit",
-        m.put_premium_exit, m.put_premium_exit, m.put_exit_exec,
-        spot_usd=exit_spot,
-    )
-    if exit_blocks:
-        if blocks:
-            blocks.append("")
-        blocks.append("<b>Exit execution</b>")
-        blocks += exit_blocks
+    # ── Single-session (or legacy): split entry / exit ───────────
+    else:
+        entry_spot = m.entry_spot or 0.0
+        exit_spot = m.exit_spot or entry_spot
+
+        entry_blocks = []
+        entry_blocks += _format_exec_block(
+            "put", "entry",
+            m.put_premium_entry, m.put_premium_entry, m.put_entry_exec,
+            spot_usd=entry_spot,
+        )
+        entry_blocks += _format_exec_block(
+            "call", "entry",
+            m.call_premium_entry, m.call_premium_entry, m.call_entry_exec,
+            spot_usd=entry_spot,
+        )
+        if entry_blocks:
+            blocks.append("<b>Entry execution</b>")
+            blocks += entry_blocks
+
+        exit_blocks = []
+        exit_blocks += _format_exec_block(
+            "call", "exit",
+            m.call_premium_exit, m.call_premium_exit, m.call_exit_exec,
+            spot_usd=exit_spot,
+        )
+        exit_blocks += _format_exec_block(
+            "put", "exit",
+            m.put_premium_exit, m.put_premium_exit, m.put_exit_exec,
+            spot_usd=exit_spot,
+        )
+        if exit_blocks:
+            if blocks:
+                blocks.append("")
+            blocks.append("<b>Exit execution</b>")
+            blocks += exit_blocks
 
     if not blocks:
         return []
 
-    # Aggregate summary
-    legs = [
-        m.call_entry_exec, m.put_entry_exec,
-        m.call_exit_exec, m.put_exit_exec,
-    ]
-    legs = [x for x in legs if x and x.duration_sec > 0]
+    # ── Daily aggregate across EVERY leg of EVERY session ─────────
+    if today:
+        legs: list[ExecutionMetrics] = []
+        for t in today:
+            for _, exec_m, _, _ in _legs_for_trade(t):
+                legs.append(exec_m)
+    else:
+        legs = [
+            m.call_entry_exec, m.put_entry_exec,
+            m.call_exit_exec, m.put_exit_exec,
+        ]
+        legs = [x for x in legs if x and x.duration_sec > 0]
+
     if legs:
         total_saved = sum(x.saved_vs_taker_usd for x in legs)
         total_attempts = sum(x.attempts for x in legs)
         avg_dur = sum(x.duration_sec for x in legs) / len(legs)
         avg_slip = sum(x.slippage_vs_mark_pct for x in legs) / len(legs)
         blocks.append("")
-        blocks.append("<b>Execution summary</b>")
+        scope = (
+            f"across {len(today)} sessions" if len(today) > 1
+            else f"across {len(legs)} legs"
+        )
+        blocks.append(f"<b>Execution summary</b> ({scope})")
         blocks.append(
             f"  Avg time to fill: {avg_dur:.1f}s "
             f"({total_attempts} total attempts across {len(legs)} legs)"
@@ -811,7 +898,11 @@ def format_telegram_report(m: DailyMetrics) -> str:
         "",
         "<b>Portfolio</b>",
         f"  Cumulative P&L: ${m.total_pnl:,.2f} "
-        f"({m.cumulative_return_pct:+.1%})",
+        f"({m.cumulative_return_pct:+.1%})"
+        + (
+            f"  <i>since ${m.inception_equity:,.0f} on {m.inception_date}</i>"
+            if m.inception_equity > 0 else ""
+        ),
         f"  High Water Mark: ${m.high_water_mark:,.2f}",
         "",
         f"<b>Win/Loss ({m.total_trades} trades)</b>",
@@ -990,6 +1081,8 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
         # weekly formatter can sum per-trade qty_per_leg correctly.
         today_trades=trades,
         qty_per_leg=latest.qty_per_leg or config.QTY_PER_LEG,
+        inception_equity=inception,
+        inception_date=trades[0].date if trades else "",
     )
 
 

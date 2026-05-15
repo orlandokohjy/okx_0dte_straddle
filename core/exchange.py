@@ -144,6 +144,7 @@ def _build_fill_metrics(
     ref_bid: float,
     ref_ask: float,
     ref_mark: float,
+    spot_usd: float = 0.0,
 ) -> dict:
     """
     Build the fill-quality metrics dict that flows from chase_buy/sell
@@ -153,6 +154,13 @@ def _build_fill_metrics(
     Slippage is positive when we paid more than mark (buys) or
     received less than mark (sells) — i.e. execution worse than fair
     value. Negative = better than fair value.
+
+    USD conversion: OKX BTC-USD inverse-option premiums are quoted in
+    BTC (per BTC of underlying notional). To convert a price difference
+    in BTC to dollars saved we multiply by `qty_btc * spot_usd`. The
+    caller is responsible for passing the spot price observed at
+    fill-time; if `spot_usd` is 0 (legacy / fallback), the saved-vs-taker
+    USD figure falls back to 0 to avoid emitting a misleading number.
     """
     duration = max(0.0, t_filled - t_started)
     ref_mid = (ref_bid + ref_ask) / 2 if ref_bid > 0 and ref_ask > 0 else 0.0
@@ -176,10 +184,18 @@ def _build_fill_metrics(
         saved_per_btc = (fill_price - ref_bid) if ref_bid > 0 else 0.0
         saved_pct = (saved_per_btc / ref_bid) if ref_bid > 0 else 0.0
 
+    # `saved_per_btc` is a BTC-quoted price delta (per 1 BTC of underlying
+    # notional). Multiplying by qty_btc gives BTC saved, and by spot
+    # gives USD saved. Without spot, we'd be reporting BTC and labeling
+    # it $ — that was the historical bug.
+    saved_total_btc = saved_per_btc * qty_btc
+    saved_total_usd = saved_total_btc * spot_usd if spot_usd > 0 else 0.0
+
     return {
         "instrument": instrument,
         "side": side,
         "qty_btc": qty_btc,
+        "spot_usd_at_fill": round(spot_usd, 2),
         "t_started_iso": _utc_iso(t_started),
         "t_filled_iso": _utc_iso(t_filled),
         "duration_sec": round(duration, 2),
@@ -194,7 +210,8 @@ def _build_fill_metrics(
         "taker_price_at_start": round(taker_price, 4),
         "saved_vs_taker_per_btc_usd": round(saved_per_btc, 4),
         "saved_vs_taker_pct": round(saved_pct * 100, 4),
-        "saved_vs_taker_total_usd": round(saved_per_btc * qty_btc, 2),
+        "saved_vs_taker_total_btc": round(saved_total_btc, 6),
+        "saved_vs_taker_total_usd": round(saved_total_usd, 2),
     }
 
 
@@ -1262,6 +1279,13 @@ class OKXExchange:
         filled_qty_btc = filled_contracts * ct_val
         fully_filled = filled_contracts >= target_contracts
         t_filled = time.time()
+        # Spot at fill is needed to convert BTC-quoted savings to USD.
+        # Best-effort: a single index-tickers call; fallback to 0 if it
+        # fails so we never emit a misleading $ figure.
+        try:
+            spot_at_fill = await self.get_spot_price()
+        except Exception:
+            spot_at_fill = 0.0
         metrics = _build_fill_metrics(
             side="buy",
             instrument=instrument,
@@ -1271,6 +1295,7 @@ class OKXExchange:
             t_filled=t_filled,
             attempts=attempt,
             ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+            spot_usd=spot_at_fill,
         )
         if fully_filled:
             log.info("chase_buy_filled",
@@ -1576,6 +1601,11 @@ class OKXExchange:
         filled_qty_btc = filled_contracts * ct_val
         fully_filled = filled_contracts >= target_contracts
         t_filled = time.time()
+        # Spot at fill is needed to convert BTC-quoted savings to USD.
+        try:
+            spot_at_fill = await self.get_spot_price()
+        except Exception:
+            spot_at_fill = 0.0
         metrics = _build_fill_metrics(
             side="sell",
             instrument=instrument,
@@ -1585,6 +1615,7 @@ class OKXExchange:
             t_filled=t_filled,
             attempts=attempt,
             ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
+            spot_usd=spot_at_fill,
         )
         if fully_filled:
             log.info("chase_sell_filled",
