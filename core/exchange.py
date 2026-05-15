@@ -10,18 +10,32 @@ Provides async helpers around the (sync) python-okx SDK for:
   - Cancel-all stale orders (called at startup)
   - Live instrument-metadata fetch (tick size, contract size) on connect
 
-OKX BTC option naming: e.g.  BTC-USD-260418-65000-C
-Contract size = 0.01 BTC (verified per instrument via get_instrument_meta).
+OKX BTC option naming (family-dependent — see ``core.family``):
+    CM:  BTC-USD-{YYMMDD}-{STRIKE}-{C|P}      (inverse / coin-margined)
+    UM:  BTC-USD_UM-{YYMMDD}-{STRIKE}-{C|P}   (linear / USD-margined)
 
-UNIT CONVENTIONS for BTC-USD coin-margined inverse options:
-  • Premium px is quoted in BTC, as a fraction of the underlying notional
-    (e.g. 0.0065 BTC means 0.65% of the BTC underlying)
-  • Tick size = 0.0005 BTC across the OKX BTC option family
-  • To get USD premium per contract:  px × ctVal × spot
-  • To get USD premium per BTC notional: px × spot
-The previous codebase comment that premiums are "quoted in USD" was wrong
-— this caused a critical bug where OPTION_TICK_SIZE=5.0 (USD) was added to
-BTC-quoted bids, producing nonsense prices like 5.0055 BTC.
+UNIT CONVENTIONS — native quote unit depends on family:
+  CM (inverse):
+    • Premium px quoted in BTC per BTC of underlying notional
+    • Tick size = 0.0001 BTC across the family
+    • USD premium per BTC notional: px × spot
+    • Fees charged in BTC (maker)
+  UM (linear):
+    • Premium px quoted in USD per BTC of underlying notional
+    • Tick size = 5 USD
+    • USD premium per BTC notional: px (already in USD)
+    • Fees charged in USD (maker)
+
+Internally the codebase normalises premiums to a "BTC-equivalent" ratio
+(see ``core.family.to_btc_equivalent``) so the existing P&L math
+(``entry_price × entry_spot``) yields correct USD numbers in either
+family. Native prices are only used at the order-placement / fill-read
+boundary inside this module.
+
+The 2026-05-07 OPTION_TICK_SIZE=5.0 bug — adding a USD tick to a
+BTC-quoted bid and producing 5.0055 BTC — is what motivated the family
+abstraction. ``prime_option_tick_size`` enforces a family-specific
+plausibility bound on the live tick to catch any future regression.
 
 NOTE: RFQ / Block Trading is stubbed — see send_rfq() / send_rfq_sell().
 Most retail accounts cannot use it, so leg-by-leg chase is the default.
@@ -37,6 +51,7 @@ from typing import Any, Optional
 import structlog
 
 import config
+from core import family
 
 log = structlog.get_logger(__name__)
 
@@ -145,23 +160,33 @@ def _build_fill_metrics(
     ref_ask: float,
     ref_mark: float,
     spot_usd: float = 0.0,
-    fee_btc: float = 0.0,
+    fee_native: float = 0.0,
 ) -> dict:
     """
     Build the fill-quality metrics dict that flows from chase_buy/sell
     back to the straddle builder/exit manager and ultimately into the
     daily report.
 
+    All ``ref_*``, ``fill_price`` and ``fee_native`` arguments are in
+    OKX-native units for the active option family:
+        CM (inverse) → BTC per BTC of notional, fees in BTC
+        UM (linear)  → USD per BTC of notional, fees in USD
+
     Slippage is positive when we paid more than mark (buys) or
     received less than mark (sells) — i.e. execution worse than fair
-    value. Negative = better than fair value.
+    value. Negative = better than fair value. Slippage is unit-free.
 
-    USD conversion: OKX BTC-USD inverse-option premiums are quoted in
-    BTC (per BTC of underlying notional). To convert a price difference
-    in BTC to dollars saved we multiply by `qty_btc * spot_usd`. The
-    caller is responsible for passing the spot price observed at
-    fill-time; if `spot_usd` is 0 (legacy / fallback), the saved-vs-taker
-    USD figure falls back to 0 to avoid emitting a misleading number.
+    USD conversion (saved-vs-taker, fee_usd):
+      - CM: native is BTC, multiply by ``qty_btc * spot_usd`` to get USD.
+      - UM: native is already USD per BTC of notional; multiply by
+            ``qty_btc`` only.
+      The caller passes ``spot_usd`` observed at fill-time; if it is 0
+      we fall back to 0 USD instead of emitting a misleading number.
+
+    The 'fee_btc' key is preserved (with the dimensional twist that on
+    UM it actually contains the *USD* fee — the daily report only ever
+    consumes ``fee_usd``, but the legacy column is kept for backward
+    compat with old trade-log readers).
     """
     duration = max(0.0, t_filled - t_started)
     ref_mid = (ref_bid + ref_ask) / 2 if ref_bid > 0 and ref_ask > 0 else 0.0
@@ -173,8 +198,8 @@ def _build_fill_metrics(
                     if ref_mid > 0 else 0.0)
         # As a maker buy, the taker alternative was paying the ask.
         taker_price = ref_ask
-        saved_per_btc = (ref_ask - fill_price) if ref_ask > 0 else 0.0
-        saved_pct = (saved_per_btc / ref_ask) if ref_ask > 0 else 0.0
+        saved_per_btc_native = (ref_ask - fill_price) if ref_ask > 0 else 0.0
+        saved_pct = (saved_per_btc_native / ref_ask) if ref_ask > 0 else 0.0
     else:  # sell
         slip_mark = ((ref_mark - fill_price) / ref_mark
                      if ref_mark > 0 else 0.0)
@@ -182,23 +207,24 @@ def _build_fill_metrics(
                     if ref_mid > 0 else 0.0)
         # As a maker sell, the taker alternative was hitting the bid.
         taker_price = ref_bid
-        saved_per_btc = (fill_price - ref_bid) if ref_bid > 0 else 0.0
-        saved_pct = (saved_per_btc / ref_bid) if ref_bid > 0 else 0.0
+        saved_per_btc_native = (fill_price - ref_bid) if ref_bid > 0 else 0.0
+        saved_pct = (saved_per_btc_native / ref_bid) if ref_bid > 0 else 0.0
 
-    # `saved_per_btc` is a BTC-quoted price delta (per 1 BTC of underlying
-    # notional). Multiplying by qty_btc gives BTC saved, and by spot
-    # gives USD saved. Without spot, we'd be reporting BTC and labeling
-    # it $ — that was the historical bug.
-    saved_total_btc = saved_per_btc * qty_btc
-    saved_total_usd = saved_total_btc * spot_usd if spot_usd > 0 else 0.0
-    # OKX inverse options are coin-margined: maker fees are charged in BTC.
-    # We persist both BTC and USD (using fill-time spot) so the daily report's
-    # ledger P&L can finally subtract the fee that the wallet equity already
-    # reflects — eliminating the historical "Drift vs wallet" component.
-    fee_btc_abs = abs(fee_btc)
-    fee_usd = fee_btc_abs * spot_usd if spot_usd > 0 else 0.0
+    # `saved_per_btc_native` is a price delta in OKX-native units per
+    # 1 BTC of underlying notional. Convert to USD using the family
+    # converter so CM (BTC × spot) and UM (USD × 1) both end up correct.
+    saved_total_native = saved_per_btc_native * qty_btc
+    saved_total_usd = family.native_premium_to_usd(
+        saved_per_btc_native, qty_btc, spot_usd,
+    ) if (saved_per_btc_native and (family.is_um() or spot_usd > 0)) else 0.0
+    fee_native_abs = abs(fee_native)
+    fee_usd = family.fee_to_usd(fee_native_abs, spot_usd)
+
+    decimals = family.native_decimals()
 
     return {
+        "family": family.label(),
+        "native_unit": family.native_quote_unit_label(),
         "instrument": instrument,
         "side": side,
         "qty_btc": qty_btc,
@@ -207,19 +233,25 @@ def _build_fill_metrics(
         "t_filled_iso": _utc_iso(t_filled),
         "duration_sec": round(duration, 2),
         "attempts": attempts,
-        "ref_bid": round(ref_bid, 4),
-        "ref_ask": round(ref_ask, 4),
-        "ref_mid": round(ref_mid, 4),
-        "ref_mark": round(ref_mark, 4),
-        "fill_price": round(fill_price, 4),
+        "ref_bid": round(ref_bid, decimals + 2),
+        "ref_ask": round(ref_ask, decimals + 2),
+        "ref_mid": round(ref_mid, decimals + 2),
+        "ref_mark": round(ref_mark, decimals + 2),
+        "fill_price": round(fill_price, decimals + 2),
         "slippage_vs_mark_pct": round(slip_mark * 100, 4),
         "slippage_vs_mid_pct": round(slip_mid * 100, 4),
-        "taker_price_at_start": round(taker_price, 4),
-        "saved_vs_taker_per_btc_usd": round(saved_per_btc, 4),
+        "taker_price_at_start": round(taker_price, decimals + 2),
+        # Legacy key name (per_btc_usd) kept for backward compat — the
+        # value carries native units (BTC for CM, USD for UM), and is
+        # NOT necessarily USD. Reports should consume ``saved_vs_taker_total_usd``.
+        "saved_vs_taker_per_btc_usd": round(saved_per_btc_native, decimals + 2),
         "saved_vs_taker_pct": round(saved_pct * 100, 4),
-        "saved_vs_taker_total_btc": round(saved_total_btc, 6),
+        "saved_vs_taker_total_btc": round(saved_total_native, 6),
         "saved_vs_taker_total_usd": round(saved_total_usd, 2),
-        "fee_btc": round(fee_btc_abs, 8),
+        # Legacy key name (fee_btc) — for CM holds native BTC fee, for UM
+        # holds native USD fee. Daily report consumes fee_usd only.
+        "fee_btc": round(fee_native_abs, 8 if family.is_cm() else 4),
+        "fee_native": round(fee_native_abs, 8 if family.is_cm() else 4),
         "fee_usd": round(fee_usd, 4),
     }
 
@@ -362,10 +394,16 @@ class OKXExchange:
     # ──────────────────── Market data ─────────────────────────────
 
     async def get_spot_price(self) -> float:
-        """Return BTC index price (USD)."""
+        """Return BTC index price (USD).
+
+        The BTC index ticker is always ``BTC-USD`` on OKX regardless of
+        the option family in use — the linear ``BTC-USD_UM`` uly does
+        not have a separate spot index. So this query is hard-coded
+        rather than going through ``family.underlying()``.
+        """
         resp = await self._call(
             self._market.get_index_tickers,
-            instId=f"{config.BASE_COIN}-{config.QUOTE_COIN}",
+            instId=f"{config.BASE_COIN}-USD",
         )
         rows = self._data_or_empty(resp)
         if not rows:
@@ -456,17 +494,15 @@ class OKXExchange:
         self, sample_underlying: str = "",
     ) -> float:
         """
-        Read the live tick size for the BTC option family from OKX and
+        Read the live tick size for the active option family from OKX and
         update self._default_option_tick. Returns the tick size in use.
 
-        We query the full instrument list for instType=OPTION+uly=<base-quote>
-        and pick the first row's tickSz. OKX BTC options share a common tick
-        across strikes, so any sample is fine.
+        We query the full instrument list for instType=OPTION+uly=<family>
+        and pick the most-common tickSz. OKX BTC options share a common
+        tick across strikes within each family (CM=0.0001 BTC, UM=5 USD),
+        so any sample is fine.
         """
-        underlying = (
-            sample_underlying
-            or f"{config.BASE_COIN}-{config.QUOTE_COIN}"
-        )
+        underlying = sample_underlying or family.underlying()
         try:
             resp = await self._call(
                 self._public.get_instruments,
@@ -529,51 +565,80 @@ class OKXExchange:
 
         live_ct = ct_vals[0] if ct_vals else 0.0
 
-        # Sanity: an option tick > 0.01 BTC is almost certainly wrong (real
-        # OKX BTC options are 0.0001). If we got something nonsensical,
-        # refuse to override the sensible config default.
-        if self._default_option_tick > 0.01:
+        # Sanity: an option tick larger than the family's plausible
+        # ceiling almost certainly means we got the wrong instrument
+        # type back (e.g. a futures row leaking in via a loose uly+
+        # instType combination). Refuse to override the sensible
+        # config default in that case. CM ceiling = 0.01 BTC,
+        # UM ceiling = 100 USD (real ticks: CM=0.0001 BTC, UM=5 USD).
+        plausibility_ceiling = family.tick_implausible_threshold()
+        if self._default_option_tick > plausibility_ceiling:
             log.warning("prime_tick_implausible",
+                        family=family.label(),
                         candidate=self._default_option_tick,
+                        ceiling=plausibility_ceiling,
                         action="keeping config fallback",
                         config_value=config.OPTION_TICK_SIZE)
             self._default_option_tick = config.OPTION_TICK_SIZE
 
+        # Capture a sample minSz/lotSz so the operator can spot-check
+        # the contract size assumption on the very first boot of a new
+        # family. Especially important on UM where empirical contract
+        # sizing has not been independently verified at desk.
+        sample_min_sz = 0.0
+        sample_lot_sz = 0.0
+        for r in rows:
+            inst = r.get("instId", "")
+            parts = inst.split("-")
+            if len(parts) == 5 and parts[-1] in ("C", "P"):
+                sample_min_sz = self._f(r, "minSz")
+                sample_lot_sz = self._f(r, "lotSz")
+                break
+
         log.info("instrument_meta_primed",
+                 family=family.label(),
                  underlying=underlying,
                  total_rows=len(rows),
                  option_rows=option_rows,
                  tick_size=self._default_option_tick,
-                 contract_size=live_ct)
+                 contract_size_api=live_ct,
+                 contract_size_assumed_btc=config.OKX_CONTRACT_SIZE_BTC,
+                 sample_min_sz=sample_min_sz,
+                 sample_lot_sz=sample_lot_sz)
 
         # Note on contract-size reporting:
-        # OKX's `ctVal` field for BTC-USD inverse OPTIONS is reported as 1.0
-        # via /api/v5/public/instruments — but empirically, 1 contract = 0.01
-        # BTC of underlying (verified by the OKX UI: pos=50 contracts shows
-        # as 0.5 BTC notional). The API's ctVal=1.0 in this context appears
-        # to be a USD multiplier on inverse contracts, NOT a BTC quantity.
+        # OKX's `ctVal` field is reported as 1.0 for both CM (BTC-USD)
+        # and UM (BTC-USD_UM) BTC OPTIONS via /api/v5/public/instruments
+        # — but empirically, 1 contract = 0.01 BTC of underlying
+        # (verified by the OKX UI: pos=50 contracts shows as 0.5 BTC
+        # notional, on the user's CM account 2026-05-15). The API's
+        # ctVal=1.0 appears to be a quote-currency multiplier on
+        # contract notional, NOT the BTC quantity per contract.
         #
-        # Therefore we trust .env's OKX_CONTRACT_SIZE_BTC as the source of
-        # truth. The known-correct value for BTC-USD options is 0.01.
-        # We only warn if the operator has set the env to something OTHER
-        # than 0.01, which is almost certainly a misconfiguration.
+        # Therefore we trust the env-derived ``config.OKX_CONTRACT_SIZE_BTC``
+        # as source of truth (default 0.01 for both families). Operators
+        # should verify minSz/lotSz on the first UM trade in case the
+        # linear family behaves differently.
         EMPIRICAL_CTVAL_BTC = 0.01
         if abs(config.OKX_CONTRACT_SIZE_BTC - EMPIRICAL_CTVAL_BTC) > 1e-9:
             log.warning(
                 "contract_size_unusual",
+                family=family.label(),
                 config=config.OKX_CONTRACT_SIZE_BTC,
                 expected=EMPIRICAL_CTVAL_BTC,
                 api_field=live_ct,
-                hint=("BTC-USD options use 0.01 BTC per contract empirically; "
+                hint=("BTC options use 0.01 BTC per contract empirically; "
                       "OKX's ctVal API field reports 1.0 (USD multiplier) "
                       "but that is NOT the BTC notional multiplier we need."),
-                action="set OKX_CONTRACT_SIZE_BTC=0.01 in .env",
+                action="set OKX_CONTRACT_SIZE_BTC=0.01 (or "
+                       "OKX_CONTRACT_SIZE_BTC_UM=0.01 for UM) in .env",
             )
         elif live_ct > 0 and abs(live_ct - 1.0) > 1e-9:
             # Belt and suspenders — flag if OKX's ctVal API ever changes
             # away from the well-known 1.0 value, so we re-investigate.
             log.warning(
                 "contract_size_api_changed",
+                family=family.label(),
                 live=live_ct,
                 expected_api_value=1.0,
                 hint="OKX may have changed ctVal semantics — review the algo.",
@@ -650,18 +715,19 @@ class OKXExchange:
         return self._f(rows[0], "totalEq")
 
     async def list_open_positions(self) -> list[dict]:
-        """List all option positions for BTC-USD.
+        """List all option positions for the active family.
 
         python-okx >=0.4.1 dropped the `uly=` parameter from
         `Account.get_positions`. We now fetch all OPTION positions and
-        filter to BASE_COIN-QUOTE_COIN in code.
+        filter by the family-specific instId prefix in code (CM:
+        ``BTC-USD-`` vs UM: ``BTC-USD_UM-``).
         """
         resp = await self._call(
             self._account.get_positions,
             instType="OPTION",
         )
         rows = self._data_or_empty(resp)
-        family_prefix = f"{config.BASE_COIN}-{config.QUOTE_COIN}-"
+        family_prefix = family.instid_prefix()
         out = []
         for r in rows:
             pos = self._f(r, "pos")
@@ -1327,7 +1393,9 @@ class OKXExchange:
         filled_qty_btc = filled_contracts * ct_val
         fully_filled = filled_contracts >= target_contracts
         t_filled = time.time()
-        # Spot at fill is needed to convert BTC-quoted savings to USD.
+        # Spot at fill is needed to convert native saving deltas to USD.
+        # On CM (BTC-quoted) it converts BTC × USD; on UM (USD-quoted)
+        # the conversion is a no-op but we still record it for context.
         # Best-effort: a single index-tickers call; fallback to 0 if it
         # fails so we never emit a misleading $ figure.
         try:
@@ -1337,8 +1405,9 @@ class OKXExchange:
         # Sum all fees collected across every order_id used during this
         # chase. OKX returns fee per-order_id (cumulative for that order),
         # so summing the latest absolute value across all ord_ids gives
-        # the chase total. Multiply by spot to surface USD in metrics.
-        total_fee_btc = sum(fees_by_ord_id.values())
+        # the chase total. Native unit is family-specific (BTC for CM,
+        # USD for UM); _build_fill_metrics converts to USD for reports.
+        total_fee_native = sum(fees_by_ord_id.values())
         metrics = _build_fill_metrics(
             side="buy",
             instrument=instrument,
@@ -1349,7 +1418,7 @@ class OKXExchange:
             attempts=attempt,
             ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
             spot_usd=spot_at_fill,
-            fee_btc=total_fee_btc,
+            fee_native=total_fee_native,
         )
         if fully_filled:
             log.info("chase_buy_filled",
@@ -1661,12 +1730,13 @@ class OKXExchange:
         filled_qty_btc = filled_contracts * ct_val
         fully_filled = filled_contracts >= target_contracts
         t_filled = time.time()
-        # Spot at fill is needed to convert BTC-quoted savings to USD.
+        # Spot at fill is needed to convert native deltas to USD on CM
+        # (no-op on UM). Best-effort; fallback to 0 if the call fails.
         try:
             spot_at_fill = await self.get_spot_price()
         except Exception:
             spot_at_fill = 0.0
-        total_fee_btc = sum(fees_by_ord_id.values())
+        total_fee_native = sum(fees_by_ord_id.values())
         metrics = _build_fill_metrics(
             side="sell",
             instrument=instrument,
@@ -1677,7 +1747,7 @@ class OKXExchange:
             attempts=attempt,
             ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
             spot_usd=spot_at_fill,
-            fee_btc=total_fee_btc,
+            fee_native=total_fee_native,
         )
         if fully_filled:
             log.info("chase_sell_filled",

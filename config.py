@@ -44,16 +44,42 @@ HAS_OKX_CREDS: bool = bool(OKX_API_KEY and OKX_API_SECRET and OKX_PASSPHRASE)
 
 # ──────────────────── Strategy Constants ──────────────────────────
 BASE_COIN: str = "BTC"
-QUOTE_COIN: str = os.getenv("QUOTE_COIN", "USD")  # "USD" (coin-margined) or "USDT"
+
+# Option family selector.
+#   OPTION_FAMILY=CM (default) → BTC-USD inverse / coin-margined
+#                                premiums quoted in BTC, settle in BTC.
+#   OPTION_FAMILY=UM           → BTC-USD_UM linear / USD-margined
+#                                premiums quoted in USD, settle in USD.
+#
+# All family-aware behaviour (instId building, tick rounding, fee unit,
+# USD conversion) is centralised in ``core.family``. Keep this knob as
+# the only OPS-facing toggle — flipping it is the canonical way to
+# migrate the algo from CM to UM (or back).
+OPTION_FAMILY: str = os.getenv("OPTION_FAMILY", "CM").upper()
+
+# Legacy single-quote token. With OPTION_FAMILY=CM this resolves to
+# "USD"; with UM it becomes "USD_UM". Kept exposed for backward-compat
+# imports (``data/option_chain.py`` historically referenced it directly)
+# — new code should import ``core.family`` and call ``quote_token()``.
+QUOTE_COIN: str = os.getenv(
+    "QUOTE_COIN", "USD_UM" if OPTION_FAMILY == "UM" else "USD",
+)
+
 # Legacy single-session BTC notional. Kept ONLY as a fallback for older
 # trade-log rows that pre-date per-session qty_per_leg. New entries source
 # qty_per_leg from the Session that fired them — see SESSIONS below.
 QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "0.5"))
 
-# OKX BTC options: 1 contract = 0.01 BTC (coin-margined). Verify per instrument
-# via SDK get_instruments → ctVal field on first run. Update if your account
-# uses a different contract size.
-OKX_CONTRACT_SIZE_BTC: float = float(os.getenv("OKX_CONTRACT_SIZE_BTC", "0.01"))
+# OKX BTC options: 1 contract = 0.01 BTC of underlying notional, for
+# both CM and UM families on the user's account (verified empirically
+# 2026-05-15 from the OKX UI: 50 contracts displayed as 0.5 BTC).
+# Override per-family via OKX_CONTRACT_SIZE_BTC (CM) or
+# OKX_CONTRACT_SIZE_BTC_UM (UM) if your account behaves differently.
+OKX_CONTRACT_SIZE_BTC: float = float(os.getenv(
+    "OKX_CONTRACT_SIZE_BTC_UM" if OPTION_FAMILY == "UM"
+    else "OKX_CONTRACT_SIZE_BTC",
+    "0.01",
+))
 
 # Trading mode for OKX OPTION orders.
 # OKX rejects `cash` for OPTION instType (cash is spot only), so this MUST
@@ -214,20 +240,30 @@ ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri (legacy default)
 # ──────────────────── Execution Settings ──────────────────────────
 OPTION_CHASE_INTERVAL_SEC: float = 5.0
 
-# OKX BTC-USD coin-margined options:
-#   • Premium quoted in BTC (per BTC of underlying notional, dimensionless)
-#   • Tick size = 0.0005 BTC across all strikes/expiries (verified 2026-05)
-# This default is used as a fallback only — on startup the algo queries
-# /api/v5/public/instruments and overrides with the live tickSz from OKX.
-OPTION_TICK_SIZE: float = float(os.getenv("OPTION_TICK_SIZE", "0.0005"))
+# Default tick size fallback. The authoritative tick comes from
+# /api/v5/public/instruments on startup — this is just the boot-time
+# default if the API is unreachable. Family-specific:
+#   CM (BTC-USD)    : 0.0001 BTC across all strikes/expiries
+#   UM (BTC-USD_UM) : 5 USD across all strikes/expiries
+# Pick the right family default automatically; allow override via env.
+OPTION_TICK_SIZE: float = float(os.getenv(
+    "OPTION_TICK_SIZE", "5" if OPTION_FAMILY == "UM" else "0.0001",
+))
 
 # Sanity-check bounds for the chase-pricing self-test on startup. If the
 # chase math yields a price outside these bounds for a real ITM option
 # (relative to its mark), the algo aborts with a clear error rather than
 # attempting orders. Guards against unit-conversion regressions like the
 # OPTION_TICK_SIZE=5.0 (USD) bug.
-CHASE_SELFTEST_MAX_OVER_MARK: float = 1.5     # never > 1.5× mark
-CHASE_SELFTEST_MAX_ABSOLUTE_BTC: float = 0.5  # never > 0.5 BTC absolute
+#
+# The absolute ceiling is family-dependent because the native unit is
+# different:
+#   CM: ≤ 0.5 BTC absolute (ITM premiums never exceed half a BTC)
+#   UM: ≤ $50,000 absolute (premium in USD per BTC of notional;
+#       the deepest ITM 0DTE on a $80k-spot day caps around $80k)
+CHASE_SELFTEST_MAX_OVER_MARK: float = 1.5         # never > 1.5× mark (any unit)
+CHASE_SELFTEST_MAX_ABSOLUTE_BTC: float = 0.5      # CM: ≤ 0.5 BTC
+CHASE_SELFTEST_MAX_ABSOLUTE_USD: float = 50_000.0 # UM: ≤ $50k per BTC notional
 
 # Maker-only chase: 50% bid-ask gap narrowing per retry, fair-value cap, deadline
 OPTION_CHASE_GAP_NARROW_PCT: float = float(

@@ -14,12 +14,13 @@ from typing import Optional
 import structlog
 
 import config
+from core import family
 from utils.time_utils import now_utc
 
 log = structlog.get_logger(__name__)
 
 TRADE_LOG_FIELDS = [
-    "date", "session", "qty_per_leg",
+    "date", "session", "family", "qty_per_leg",
     "entry_time", "exit_time", "exit_reason",
     "num_straddles", "strike",
     "entry_spot", "exit_spot",
@@ -84,6 +85,13 @@ class Straddle:
     # as "unknown" but still display the row.
     session_name: str = ""
 
+    # Option family at the time of entry — frozen on the Straddle so a
+    # mid-flight family change (operator restart with a new env var)
+    # cannot break the close-out P&L. Empty string is treated as "CM"
+    # (legacy default) by ``call_pnl`` for backward compat with existing
+    # positions.json files written before the family abstraction landed.
+    family: str = ""
+
     # Spot prices captured for context (verify strike selection, exit
     # context). Optional — older state files may not have them.
     entry_spot_price: float = 0.0
@@ -95,15 +103,36 @@ class Straddle:
     exit_put_price: Optional[float] = None
     pnl: Optional[float] = None
 
+    def _is_um(self) -> bool:
+        """Treat empty-string family as CM (legacy)."""
+        return (self.family or "CM").upper() == "UM"
+
     def call_pnl(self, call_now: float, exit_spot: float = 0.0) -> float:
         """USD P&L on the call leg.
 
-        Premium quotes are in BTC per BTC of notional. To convert to USD we
-        cost the entry leg at the entry spot and credit the exit leg at the
-        exit spot — this is the USDT-account convention (account value rises
-        when premium-in-BTC × spot rises). If spot is missing, we degrade
-        gracefully to a single-spot model using whichever is available.
+        Two pricing conventions co-exist depending on the option family
+        the straddle was opened against:
+
+          CM (BTC-USD inverse): premiums quoted in BTC per BTC of
+              notional. USD value = price × spot. We cost the entry
+              leg at entry-time spot and credit the exit leg at
+              exit-time spot — the USDT-account convention where
+              account value rises when premium-in-BTC × spot rises.
+
+          UM (BTC-USD_UM linear): premiums already in USD per BTC of
+              notional. USD value = price × 1. P&L is the direct
+              difference, no spot multiplication. Eliminates BTC
+              currency drift entirely.
+
+        Falls back gracefully when spot information is missing (legacy
+        state files written without spot-capture).
         """
+        if self._is_um():
+            return (
+                self.qty_per_leg
+                * self.num_straddles
+                * (call_now - self.entry_call_price)
+            )
         entry_spot = self.entry_spot_price
         spot_for_exit = exit_spot or self.exit_spot_price or entry_spot
         if entry_spot <= 0 and spot_for_exit <= 0:
@@ -125,6 +154,12 @@ class Straddle:
         )
 
     def put_pnl(self, put_now: float, exit_spot: float = 0.0) -> float:
+        if self._is_um():
+            return (
+                self.qty_per_leg
+                * self.num_straddles
+                * (put_now - self.entry_put_price)
+            )
         entry_spot = self.entry_spot_price
         spot_for_exit = exit_spot or self.exit_spot_price or entry_spot
         if entry_spot <= 0 and spot_for_exit <= 0:
@@ -164,6 +199,7 @@ class Straddle:
             "straddle_cost": self.straddle_cost,
             "num_straddles": self.num_straddles,
             "session_name": self.session_name,
+            "family": self.family,
             "entry_spot_price": self.entry_spot_price,
             "exit_spot_price": self.exit_spot_price,
             "status": self.status,
@@ -307,15 +343,26 @@ class Portfolio:
         """
         os.makedirs(config.STATE_DIR, exist_ok=True)
 
-        # Convert BTC-quoted premiums to USD using the spot at the moment of
-        # the relevant fill (entry_spot for entry legs, exit_spot for exit
-        # legs). Daily/weekly reports read these CSV columns as USD amounts.
+        # Normalize premiums to USD-per-BTC-of-notional for the CSV so
+        # downstream reports can read raw numeric columns without family
+        # awareness.
+        #   CM: native BTC-quoted, multiply by spot at the relevant fill
+        #   UM: native already USD-per-BTC, store as-is
+        # Daily/weekly reports read these as USD amounts and the math
+        # works for both families.
         entry_spot = s.entry_spot_price or 0.0
         exit_spot = s.exit_spot_price or entry_spot or 0.0
-        call_entry_usd = (s.entry_call_price or 0.0) * entry_spot
-        put_entry_usd = (s.entry_put_price or 0.0) * entry_spot
-        call_exit_usd = (s.exit_call_price or 0.0) * exit_spot
-        put_exit_usd = (s.exit_put_price or 0.0) * exit_spot
+        is_um = (s.family or "CM").upper() == "UM"
+        if is_um:
+            call_entry_usd = s.entry_call_price or 0.0
+            put_entry_usd = s.entry_put_price or 0.0
+            call_exit_usd = s.exit_call_price or 0.0
+            put_exit_usd = s.exit_put_price or 0.0
+        else:
+            call_entry_usd = (s.entry_call_price or 0.0) * entry_spot
+            put_entry_usd = (s.entry_put_price or 0.0) * entry_spot
+            call_exit_usd = (s.exit_call_price or 0.0) * exit_spot
+            put_exit_usd = (s.exit_put_price or 0.0) * exit_spot
         straddle_cost_usd = (call_entry_usd + put_entry_usd) * s.qty_per_leg
         total_capital_used = straddle_cost_usd * s.num_straddles
         call_pnl_usd = s.call_pnl(
@@ -345,6 +392,7 @@ class Portfolio:
         row = {
             "date": s.entry_time[:10],
             "session": s.session_name,
+            "family": (s.family or "CM").upper(),
             "qty_per_leg": s.qty_per_leg,
             "entry_time": s.entry_time,
             "exit_time": s.exit_time,
@@ -452,6 +500,14 @@ class Portfolio:
             d = dict(zip(existing_header, raw))
             d.setdefault("session", "")
             d.setdefault("qty_per_leg", str(config.QTY_PER_LEG))
+            # Pre-2026-05-15 trade-log rows are all CM by definition —
+            # the UM family didn't exist as a deployment option yet.
+            # Backfilling with "CM" lets the family-filter in the
+            # reporting layer treat historical rows correctly without
+            # any further migration step.
+            d.setdefault("family", "CM")
+            if not (d.get("family") or "").strip():
+                d["family"] = "CM"
             old_rows.append(d)
 
         try:

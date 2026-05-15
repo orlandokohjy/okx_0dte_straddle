@@ -29,7 +29,7 @@ from typing import Optional
 import structlog
 
 import config
-from core import notifier
+from core import family, notifier
 from core.exchange import OKXExchange
 from core.portfolio import Portfolio, Straddle, StraddleLeg
 from data.market_data import MarketData
@@ -52,9 +52,13 @@ def _format_leg_fill_message(
 
     `side` is the human-friendly action label ("entry" for buys at the
     open, "exit" for sells at the close). The metrics dict is produced by
-    core.exchange._build_fill_metrics; we surface the four numbers that
+    core.exchange._build_fill_metrics; we surface the five numbers that
     matter most to a desk: avg fill, slippage vs mark, time to fill,
     attempts, and dollars saved vs taker.
+
+    Native price formatting depends on the active family:
+        CM → "0.0035 BTC"
+        UM → "$285"
     """
     metrics = result.get("metrics") or {}
     avg = float(result.get("average_price", 0) or 0)
@@ -67,9 +71,9 @@ def _format_leg_fill_message(
     qty_btc = float(result.get("filled_qty_btc", 0) or 0)
 
     header = f"LEG {'FILLED' if side == 'entry' else 'UNWOUND'} — {leg}"
-    fill_line = f"Avg fill: {avg:.4f} BTC"
+    fill_line = f"Avg fill: {family.format_native_price(avg)}"
     if mark > 0:
-        fill_line += f"  (mark {mark:.4f})"
+        fill_line += f"  (mark {family.format_native_price(mark)})"
     slip_line = (
         f"Slippage vs mark: {slip:+.2f}%"
         if mark > 0 else "Slippage vs mark: n/a"
@@ -83,7 +87,7 @@ def _format_leg_fill_message(
     fully_line = "" if fully else "  ⚠️ PARTIAL"
 
     return (
-        f"<b>{header}</b>{fully_line} [{straddle_id}]\n"
+        f"<b>{header}</b>{fully_line} [{straddle_id}] [{family.label()}]\n"
         f"Symbol: {symbol}\n"
         f"{fill_line}\n"
         f"{slip_line}\n"
@@ -158,11 +162,17 @@ async def build_straddle(
         pair.call.symbol, pair.put.symbol, total_qty,
     )
     if rfq_result is not None:
-        call_fill = rfq_result["call_price"]
-        put_fill = rfq_result["put_price"]
+        # We store OKX-native fill prices directly on the Straddle
+        # (BTC for CM, USD-per-BTC-notional for UM). The portfolio's
+        # call_pnl/put_pnl is family-aware and produces USD P&L for
+        # both. See ``core.portfolio.Straddle.call_pnl`` for details.
+        call_fill = float(rfq_result["call_price"])
+        put_fill = float(rfq_result["put_price"])
         rfq_id = rfq_result.get("rfq_id", "")
         log.info("rfq_filled", id=straddle_id, rfq_id=rfq_id,
-                 call=call_fill, put=put_fill)
+                 family=family.label(),
+                 call=call_fill, put=put_fill,
+                 unit=family.native_quote_unit_label())
 
         call_leg = StraddleLeg(
             instrument=pair.call.symbol, side="Buy",
@@ -340,27 +350,40 @@ async def build_straddle(
             return None
 
         # Both filled — build the legs.
+        # Storage convention: OKX-native premium per BTC of notional.
+        #   CM (inverse) → BTC per BTC of notional (e.g. 0.0035)
+        #   UM (linear)  → USD per BTC of notional (e.g. 285)
+        # Portfolio.Straddle.call_pnl is family-aware; it multiplies CM
+        # premiums by spot to convert to USD, while UM premiums are
+        # already USD and used directly. This avoids the precision loss
+        # from converting through a BTC-equivalent intermediate when
+        # spot drifts during the chase.
         put_fill = float(put_result.get("average_price", pair.put.ask))
         call_fill = float(call_result.get("average_price", pair.call.ask))
-        log.info("both_legs_filled", id=straddle_id,
-                 call=call_fill, put=put_fill)
+        put_metrics = put_result.get("metrics", {}) or {}
+        call_metrics = call_result.get("metrics", {}) or {}
+        log.info("both_legs_filled", id=straddle_id, family=family.label(),
+                 call=call_fill, put=put_fill,
+                 unit=family.native_quote_unit_label())
 
         put_leg = StraddleLeg(
             instrument=pair.put.symbol, side="Buy",
             qty=total_qty, entry_price=put_fill,
             order_id=put_result.get("order_id", ""),
             avg_fill_price=put_fill,
-            entry_metrics=put_result.get("metrics", {}),
+            entry_metrics=put_metrics,
         )
         call_leg = StraddleLeg(
             instrument=pair.call.symbol, side="Buy",
             qty=total_qty, entry_price=call_fill,
             order_id=call_result.get("order_id", ""),
             avg_fill_price=call_fill,
-            entry_metrics=call_result.get("metrics", {}),
+            entry_metrics=call_metrics,
         )
 
     # ── Register ──
+    # straddle_cost is in OKX-native units (BTC for CM, USD for UM).
+    # Portfolio renderers convert to USD via Straddle helpers.
     straddle_cost = qty_per_leg * (call_fill + put_fill)
 
     # Capture spot if caller didn't provide it (rare path).
@@ -383,6 +406,7 @@ async def build_straddle(
         num_straddles=num_straddles,
         entry_spot_price=entry_spot,
         session_name=session_name,
+        family=family.label(),
     )
     portfolio.set_straddle(straddle)
     log.info("straddle_built", id=straddle_id, session=session_name,
@@ -424,13 +448,19 @@ async def unwind_straddle(
         straddle.call_leg.qty,
     )
     if rfq_result is not None:
-        exit_call_price = rfq_result["call_price"]
-        exit_put_price = rfq_result["put_price"]
+        # Store native exit prices directly — Straddle.call_pnl is
+        # family-aware (BTC × spot for CM, USD × 1 for UM).
+        exit_call_price = float(rfq_result["call_price"])
+        exit_put_price = float(rfq_result["put_price"])
         log.info("rfq_unwind_filled",
-                 id=straddle.id,
-                 call_exit=exit_call_price, put_exit=exit_put_price)
+                 id=straddle.id, family=family.label(),
+                 call=exit_call_price, put=exit_put_price,
+                 unit=family.native_quote_unit_label())
     else:
         # ── Concurrent unwind: sell BOTH legs at once ──
+        # Initialise to the entry native prices so a leg that fails to
+        # sell gets a P&L of 0 instead of crashing on missing fields.
+        # Successful chases overwrite below.
         exit_call_price = straddle.entry_call_price
         exit_put_price = straddle.entry_put_price
 
@@ -468,15 +498,18 @@ async def unwind_straddle(
             put_result = None
 
         if call_result:
+            call_metrics = call_result.get("metrics", {}) or {}
             exit_call_price = float(
                 call_result.get("average_price", call_ask),
             )
-            straddle.call_leg.exit_metrics = call_result.get("metrics", {})
+            straddle.call_leg.exit_metrics = call_metrics
             call_fully = call_result.get("fully_filled", True)
             call_filled_btc = float(
                 call_result.get("filled_qty_btc", straddle.call_leg.qty),
             )
             log.info("call_sold", price=exit_call_price,
+                     family=family.label(),
+                     unit=family.native_quote_unit_label(),
                      fully_filled=call_fully,
                      filled_btc=call_filled_btc,
                      target_btc=straddle.call_leg.qty)
@@ -507,15 +540,18 @@ async def unwind_straddle(
             )
 
         if put_result:
+            put_metrics = put_result.get("metrics", {}) or {}
             exit_put_price = float(
                 put_result.get("average_price", put_ask),
             )
-            straddle.put_leg.exit_metrics = put_result.get("metrics", {})
+            straddle.put_leg.exit_metrics = put_metrics
             put_fully = put_result.get("fully_filled", True)
             put_filled_btc = float(
                 put_result.get("filled_qty_btc", straddle.put_leg.qty),
             )
             log.info("put_sold", price=exit_put_price,
+                     family=family.label(),
+                     unit=family.native_quote_unit_label(),
                      fully_filled=put_fully,
                      filled_btc=put_filled_btc,
                      target_btc=straddle.put_leg.qty)

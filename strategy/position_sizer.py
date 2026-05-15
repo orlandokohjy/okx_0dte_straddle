@@ -1,11 +1,15 @@
 """
-Compound position sizing for a pure option straddle on OKX BTC-USD options.
+Compound position sizing for a pure option straddle on OKX BTC options.
 
-OKX BTC-USD options are coin-margined inverse contracts:
-  • Premium px is quoted in BTC (per BTC of underlying notional)
-  • To compare to a USD equity figure, we must multiply by spot:
-        usd_premium_per_btc_notional = btc_premium × spot
-        usd_cost_per_straddle = qty_per_leg × (usd_call + usd_put)
+Two families are supported (see ``core.family``):
+
+  CM (BTC-USD inverse, coin-margined):
+    • Premium px is quoted in BTC per BTC of underlying notional
+    • USD conversion: usd_premium_per_btc_notional = btc_premium × spot
+
+  UM (BTC-USD_UM linear, USD-margined):
+    • Premium px is quoted in USD per BTC of underlying notional
+    • USD conversion: usd_premium_per_btc_notional = native_price (identity)
 
 Sizing math (all in USD):
     straddle_cost_usd = call_cost_per_usd + put_cost_per_usd
@@ -23,6 +27,7 @@ from dataclasses import dataclass
 import structlog
 
 import config
+from core import family
 
 log = structlog.get_logger(__name__)
 
@@ -44,19 +49,22 @@ class SizingResult:
 
 def size_position(
     equity: float,
-    call_premium_btc: float,
-    put_premium_btc: float,
+    call_premium_native: float,
+    put_premium_native: float,
     spot_usd: float,
     qty_per_leg: float,
 ) -> SizingResult:
     """
-    Compute sizing in USD given BTC-quoted premiums and spot price.
+    Compute sizing in USD given OKX-native ask premiums and spot price.
 
     Args:
         equity: Trading-account equity in USD (USDT/USDC).
-        call_premium_btc: Call ask in BTC (per BTC of notional).
-        put_premium_btc: Put ask in BTC (per BTC of notional).
-        spot_usd: BTC spot in USD, used to translate BTC premiums → USD.
+        call_premium_native: Call ask in OKX-native units —
+            BTC per BTC of notional for CM, USD per BTC of notional for UM.
+        put_premium_native: Put ask, same convention.
+        spot_usd: BTC spot in USD. Required for CM (BTC → USD); ignored
+            on UM (already USD), but still used as a degenerate-input
+            guard.
         qty_per_leg: BTC notional per leg for the firing session.
 
     Returns:
@@ -72,9 +80,13 @@ def size_position(
             available_capital=config.ALLOC_PCT * equity,
         )
 
-    # USD premium per BTC of notional.
-    call_premium_usd = call_premium_btc * spot_usd
-    put_premium_usd = put_premium_btc * spot_usd
+    # USD premium per BTC of notional. Family-aware: identity on UM.
+    call_premium_usd = family.native_premium_to_usd(
+        call_premium_native, qty_btc=1.0, spot_usd=spot_usd,
+    )
+    put_premium_usd = family.native_premium_to_usd(
+        put_premium_native, qty_btc=1.0, spot_usd=spot_usd,
+    )
 
     call_cost_per = qty_per_leg * call_premium_usd
     put_cost_per = qty_per_leg * put_premium_usd
@@ -111,13 +123,15 @@ def size_position(
 
     log.info(
         "position_sized",
+        family=family.label(),
         equity=f"${equity:,.0f}",
         spot=f"${spot_usd:,.0f}",
         available=f"${available:,.0f}",
         num_straddles=n,
         qty_per_leg=qty_per_leg,
-        call_premium_btc=call_premium_btc,
-        put_premium_btc=put_premium_btc,
+        call_premium_native=call_premium_native,
+        put_premium_native=put_premium_native,
+        native_unit=family.native_quote_unit_label(),
         call_cost_per=f"${call_cost_per:,.2f}",
         put_cost_per=f"${put_cost_per:,.2f}",
         straddle_cost=f"${straddle_cost:,.2f}",

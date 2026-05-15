@@ -42,7 +42,7 @@ from datetime import datetime
 import structlog
 
 import config
-from core import notifier
+from core import family, notifier
 from core.exchange import OKXExchange
 from core.portfolio import Portfolio
 from core.scheduler import Scheduler
@@ -244,7 +244,16 @@ class Algo:
 
         log.info("algo_starting", mode=mode, dry_run=config.DRY_RUN,
                  has_creds=config.HAS_OKX_CREDS,
-                 reset_state=config.RESET_STATE_ON_BOOT)
+                 reset_state=config.RESET_STATE_ON_BOOT,
+                 option_family=family.label(),
+                 option_family_display=family.display_name(),
+                 option_family_underlying=family.underlying(),
+                 option_family_raw_env=family.RAW)
+        if family.RAW and family.RAW != family.label():
+            log.warning("option_family_alias_resolved",
+                        raw=family.RAW, resolved=family.label(),
+                        hint="set OPTION_FAMILY=CM or UM in .env to "
+                             "silence this warning")
 
         self.exchange.connect()
 
@@ -316,6 +325,7 @@ class Algo:
             f"<b>OKX STRADDLE ALGO STARTED</b>\n"
             f"Mode: {mode}"
             f"{' (DRY RUN)' if config.DRY_RUN else ''}\n"
+            f"Family: {family.label()} ({family.display_name()})\n"
             f"Spot: ${spot:,.2f}\n"
             f"Equity: ${self.portfolio.equity:,.2f}\n"
             f"Time: {format_utc_sgt(now_utc())}\n"
@@ -435,7 +445,15 @@ class Algo:
                 capped = min(new_price, cap)
                 cap_engaged = pre_cap_price > cap
 
-                ok_absolute = capped <= config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC
+                # Family-aware absolute ceiling: CM premiums are
+                # quoted in BTC (≤ 0.5 BTC sane), UM in USD-per-BTC-
+                # notional (≤ $50,000 sane on a $80k-spot day).
+                abs_ceiling = (
+                    config.CHASE_SELFTEST_MAX_ABSOLUTE_USD
+                    if family.is_um()
+                    else config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC
+                )
+                ok_absolute = capped <= abs_ceiling
                 ok_positive = capped > 0
                 ok_vs_mark = (
                     mark <= 0 or
@@ -462,22 +480,30 @@ class Algo:
                 # should not hold up startup if a healthier strike exists.
 
             sample, bid, ask, mark, tick, pre_cap, capped = last_failure
+            abs_ceiling = (
+                config.CHASE_SELFTEST_MAX_ABSOLUTE_USD
+                if family.is_um()
+                else config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC
+            )
+            unit = family.native_quote_unit_label()
             log.error("chase_selftest_failed",
+                      family=family.label(),
                       instrument=sample.symbol,
                       pre_cap_price=pre_cap, capped_price=capped,
                       mark=mark, tick=tick,
                       max_over_mark=config.CHASE_SELFTEST_MAX_OVER_MARK,
-                      max_absolute=config.CHASE_SELFTEST_MAX_ABSOLUTE_BTC)
+                      max_absolute=abs_ceiling)
             await notifier.send(
                 f"<b>STARTUP SELF-TEST FAILED</b>\n"
                 f"Every sampled ITM option produced an out-of-bound price. "
                 f"This is a likely unit-conversion bug, NOT a wide-spread "
                 f"issue.\n"
+                f"Family: {family.label()} ({family.display_name()})\n"
                 f"Last sample: {sample.symbol}\n"
-                f"Bid/Ask: {bid:.4f} / {ask:.4f} BTC\n"
-                f"Mark: {mark:.4f} BTC, tick: {tick:.4f}\n"
-                f"Pre-cap price: {pre_cap:.4f} BTC, "
-                f"post-cap: {capped:.4f} BTC\n"
+                f"Bid/Ask: {bid} / {ask} {unit}\n"
+                f"Mark: {mark} {unit}, tick: {tick}\n"
+                f"Pre-cap price: {pre_cap} {unit}, "
+                f"post-cap: {capped} {unit}\n"
                 f"Entry will be LOCKED until restart with fix."
             )
             return False
@@ -749,10 +775,17 @@ class Algo:
             volume_tracker.record_trade(
                 sizing.num_straddles, qty_per_leg=session.qty_per_leg,
             )
-            # Convert BTC-quoted premiums to USD for human-readable display.
+            # Convert OKX-native premiums to USD for human-readable display.
+            # CM: native is BTC, multiply by spot. UM: native is already
+            # USD-per-BTC-of-notional, identity. ``family.native_premium_to_usd``
+            # handles both with qty_btc=1.0 (= per BTC of notional).
             entry_spot_usd = straddle.entry_spot_price or spot
-            call_fill_usd = straddle.entry_call_price * entry_spot_usd
-            put_fill_usd = straddle.entry_put_price * entry_spot_usd
+            call_fill_usd = family.native_premium_to_usd(
+                straddle.entry_call_price, qty_btc=1.0, spot_usd=entry_spot_usd,
+            )
+            put_fill_usd = family.native_premium_to_usd(
+                straddle.entry_put_price, qty_btc=1.0, spot_usd=entry_spot_usd,
+            )
             call_cost_total_usd = (
                 call_fill_usd * session.qty_per_leg * sizing.num_straddles
             )
@@ -775,8 +808,9 @@ class Algo:
                      session=session.name,
                      qty_per_leg=session.qty_per_leg,
                      num_straddles=sizing.num_straddles,
-                     call_fill_btc=straddle.entry_call_price,
-                     put_fill_btc=straddle.entry_put_price,
+                     family=family.label(),
+                     call_fill_native=straddle.entry_call_price,
+                     put_fill_native=straddle.entry_put_price,
                      call_fill_usd=call_fill_usd,
                      put_fill_usd=put_fill_usd)
         else:

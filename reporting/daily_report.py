@@ -29,6 +29,7 @@ from typing import Optional
 import structlog
 
 import config
+from core import family as option_family
 
 log = structlog.get_logger(__name__)
 
@@ -68,6 +69,10 @@ class TradeRow:
     # row that pre-dates the multi-session refactor.
     session: str = ""
     qty_per_leg: float = 0.0
+    # Option family at the time of the trade. "CM" for legacy rows
+    # (pre-2026-05-15) and any row written before the family
+    # abstraction landed. "UM" for trades on the linear family.
+    family: str = "CM"
     # Trading day = expiry date in UTC (08:00 UTC cutoff). Computed at
     # load time from the entry_time so reports can group afternoon
     # (Mon 13:30 UTC) + morning (Tue 01:00 UTC) into ONE Tuesday row.
@@ -247,10 +252,35 @@ def _inception_equity(trades: list["TradeRow"]) -> float:
     return config.INITIAL_CAPITAL_USD
 
 
-def _load_trades() -> list[TradeRow]:
+def _load_trades(
+    *,
+    family_filter: Optional[str] = None,
+    include_all_families: bool = False,
+) -> list[TradeRow]:
+    """Load all trade rows from ``trade_log.csv``.
+
+    By default, returns only rows that match the **active option family**
+    (``core.family.label()``) — so a daily report rendered while running
+    UM never accidentally mixes in the historical CM rows. Pre-2026-05-15
+    rows are tagged ``CM`` by the migration step in
+    ``Portfolio._migrate_trade_log``.
+
+    Args:
+        family_filter: explicit family to keep ("CM" / "UM"). Defaults to
+            the currently active family. Has no effect when
+            ``include_all_families=True``.
+        include_all_families: load every row regardless of family. Used
+            by ad-hoc / cross-family analysis tools and by weekly reports
+            that want to show "lifetime" volume across both families.
+    """
     path = config.TRADE_LOG_FILE
     if not os.path.exists(path):
         return []
+    target_family = (
+        None
+        if include_all_families
+        else (family_filter or option_family.label()).upper()
+    )
     trades: list[TradeRow] = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
@@ -269,6 +299,10 @@ def _load_trades() -> list[TradeRow]:
                 trading_day = _trading_day_from_entry_time(
                     entry_time, fallback_date=date_str,
                 )
+                row_family = (row.get("family") or "CM").strip().upper() \
+                    or "CM"
+                if target_family is not None and row_family != target_family:
+                    continue
                 trades.append(TradeRow(
                     date=date_str,
                     net_pnl=float(row["net_pnl"]),
@@ -287,6 +321,7 @@ def _load_trades() -> list[TradeRow]:
                     exit_spot=_f(row, "exit_spot"),
                     session=row.get("session", "") or "",
                     qty_per_leg=qpl,
+                    family=row_family,
                     trading_day=trading_day,
                     entry_time=entry_time,
                     call_entry_exec=_exec_from_row(
@@ -924,7 +959,8 @@ def format_telegram_report(m: DailyMetrics) -> str:
         equity_line = f"  Equity: ${m.equity:,.2f}"
 
     lines = [
-        f"<b>DAILY REPORT — {m.trade_date}</b>",
+        f"<b>DAILY REPORT — {m.trade_date}</b> "
+        f"<i>[{option_family.label()} family]</i>",
         "",
         *_format_today_block(m),
         "",
@@ -1221,7 +1257,8 @@ def format_weekly_report(m: DailyMetrics) -> str:
     )
 
     lines = [
-        f"<b>WEEKLY REPORT — Week of {m.trade_date}</b>",
+        f"<b>WEEKLY REPORT — Week of {m.trade_date}</b> "
+        f"<i>[{option_family.label()} family]</i>",
         "",
         f"  Weekly P&L: {pnl_sign}${m.trade_pnl:,.2f} "
         f"({pnl_sign}{m.trade_return_pct:.2%})",

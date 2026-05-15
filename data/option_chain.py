@@ -2,8 +2,12 @@
 Option chain management for OKX.
 
 Fetches BTC options, filters to 0DTE, and provides strike/instrument lookup.
-OKX instrument naming: BTC-USD-YYMMDD-STRIKE-{C|P}
-  e.g. BTC-USD-260418-65000-C  →  call, expiry 18-Apr-2026, strike $65k
+OKX instrument naming depends on the active family (see ``core.family``):
+    CM:  BTC-USD-{YYMMDD}-{STRIKE}-{C|P}
+    UM:  BTC-USD_UM-{YYMMDD}-{STRIKE}-{C|P}
+
+Both formats split into 5 dash-separated tokens (the ``_UM`` is part of
+the second token, not a delimiter), so the parser here is family-agnostic.
 
 Uses bulk get_tickers_for_underlying() for efficiency instead of per-instrument
 polling.
@@ -15,6 +19,7 @@ from dataclasses import dataclass
 import structlog
 
 import config
+from core import family
 from core.exchange import OKXExchange
 from utils.time_utils import today_expiry_instid_str
 
@@ -45,13 +50,15 @@ class OptionChain:
         Returns the total number of 0DTE instruments found.
         """
         expiry_str = today_expiry_instid_str()
-        underlying = f"{config.BASE_COIN}-{config.QUOTE_COIN}"
+        underlying = family.underlying()
+        expected_quote = family.quote_token()
         self.calls.clear()
         self.puts.clear()
 
         tickers = await self._exchange.get_tickers_for_underlying(underlying)
         if not tickers:
-            log.warning("no_tickers_for_underlying", uly=underlying)
+            log.warning("no_tickers_for_underlying", uly=underlying,
+                        family=family.label())
             return 0
 
         for name, ticker in tickers.items():
@@ -60,7 +67,7 @@ class OptionChain:
             if len(parts) != 5:
                 continue
             base, quote, exp, strike_str, opt_type = parts
-            if base != config.BASE_COIN or quote != config.QUOTE_COIN:
+            if base != config.BASE_COIN or quote != expected_quote:
                 continue
             if exp != expiry_str:
                 continue
@@ -89,5 +96,6 @@ class OptionChain:
 
         total = len(self.calls) + len(self.puts)
         log.info("chain_refreshed", expiry=expiry_str,
+                 family=family.label(), uly=underlying,
                  calls=len(self.calls), puts=len(self.puts), total=total)
         return total
