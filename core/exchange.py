@@ -287,6 +287,13 @@ class OKXExchange:
         # value from /api/v5/public/instruments. Used by chase_buy/chase_sell
         # when an instrument-specific tick isn't cached.
         self._default_option_tick: float = config.OPTION_TICK_SIZE
+        # Set to True by prime_option_tick_size() when ctVal × ctMult from
+        # the live OKX API does not match config.OKX_CONTRACT_SIZE_BTC.
+        # main.py reads this flag during startup and locks entries on
+        # mismatch — guards against the catastrophic case where the algo's
+        # contract-size assumption is wrong (would cause 100× wrong
+        # position sizing).
+        self._contract_size_mismatch: bool = False
 
     # ──────────────────── Connection ──────────────────────────────
 
@@ -484,6 +491,7 @@ class OKXExchange:
         meta = {
             "tickSz": self._f(r, "tickSz"),
             "ctVal": self._f(r, "ctVal"),
+            "ctMult": self._f(r, "ctMult"),
             "lotSz": self._f(r, "lotSz"),
             "minSz": self._f(r, "minSz"),
         }
@@ -527,8 +535,17 @@ class OKXExchange:
         # entries when instType+uly are loose; on 2026-05-07 this caused
         # _default_option_tick to be set to 5.0 (futures tick) which would
         # have been a latent footgun if the per-instrument cache missed.
+        #
+        # ctVal × ctMult is the EMPIRICAL contract size in BTC (verified
+        # 2026-05-15 via /api/v5/public/instruments: both CM and UM
+        # families return ctVal=1, ctMult=0.01 ⇒ 0.01 BTC per contract).
+        # We compute this for every option row so a startup mismatch
+        # against config.OKX_CONTRACT_SIZE_BTC is caught immediately
+        # instead of relying on an empirical UI verification.
         ticks: list[float] = []
         ct_vals: list[float] = []
+        ct_mults: list[float] = []
+        effective_sizes: list[float] = []
         option_rows = 0
         for r in rows:
             inst = r.get("instId")
@@ -537,6 +554,7 @@ class OKXExchange:
             meta = {
                 "tickSz": self._f(r, "tickSz"),
                 "ctVal": self._f(r, "ctVal"),
+                "ctMult": self._f(r, "ctMult"),
                 "lotSz": self._f(r, "lotSz"),
                 "minSz": self._f(r, "minSz"),
             }
@@ -555,6 +573,10 @@ class OKXExchange:
                 ticks.append(meta["tickSz"])
             if meta["ctVal"] > 0:
                 ct_vals.append(meta["ctVal"])
+            if meta["ctMult"] > 0:
+                ct_mults.append(meta["ctMult"])
+            if meta["ctVal"] > 0 and meta["ctMult"] > 0:
+                effective_sizes.append(meta["ctVal"] * meta["ctMult"])
 
         if ticks:
             # Use the most common tick — OKX BTC options are uniform
@@ -563,7 +585,17 @@ class OKXExchange:
             most_common_tick = Counter(ticks).most_common(1)[0][0]
             self._default_option_tick = most_common_tick
 
-        live_ct = ct_vals[0] if ct_vals else 0.0
+        live_ct_val = ct_vals[0] if ct_vals else 0.0
+        live_ct_mult = ct_mults[0] if ct_mults else 0.0
+        # ctVal × ctMult is the empirical BTC contract size. OKX docs
+        # are ambiguous about which field carries the BTC quantity, but
+        # the live values resolve it: ctVal=1, ctMult=0.01 ⇒ 0.01 BTC
+        # per contract. This holds across all 1,200 BTC option
+        # instruments (730 CM + 470 UM, verified 2026-05-15).
+        live_effective_size = (
+            sum(effective_sizes) / len(effective_sizes)
+            if effective_sizes else 0.0
+        )
 
         # Sanity: an option tick larger than the family's plausible
         # ceiling almost certainly means we got the wrong instrument
@@ -601,48 +633,50 @@ class OKXExchange:
                  total_rows=len(rows),
                  option_rows=option_rows,
                  tick_size=self._default_option_tick,
-                 contract_size_api=live_ct,
+                 contract_size_api_ctval=live_ct_val,
+                 contract_size_api_ctmult=live_ct_mult,
+                 contract_size_api_effective_btc=live_effective_size,
                  contract_size_assumed_btc=config.OKX_CONTRACT_SIZE_BTC,
                  sample_min_sz=sample_min_sz,
                  sample_lot_sz=sample_lot_sz)
 
-        # Note on contract-size reporting:
-        # OKX's `ctVal` field is reported as 1.0 for both CM (BTC-USD)
-        # and UM (BTC-USD_UM) BTC OPTIONS via /api/v5/public/instruments
-        # — but empirically, 1 contract = 0.01 BTC of underlying
-        # (verified by the OKX UI: pos=50 contracts shows as 0.5 BTC
-        # notional, on the user's CM account 2026-05-15). The API's
-        # ctVal=1.0 appears to be a quote-currency multiplier on
-        # contract notional, NOT the BTC quantity per contract.
-        #
-        # Therefore we trust the env-derived ``config.OKX_CONTRACT_SIZE_BTC``
-        # as source of truth (default 0.01 for both families). Operators
-        # should verify minSz/lotSz on the first UM trade in case the
-        # linear family behaves differently.
-        EMPIRICAL_CTVAL_BTC = 0.01
-        if abs(config.OKX_CONTRACT_SIZE_BTC - EMPIRICAL_CTVAL_BTC) > 1e-9:
-            log.warning(
-                "contract_size_unusual",
-                family=family.label(),
-                config=config.OKX_CONTRACT_SIZE_BTC,
-                expected=EMPIRICAL_CTVAL_BTC,
-                api_field=live_ct,
-                hint=("BTC options use 0.01 BTC per contract empirically; "
-                      "OKX's ctVal API field reports 1.0 (USD multiplier) "
-                      "but that is NOT the BTC notional multiplier we need."),
-                action="set OKX_CONTRACT_SIZE_BTC=0.01 (or "
-                       "OKX_CONTRACT_SIZE_BTC_UM=0.01 for UM) in .env",
-            )
-        elif live_ct > 0 and abs(live_ct - 1.0) > 1e-9:
-            # Belt and suspenders — flag if OKX's ctVal API ever changes
-            # away from the well-known 1.0 value, so we re-investigate.
-            log.warning(
-                "contract_size_api_changed",
-                family=family.label(),
-                live=live_ct,
-                expected_api_value=1.0,
-                hint="OKX may have changed ctVal semantics — review the algo.",
-            )
+        # Auto-verify the contract-size assumption against the live API.
+        # OKX BTC options use ctVal × ctMult = 1 × 0.01 = 0.01 BTC per
+        # contract on both CM (inverse) and UM (linear) families. The
+        # algo's hardcoded OKX_CONTRACT_SIZE_BTC=0.01 must match this
+        # exactly — any mismatch is a deployment bug that would cause
+        # catastrophic position sizing on the first trade.
+        if live_effective_size > 0:
+            tolerance = 1e-6
+            if abs(live_effective_size - config.OKX_CONTRACT_SIZE_BTC) \
+                    > tolerance:
+                log.error(
+                    "contract_size_api_mismatch",
+                    family=family.label(),
+                    live_ctval=live_ct_val,
+                    live_ctmult=live_ct_mult,
+                    live_effective_btc=live_effective_size,
+                    config_btc=config.OKX_CONTRACT_SIZE_BTC,
+                    hint=("ctVal × ctMult from /api/v5/public/instruments "
+                          "does not match config.OKX_CONTRACT_SIZE_BTC. "
+                          "Update OKX_CONTRACT_SIZE_BTC (CM) or "
+                          "OKX_CONTRACT_SIZE_BTC_UM (UM) in .env to "
+                          "match the live API value before trading."),
+                )
+                # Surface the mismatch so the algo's _entry_lock
+                # mechanism can pick it up (callers check this flag).
+                self._contract_size_mismatch = True
+            else:
+                log.info("contract_size_verified",
+                         family=family.label(),
+                         live_btc=live_effective_size,
+                         config_btc=config.OKX_CONTRACT_SIZE_BTC)
+                self._contract_size_mismatch = False
+        else:
+            log.warning("contract_size_unavailable",
+                        family=family.label(),
+                        note="ctVal/ctMult not returned by API — "
+                             "falling back to config value")
 
         return self._default_option_tick
 

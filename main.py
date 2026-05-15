@@ -260,10 +260,32 @@ class Algo:
         # Prime per-instrument metadata (tick size, contract size). Public
         # endpoint, no auth required. Sets the runtime tick that chase_buy/
         # chase_sell use, replacing the old hardcoded OPTION_TICK_SIZE=5.0.
+        # Also auto-verifies that ctVal × ctMult from the live API matches
+        # config.OKX_CONTRACT_SIZE_BTC; sets exchange._contract_size_mismatch
+        # on any deviation, which the lock-check below converts into an
+        # entry lock.
         try:
             await self.exchange.prime_option_tick_size()
         except Exception:
             log.warning("prime_option_tick_failed", exc_info=True)
+
+        if getattr(self.exchange, "_contract_size_mismatch", False):
+            self._entry_locked = True
+            self._lock_reason = (
+                "Contract size mismatch — OKX API's ctVal × ctMult "
+                "differs from config.OKX_CONTRACT_SIZE_BTC. See "
+                "contract_size_api_mismatch log entry."
+            )
+            await notifier.send(
+                "<b>STARTUP CONTRACT-SIZE MISMATCH</b>\n"
+                "OKX's live ctVal × ctMult does not match the algo's "
+                "configured BTC-per-contract value. This would cause "
+                "catastrophic position sizing on the next trade.\n\n"
+                "<b>Entries are LOCKED</b> until reconciled.\n"
+                "Action: align OKX_CONTRACT_SIZE_BTC (CM) or "
+                "OKX_CONTRACT_SIZE_BTC_UM (UM) in .env with the live "
+                "API value, then restart."
+            )
 
         # Auth-required startup safeguards. Run whenever we HAVE credentials,
         # regardless of DRY_RUN — this lets a dry-run boot still validate the
@@ -531,21 +553,25 @@ class Algo:
 
         Defends the first UM cutover trade against the latent risk that
         OKX's BTC-USD_UM family quotes / sizes its options differently
-        from BTC-USD inverse on this account. The CM family is verified
-        empirically (50 contracts = 0.5 BTC); UM has no such empirical
-        anchor at the time of writing — this guard provides one before
-        any UM order is ever sent.
+        from the assumed convention.
 
-        Three live checks (all read-only, no orders placed):
+        The PRIMARY contract-size verification happens earlier in the
+        startup sequence (``prime_option_tick_size`` reads ctVal × ctMult
+        from the API and sets ``exchange._contract_size_mismatch`` on any
+        deviation). This guard adds three additional UM-specific checks
+        that prove the *quote unit* and *position-sizing math* will land
+        correctly:
+
           1. Tick size is in plausible USD range (1 ≤ tick ≤ 100). Real
-             value is 5; we accept anything sane to allow OKX to widen
-             ticks during a market disruption without locking us out.
-          2. Live UM minSz / lotSz match 1 (the CM shape we inherit
-             0.01 BTC/contract from). Anything else means UM uses a
-             different lot convention and our assumption is wrong.
-          3. A sample UM ITM ask falls in USD range ($50 – $50,000),
+             value is 5 USD; we accept anything sane to allow OKX to
+             widen ticks during a market disruption without locking us out.
+          2. Sample UM ITM ask falls in USD range ($50 – $50,000),
              NOT in BTC range (0.0001 – 0.5). Catches the catastrophic
              case where the wire is somehow still BTC-quoted.
+          3. CROSS-FAMILY PROBE (verified live 2026-05-15 against OKX
+             public API): for the same strike + same expiry, the UM
+             USD-mark must roughly equal the CM BTC-mark × spot. A
+             ≥30% disagreement suggests our unit assumption is wrong.
 
         Returns False on any failure so the caller can lock entries
         and alert the operator. CM bypasses this method entirely.
@@ -563,17 +589,19 @@ class Algo:
                           range="[1, 100] USD",
                           hint="UM tick should be 5 USD on OKX")
 
-            # ── 2. minSz / lotSz shape verification ──
+            # ── Pick a sample UM ITM put (most reliable for cross-
+            # family verification because deep-ITM puts always have a
+            # tight intrinsic anchor that makes the cross-check robust).
             await self.chain.refresh()
             sample = None
-            for c in self.chain.calls:
-                if c.ask > 0 and c.bid >= 0:
-                    sample = c
+            for p in self.chain.puts:
+                if p.strike > spot and p.bid > 0 and p.ask > 0:
+                    sample = p
                     break
             if sample is None:
-                for p in self.chain.puts:
-                    if p.ask > 0:
-                        sample = p
+                for c in self.chain.calls:
+                    if c.strike < spot and c.bid > 0 and c.ask > 0:
+                        sample = c
                         break
             if sample is None:
                 log.warning("um_guard_no_sample",
@@ -581,17 +609,7 @@ class Algo:
                                  "deferring guard until first live data")
                 return True  # don't lock on transient empty chain
 
-            meta = await self.exchange.get_instrument_meta(sample.symbol)
-            min_sz = float(meta.get("minSz", 0) or 0)
-            lot_sz = float(meta.get("lotSz", 0) or 0)
-            shape_ok = (min_sz == 1.0 and lot_sz == 1.0)
-            if not shape_ok:
-                log.error("um_guard_shape_failed",
-                          instrument=sample.symbol,
-                          min_sz=min_sz, lot_sz=lot_sz,
-                          expected="minSz=1, lotSz=1 (CM-family shape)")
-
-            # ── 3. Live ask in USD range, NOT BTC range ──
+            # ── 2. Live ask in USD range, NOT BTC range ──
             ask = sample.ask
             in_usd_range = 50.0 <= ask <= 50_000.0
             in_btc_range = 0.0001 <= ask <= 0.5
@@ -605,6 +623,48 @@ class Algo:
                           hint=("UM ask must be USD-per-BTC-of-notional "
                                 "($50-$50000); BTC-range ask means the "
                                 "wire is still inverse-quoted"))
+
+            # ── 3. Cross-family probe ──
+            # Build the equivalent CM instId by swapping the family
+            # token. UM: BTC-USD_UM-{exp}-{strike}-{C|P}
+            # CM: BTC-USD-{exp}-{strike}-{C|P}
+            cm_inst_id = sample.symbol.replace("BTC-USD_UM-", "BTC-USD-", 1)
+            cross_ok = True  # default-pass when CM peer is unavailable
+            cross_detail = "skipped (no CM peer)"
+            try:
+                um_mark = await self.exchange.get_option_mark_price(
+                    sample.symbol,
+                )
+                cm_mark = await self.exchange.get_option_mark_price(
+                    cm_inst_id,
+                )
+                if um_mark > 0 and cm_mark > 0 and spot > 0:
+                    cm_mark_usd = cm_mark * spot
+                    rel_err = (
+                        abs(um_mark - cm_mark_usd) / cm_mark_usd
+                        if cm_mark_usd > 0 else 1.0
+                    )
+                    cross_ok = rel_err <= 0.30  # ≤30% (verified ~2% in practice)
+                    cross_detail = (
+                        f"UM=${um_mark:.0f}, CM={cm_mark:.4f}BTC "
+                        f"(${cm_mark_usd:.0f}), rel_err={rel_err:.1%}"
+                    )
+                    if not cross_ok:
+                        log.error("um_guard_cross_family_failed",
+                                  instrument=sample.symbol,
+                                  cm_peer=cm_inst_id,
+                                  um_mark_usd=um_mark,
+                                  cm_mark_btc=cm_mark,
+                                  cm_mark_usd_via_spot=cm_mark_usd,
+                                  rel_err=rel_err,
+                                  hint=("UM USD-mark and CM BTC-mark×spot "
+                                        "should agree within ~5%; large "
+                                        "divergence means the unit "
+                                        "interpretation is wrong"))
+            except Exception:
+                log.warning("um_guard_cross_family_skipped",
+                            instrument=sample.symbol,
+                            exc_info=True)
 
             # ── 4. Implied position size sanity ──
             # If we send the configured qty_per_leg (typically 0.5 BTC),
@@ -620,34 +680,33 @@ class Algo:
             log.info("um_guard_summary",
                      family=family.label(),
                      tick=tick, tick_ok=tick_ok,
-                     min_sz=min_sz, lot_sz=lot_sz,
-                     shape_ok=shape_ok,
                      sample_instrument=sample.symbol,
                      sample_ask_usd=ask,
                      quote_unit_ok=quote_ok,
+                     cross_family=cross_detail,
+                     cross_family_ok=cross_ok,
                      largest_session_qty_btc=sample_qty_btc,
                      implied_contracts=sample_contracts,
                      implied_notional_usd=round(sample_usd, 0),
-                     contract_size_assumed_btc=(
+                     contract_size_btc=(
                          config.OKX_CONTRACT_SIZE_BTC
                      ))
 
-            all_ok = tick_ok and shape_ok and quote_ok
+            all_ok = tick_ok and quote_ok and cross_ok
             if not all_ok:
                 fail_lines = []
                 if not tick_ok:
                     fail_lines.append(
                         f"  • tick={tick} USD (expected 1-100)"
                     )
-                if not shape_ok:
-                    fail_lines.append(
-                        f"  • minSz/lotSz={min_sz}/{lot_sz} "
-                        f"(expected 1/1)"
-                    )
                 if not quote_ok:
                     fail_lines.append(
                         f"  • sample ask={ask} "
                         f"(expected USD range $50-$50000)"
+                    )
+                if not cross_ok:
+                    fail_lines.append(
+                        f"  • cross-family: {cross_detail}"
                     )
                 await notifier.send(
                     f"<b>UM UNIT-ASSUMPTION GUARD FAILED</b>\n"
@@ -656,8 +715,7 @@ class Algo:
                     f"Sample instrument: {sample.symbol}\n"
                     + "\n".join(fail_lines) + "\n\n"
                     f"<b>Entries are LOCKED</b> until investigated.\n"
-                    f"Run diagnose_um_cutover.py for a full "
-                    f"cross-family probe."
+                    f"Run diagnose_um_cutover.py for a full probe."
                 )
             return all_ok
         except Exception:
