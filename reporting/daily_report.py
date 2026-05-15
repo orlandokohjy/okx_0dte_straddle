@@ -897,12 +897,23 @@ def format_telegram_report(m: DailyMetrics) -> str:
         equity_line,
         "",
         "<b>Portfolio</b>",
-        f"  Cumulative P&L: ${m.total_pnl:,.2f} "
+        # Cumulative P&L is anchored on the LIVE wallet (equity − inception)
+        # so the dollar number always matches the percentage. The
+        # "Trade ledger" line below reports the algorithmic sum of per-
+        # trade P&Ls, and "Drift" = wallet − ledger. The drift comes from
+        # MTM on BTC-denominated margin (auto-borrow), settlement vs.
+        # closing-trade price, maker rebates, and borrow interest — none
+        # of which are captured in the per-trade P&L snapshot.
+        f"  Cumulative P&L: ${(m.equity - m.inception_equity):,.2f} "
         f"({m.cumulative_return_pct:+.1%})"
         + (
             f"  <i>since ${m.inception_equity:,.0f} on {m.inception_date}</i>"
             if m.inception_equity > 0 else ""
         ),
+        f"  Trade ledger: ${m.total_pnl:,.2f}  "
+        f"Drift vs wallet: "
+        f"${(m.equity - m.inception_equity - m.total_pnl):+,.2f}  "
+        f"<i>(MTM/settlement/fees)</i>",
         f"  High Water Mark: ${m.high_water_mark:,.2f}",
         "",
         f"<b>Win/Loss ({m.total_trades} trades)</b>",
@@ -1121,6 +1132,13 @@ def format_weekly_report(m: DailyMetrics) -> str:
     traded_total = open_total + close_total
     traded_usd = opened_usd + closed_usd
 
+    cum_pnl_wallet = m.equity - m.inception_equity if m.inception_equity > 0 else 0.0
+    drift = cum_pnl_wallet - m.total_pnl
+    inception_suffix = (
+        f"  <i>since ${m.inception_equity:,.0f} on {m.inception_date}</i>"
+        if m.inception_equity > 0 else ""
+    )
+
     lines = [
         f"<b>WEEKLY REPORT — Week of {m.trade_date}</b>",
         "",
@@ -1128,7 +1146,11 @@ def format_weekly_report(m: DailyMetrics) -> str:
         f"({pnl_sign}{m.trade_return_pct:.2%})",
         f"  Trades: {m.total_trades} ({m.wins}W / {m.losses}L)",
         f"  Equity: ${m.equity:,.2f}",
-        f"  Cumulative: {m.cumulative_return_pct:+.1%}",
+        f"  Cumulative: ${cum_pnl_wallet:,.2f} "
+        f"({m.cumulative_return_pct:+.1%}){inception_suffix}",
+        f"  Trade ledger: ${m.total_pnl:,.2f}  "
+        f"Drift vs wallet: ${drift:+,.2f}  "
+        f"<i>(MTM/settlement/fees)</i>",
         "",
         "<b>Volume (this week)</b>",
         f"  Straddles: {m.num_straddles}",
