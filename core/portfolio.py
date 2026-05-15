@@ -225,24 +225,44 @@ class Portfolio:
 
         # USD P&L using entry_spot for the entry leg and exit_spot for the
         # exit leg (set on Straddle by unwind_straddle just before close).
-        pnl = s.combined_pnl(
+        gross_pnl = s.combined_pnl(
             exit_call_price, exit_put_price, exit_spot=s.exit_spot_price,
         )
+        # Sum maker fees across all 4 legs (BTC fees converted to USD at
+        # fill-time spot by the exchange layer). Subtracting from gross
+        # gives a net P&L that matches the wallet equity to within
+        # MTM/settlement drift only — fees were the bulk of the
+        # historical "Drift vs wallet" component.
+        ce = s.call_leg.entry_metrics or {}
+        cx = s.call_leg.exit_metrics or {}
+        pe = s.put_leg.entry_metrics or {}
+        px = s.put_leg.exit_metrics or {}
+        total_fees_usd = (
+            float(ce.get("fee_usd") or 0.0)
+            + float(cx.get("fee_usd") or 0.0)
+            + float(pe.get("fee_usd") or 0.0)
+            + float(px.get("fee_usd") or 0.0)
+        )
+        net_pnl = gross_pnl - total_fees_usd
+
         s.status = "closed"
         s.exit_time = now_utc().isoformat()
         s.exit_call_price = exit_call_price
         s.exit_put_price = exit_put_price
-        s.pnl = pnl
+        s.pnl = net_pnl  # ← ledger snapshot now matches wallet behaviour
 
-        self._equity += pnl
-        self._daily_pnl += pnl
+        self._equity += net_pnl
+        self._daily_pnl += net_pnl
         self._save_equity()
         self._save_positions()
-        self._log_trade(s, exit_reason)
+        self._log_trade(s, exit_reason, gross_pnl=gross_pnl, fees=total_fees_usd)
 
         log.info("straddle_closed",
-                 pnl=f"${pnl:,.2f}", equity=f"${self._equity:,.2f}")
-        return pnl
+                 gross_pnl=f"${gross_pnl:,.2f}",
+                 fees=f"${total_fees_usd:,.2f}",
+                 net_pnl=f"${net_pnl:,.2f}",
+                 equity=f"${self._equity:,.2f}")
+        return net_pnl
 
     def reset_daily(self) -> None:
         self._daily_pnl = 0.0
@@ -273,7 +293,18 @@ class Portfolio:
         with open(config.POSITIONS_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
-    def _log_trade(self, s: Straddle, exit_reason: str) -> None:
+    def _log_trade(
+        self, s: Straddle, exit_reason: str,
+        *, gross_pnl: float = 0.0, fees: float = 0.0,
+    ) -> None:
+        """Append one trade row to ``trade_log.csv``.
+
+        ``gross_pnl`` and ``fees`` are passed in by ``close_straddle`` so
+        the row's gross/net/fees columns align with the wallet-equity
+        update done at the same moment (``s.pnl`` carries the NET, which
+        is what ``self._equity`` was just bumped by). Defaults of 0.0
+        keep legacy unit tests / ad-hoc invocations working.
+        """
         os.makedirs(config.STATE_DIR, exist_ok=True)
 
         # Convert BTC-quoted premiums to USD using the spot at the moment of
@@ -299,6 +330,18 @@ class Portfolio:
         pe = s.put_leg.entry_metrics or {}
         px = s.put_leg.exit_metrics or {}
 
+        # Fall back to summing leg metrics if caller didn't pass them in
+        # (legacy callers or ad-hoc replays).
+        if gross_pnl == 0.0 and fees == 0.0:
+            fees = (
+                float(ce.get("fee_usd") or 0.0)
+                + float(cx.get("fee_usd") or 0.0)
+                + float(pe.get("fee_usd") or 0.0)
+                + float(px.get("fee_usd") or 0.0)
+            )
+            gross_pnl = (s.pnl or 0.0) + fees  # s.pnl is NET, so back out
+        net_pnl = s.pnl or 0.0  # always NET (wallet-aligned)
+
         row = {
             "date": s.entry_time[:10],
             "session": s.session_name,
@@ -316,13 +359,15 @@ class Portfolio:
             "put_premium_exit": round(put_exit_usd, 4),
             "total_capital_used": round(total_capital_used, 2),
             "straddle_cost": round(straddle_cost_usd, 4),
-            "capital_before": self._equity - (s.pnl or 0),
+            # capital_before backs out NET P&L from the post-trade equity
+            # so capital_after − capital_before == net_pnl exactly.
+            "capital_before": round(self._equity - (s.pnl or 0), 2),
             "call_pnl": round(call_pnl_usd, 2),
             "put_pnl": round(put_pnl_usd, 2),
-            "gross_pnl": s.pnl,
-            "fees": 0.0,
-            "net_pnl": s.pnl,
-            "capital_after": self._equity,
+            "gross_pnl": round(gross_pnl, 2),
+            "fees": round(fees, 2),
+            "net_pnl": round(net_pnl, 2),
+            "capital_after": round(self._equity, 2),
             # Entry execution metrics
             "call_entry_duration_sec": ce.get("duration_sec", ""),
             "call_entry_attempts": ce.get("attempts", ""),

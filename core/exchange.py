@@ -145,6 +145,7 @@ def _build_fill_metrics(
     ref_ask: float,
     ref_mark: float,
     spot_usd: float = 0.0,
+    fee_btc: float = 0.0,
 ) -> dict:
     """
     Build the fill-quality metrics dict that flows from chase_buy/sell
@@ -190,6 +191,12 @@ def _build_fill_metrics(
     # it $ — that was the historical bug.
     saved_total_btc = saved_per_btc * qty_btc
     saved_total_usd = saved_total_btc * spot_usd if spot_usd > 0 else 0.0
+    # OKX inverse options are coin-margined: maker fees are charged in BTC.
+    # We persist both BTC and USD (using fill-time spot) so the daily report's
+    # ledger P&L can finally subtract the fee that the wallet equity already
+    # reflects — eliminating the historical "Drift vs wallet" component.
+    fee_btc_abs = abs(fee_btc)
+    fee_usd = fee_btc_abs * spot_usd if spot_usd > 0 else 0.0
 
     return {
         "instrument": instrument,
@@ -212,6 +219,8 @@ def _build_fill_metrics(
         "saved_vs_taker_pct": round(saved_pct * 100, 4),
         "saved_vs_taker_total_btc": round(saved_total_btc, 6),
         "saved_vs_taker_total_usd": round(saved_total_usd, 2),
+        "fee_btc": round(fee_btc_abs, 8),
+        "fee_usd": round(fee_usd, 4),
     }
 
 
@@ -769,6 +778,31 @@ class OKXExchange:
         rows = self._data_or_empty(resp)
         return rows[0] if rows else {}
 
+    def _accumulate_fee(
+        self, fees_by_ord_id: dict, ord_id: str, status: dict,
+    ) -> None:
+        """Track the latest cumulative fee (in BTC) for one order_id.
+
+        OKX returns ``fee`` as the cumulative fee charged by that single
+        order so far (negative when the trader paid, positive on rebate).
+        Each chase iteration may cancel-and-replace, producing multiple
+        order_ids per trade leg; ``fees_by_ord_id`` maps order_id → the
+        latest absolute BTC fee seen for that order. Total chase fee =
+        sum of values across all order_ids.
+
+        Why we read it on every status read instead of only at terminal:
+        if cancellation propagates faster than the final ``get_order``
+        round trip, we may never see ``filled``/``cancelled`` for that
+        ord_id again. Recording the fee on each status read guarantees
+        we always have the most-recent value.
+        """
+        if not ord_id:
+            return
+        raw = self._f(status, "fee", default=0.0)
+        # OKX `fee` is negative when fee was charged, positive on rebate.
+        # We track absolute BTC outlay; subtract from gross P&L downstream.
+        fees_by_ord_id[ord_id] = abs(raw)
+
     # ──────────────────── Order placement ─────────────────────────
 
     def _qty_to_contracts(self, qty_btc: float) -> str:
@@ -875,6 +909,7 @@ class OKXExchange:
         *,
         side: str,
         attempt: int,
+        fees_by_ord_id: Optional[dict] = None,
     ) -> tuple[int, float, str]:
         """Cancel the order and reconcile the final fill state.
 
@@ -910,6 +945,9 @@ class OKXExchange:
         final_acc = 0.0
         final_best: dict = {}
         order_state = (wait_status or {}).get("state", "")
+        # Capture fee from any status we already had at entry too.
+        if fees_by_ord_id is not None and wait_status:
+            self._accumulate_fee(fees_by_ord_id, ord_id, wait_status)
 
         for retry in range(3):
             final: dict = {}
@@ -924,6 +962,8 @@ class OKXExchange:
             if f_acc > final_acc:
                 final_acc = f_acc
                 final_best = final
+            if fees_by_ord_id is not None and final:
+                self._accumulate_fee(fees_by_ord_id, ord_id, final)
             f_state = (final or {}).get("state", "")
             if f_state:
                 order_state = f_state
@@ -1023,6 +1063,10 @@ class OKXExchange:
         rested_ord_id: str = ""
         rested_price: float = 0.0
         rested_credited: int = 0  # contracts already credited from this resting order
+        # Per-order_id BTC fee accumulator. OKX `fee` is cumulative *per
+        # order_id*, not per chase, so we track the latest absolute value
+        # for each order_id we touch and sum at the end.
+        fees_by_ord_id: dict[str, float] = {}
 
         FATAL_CODES = {
             "51000",   # Parameter error
@@ -1069,6 +1113,8 @@ class OKXExchange:
                          total_filled=filled_contracts,
                          vwap=weighted_value / filled_contracts,
                          state=state)
+            # Capture fee field (cumulative for this order_id) on every read.
+            self._accumulate_fee(fees_by_ord_id, rested_ord_id, status)
             return state, acc
 
         while time.time() < deadline and filled_contracts < target_contracts:
@@ -1163,6 +1209,7 @@ class OKXExchange:
                     await self._reconcile_after_wait(
                         instrument, rested_ord_id, stale_status,
                         rested_price, side="buy", attempt=attempt,
+                        fees_by_ord_id=fees_by_ord_id,
                     )
                 # Credit any *new* fills that landed during the cancel race
                 delta = max(0, filled_this - rested_credited)
@@ -1251,6 +1298,7 @@ class OKXExchange:
                 await self._reconcile_after_wait(
                     instrument, rested_ord_id, stale_status,
                     rested_price, side="buy", attempt=attempt,
+                    fees_by_ord_id=fees_by_ord_id,
                 )
             delta = max(0, filled_this - rested_credited)
             if delta > 0:
@@ -1286,6 +1334,11 @@ class OKXExchange:
             spot_at_fill = await self.get_spot_price()
         except Exception:
             spot_at_fill = 0.0
+        # Sum all fees collected across every order_id used during this
+        # chase. OKX returns fee per-order_id (cumulative for that order),
+        # so summing the latest absolute value across all ord_ids gives
+        # the chase total. Multiply by spot to surface USD in metrics.
+        total_fee_btc = sum(fees_by_ord_id.values())
         metrics = _build_fill_metrics(
             side="buy",
             instrument=instrument,
@@ -1296,13 +1349,15 @@ class OKXExchange:
             attempts=attempt,
             ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
             spot_usd=spot_at_fill,
+            fee_btc=total_fee_btc,
         )
         if fully_filled:
             log.info("chase_buy_filled",
                      instrument=instrument, avg=vwap, attempts=attempt,
                      duration_sec=metrics["duration_sec"],
                      slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
-                     saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
+                     saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
+                     fee_usd=metrics["fee_usd"])
         else:
             log.warning("chase_buy_partial_terminated",
                         instrument=instrument,
@@ -1363,6 +1418,8 @@ class OKXExchange:
         rested_ord_id: str = ""
         rested_price: float = 0.0
         rested_credited: int = 0
+        # Per-order_id BTC fee accumulator (see chase_buy for rationale).
+        fees_by_ord_id: dict[str, float] = {}
 
         FATAL_CODES = {
             "51000", "51001", "51008", "51010", "51016", "51019",
@@ -1396,6 +1453,7 @@ class OKXExchange:
                          total_filled=filled_contracts,
                          vwap=weighted_value / filled_contracts,
                          state=state)
+            self._accumulate_fee(fees_by_ord_id, rested_ord_id, status)
             return state, acc
 
         while time.time() < deadline and filled_contracts < target_contracts:
@@ -1492,6 +1550,7 @@ class OKXExchange:
                     await self._reconcile_after_wait(
                         instrument, rested_ord_id, stale_status,
                         rested_price, side="sell", attempt=attempt,
+                        fees_by_ord_id=fees_by_ord_id,
                     )
                 delta = max(0, filled_this - rested_credited)
                 if delta > 0:
@@ -1574,6 +1633,7 @@ class OKXExchange:
                 await self._reconcile_after_wait(
                     instrument, rested_ord_id, stale_status,
                     rested_price, side="sell", attempt=attempt,
+                    fees_by_ord_id=fees_by_ord_id,
                 )
             delta = max(0, filled_this - rested_credited)
             if delta > 0:
@@ -1606,6 +1666,7 @@ class OKXExchange:
             spot_at_fill = await self.get_spot_price()
         except Exception:
             spot_at_fill = 0.0
+        total_fee_btc = sum(fees_by_ord_id.values())
         metrics = _build_fill_metrics(
             side="sell",
             instrument=instrument,
@@ -1616,13 +1677,15 @@ class OKXExchange:
             attempts=attempt,
             ref_bid=ref_bid, ref_ask=ref_ask, ref_mark=ref_mark,
             spot_usd=spot_at_fill,
+            fee_btc=total_fee_btc,
         )
         if fully_filled:
             log.info("chase_sell_filled",
                      instrument=instrument, avg=vwap, attempts=attempt,
                      duration_sec=metrics["duration_sec"],
                      slippage_vs_mark_pct=metrics["slippage_vs_mark_pct"],
-                     saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"])
+                     saved_vs_taker_total_usd=metrics["saved_vs_taker_total_usd"],
+                     fee_usd=metrics["fee_usd"])
         else:
             log.warning("chase_sell_partial_terminated",
                         instrument=instrument,
