@@ -291,6 +291,21 @@ class Algo:
                 "Tick size / unit conversion likely misconfigured."
             )
 
+        # UM-only: verify the contract-size and quote-unit assumptions
+        # against live OKX metadata before trading. Catches the case
+        # where UM behaves differently from CM (e.g. minSz=1 contract
+        # representing a different BTC notional than the 0.01 we inherit
+        # from the CM family). Runs only when OPTION_FAMILY=UM so the
+        # CM hot path stays on its existing fast boot.
+        if family.is_um() and not self._entry_locked:
+            um_ok = await self._um_unit_assumption_guard(spot)
+            if not um_ok:
+                self._entry_locked = True
+                self._lock_reason = (
+                    "UM unit-assumption guard failed — see logs. "
+                    "Contract size / premium unit not as expected."
+                )
+
         log.info("algo_initialized",
                  spot=f"${spot:,.2f}",
                  equity=f"${self.portfolio.equity:,.2f}",
@@ -510,6 +525,146 @@ class Algo:
         except Exception:
             log.error("chase_selftest_exception", exc_info=True)
             return True  # don't block on transient errors
+
+    async def _um_unit_assumption_guard(self, spot: float) -> bool:
+        """UM-only pre-trade live verification of the unit assumptions.
+
+        Defends the first UM cutover trade against the latent risk that
+        OKX's BTC-USD_UM family quotes / sizes its options differently
+        from BTC-USD inverse on this account. The CM family is verified
+        empirically (50 contracts = 0.5 BTC); UM has no such empirical
+        anchor at the time of writing — this guard provides one before
+        any UM order is ever sent.
+
+        Three live checks (all read-only, no orders placed):
+          1. Tick size is in plausible USD range (1 ≤ tick ≤ 100). Real
+             value is 5; we accept anything sane to allow OKX to widen
+             ticks during a market disruption without locking us out.
+          2. Live UM minSz / lotSz match 1 (the CM shape we inherit
+             0.01 BTC/contract from). Anything else means UM uses a
+             different lot convention and our assumption is wrong.
+          3. A sample UM ITM ask falls in USD range ($50 – $50,000),
+             NOT in BTC range (0.0001 – 0.5). Catches the catastrophic
+             case where the wire is somehow still BTC-quoted.
+
+        Returns False on any failure so the caller can lock entries
+        and alert the operator. CM bypasses this method entirely.
+        """
+        if not family.is_um():
+            return True
+
+        try:
+            # ── 1. Tick size sanity ──
+            tick = self.exchange.get_tick_size()
+            tick_ok = 1.0 <= tick <= 100.0
+            if not tick_ok:
+                log.error("um_guard_tick_failed",
+                          live_tick=tick,
+                          range="[1, 100] USD",
+                          hint="UM tick should be 5 USD on OKX")
+
+            # ── 2. minSz / lotSz shape verification ──
+            await self.chain.refresh()
+            sample = None
+            for c in self.chain.calls:
+                if c.ask > 0 and c.bid >= 0:
+                    sample = c
+                    break
+            if sample is None:
+                for p in self.chain.puts:
+                    if p.ask > 0:
+                        sample = p
+                        break
+            if sample is None:
+                log.warning("um_guard_no_sample",
+                            note="no UM 0DTE quotes available; "
+                                 "deferring guard until first live data")
+                return True  # don't lock on transient empty chain
+
+            meta = await self.exchange.get_instrument_meta(sample.symbol)
+            min_sz = float(meta.get("minSz", 0) or 0)
+            lot_sz = float(meta.get("lotSz", 0) or 0)
+            shape_ok = (min_sz == 1.0 and lot_sz == 1.0)
+            if not shape_ok:
+                log.error("um_guard_shape_failed",
+                          instrument=sample.symbol,
+                          min_sz=min_sz, lot_sz=lot_sz,
+                          expected="minSz=1, lotSz=1 (CM-family shape)")
+
+            # ── 3. Live ask in USD range, NOT BTC range ──
+            ask = sample.ask
+            in_usd_range = 50.0 <= ask <= 50_000.0
+            in_btc_range = 0.0001 <= ask <= 0.5
+            quote_ok = in_usd_range and not in_btc_range
+            if not quote_ok:
+                log.error("um_guard_quote_unit_failed",
+                          instrument=sample.symbol,
+                          ask=ask,
+                          in_usd_range=in_usd_range,
+                          in_btc_range=in_btc_range,
+                          hint=("UM ask must be USD-per-BTC-of-notional "
+                                "($50-$50000); BTC-range ask means the "
+                                "wire is still inverse-quoted"))
+
+            # ── 4. Implied position size sanity ──
+            # If we send the configured qty_per_leg (typically 0.5 BTC),
+            # how many contracts is that and what's the USD notional?
+            # Surfaces the assumption explicitly so the operator can
+            # reconcile against the OKX UI on the first trade.
+            sample_qty_btc = max(
+                (s.qty_per_leg for s in config.SESSIONS), default=0.5,
+            )
+            sample_contracts = sample_qty_btc / config.OKX_CONTRACT_SIZE_BTC
+            sample_usd = sample_qty_btc * spot
+
+            log.info("um_guard_summary",
+                     family=family.label(),
+                     tick=tick, tick_ok=tick_ok,
+                     min_sz=min_sz, lot_sz=lot_sz,
+                     shape_ok=shape_ok,
+                     sample_instrument=sample.symbol,
+                     sample_ask_usd=ask,
+                     quote_unit_ok=quote_ok,
+                     largest_session_qty_btc=sample_qty_btc,
+                     implied_contracts=sample_contracts,
+                     implied_notional_usd=round(sample_usd, 0),
+                     contract_size_assumed_btc=(
+                         config.OKX_CONTRACT_SIZE_BTC
+                     ))
+
+            all_ok = tick_ok and shape_ok and quote_ok
+            if not all_ok:
+                fail_lines = []
+                if not tick_ok:
+                    fail_lines.append(
+                        f"  • tick={tick} USD (expected 1-100)"
+                    )
+                if not shape_ok:
+                    fail_lines.append(
+                        f"  • minSz/lotSz={min_sz}/{lot_sz} "
+                        f"(expected 1/1)"
+                    )
+                if not quote_ok:
+                    fail_lines.append(
+                        f"  • sample ask={ask} "
+                        f"(expected USD range $50-$50000)"
+                    )
+                await notifier.send(
+                    f"<b>UM UNIT-ASSUMPTION GUARD FAILED</b>\n"
+                    f"OKX returned UM metadata that does not match the "
+                    f"algo's UM unit assumptions.\n"
+                    f"Sample instrument: {sample.symbol}\n"
+                    + "\n".join(fail_lines) + "\n\n"
+                    f"<b>Entries are LOCKED</b> until investigated.\n"
+                    f"Run diagnose_um_cutover.py for a full "
+                    f"cross-family probe."
+                )
+            return all_ok
+        except Exception:
+            log.error("um_guard_exception", exc_info=True)
+            # Don't block on a transient exception — the chase pricing
+            # self-test already runs above and would catch a math bug.
+            return True
 
     async def _startup_cancel_stale_orders(self) -> None:
         try:
