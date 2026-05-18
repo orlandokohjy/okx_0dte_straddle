@@ -435,11 +435,20 @@ class OKXExchange:
 
     async def get_tickers_for_underlying(
         self, underlying: str,
+        inst_family: str = "",
     ) -> dict[str, Ticker]:
-        """Bulk fetch all option tickers for an underlying (e.g. BTC-USD)."""
+        """Bulk fetch option tickers, optionally filtered by ``instFamily``.
+
+        OKX shares ``uly=BTC-USD`` between CM and UM, so the discriminator
+        is ``instFamily`` (``BTC-USD`` for CM, ``BTC-USD_UM`` for UM). When
+        a caller passes both, ``instFamily`` is the authoritative filter.
+        Pre-2026-05-18 callers passed ``underlying="BTC-USD_UM"`` thinking
+        it was the family selector — that path returns 0 rows on OKX.
+        """
         resp = await self._call(
             self._market.get_tickers,
             instType="OPTION", uly=underlying,
+            instFamily=inst_family,
         )
         rows = self._data_or_empty(resp)
         out: dict[str, Ticker] = {}
@@ -505,26 +514,38 @@ class OKXExchange:
         Read the live tick size for the active option family from OKX and
         update self._default_option_tick. Returns the tick size in use.
 
-        We query the full instrument list for instType=OPTION+uly=<family>
-        and pick the most-common tickSz. OKX BTC options share a common
-        tick across strikes within each family (CM=0.0001 BTC, UM=5 USD),
-        so any sample is fine.
+        We query /api/v5/public/instruments with the family-specific
+        ``instFamily`` (BTC-USD for CM, BTC-USD_UM for UM) and pick the
+        most-common tickSz. OKX BTC options share a common tick across
+        strikes within each family (CM=0.0001 BTC, UM=5 USD), so any
+        sample is fine.
+
+        IMPORTANT — both families share ``uly=BTC-USD``. The CM/UM
+        discriminator is ``instFamily``, not ``uly``. Querying
+        ``uly=BTC-USD_UM`` returns ``code=51014 "Index doesn't exist."``
+        (regression hit 2026-05-18 during the UM cutover diagnostic).
         """
         underlying = sample_underlying or family.underlying()
+        inst_family = family.instfamily()
         try:
             resp = await self._call(
                 self._public.get_instruments,
-                instType="OPTION", uly=underlying,
+                instType="OPTION",
+                uly=underlying,
+                instFamily=inst_family,
             )
         except Exception:
             log.warning("prime_tick_failed",
-                        underlying=underlying, exc_info=True)
+                        underlying=underlying,
+                        inst_family=inst_family,
+                        exc_info=True)
             return self._default_option_tick
 
         rows = self._data_or_empty(resp)
         if not rows:
             log.warning("prime_tick_empty",
                         underlying=underlying,
+                        inst_family=inst_family,
                         fallback=self._default_option_tick)
             return self._default_option_tick
 
@@ -630,6 +651,7 @@ class OKXExchange:
         log.info("instrument_meta_primed",
                  family=family.label(),
                  underlying=underlying,
+                 inst_family=inst_family,
                  total_rows=len(rows),
                  option_rows=option_rows,
                  tick_size=self._default_option_tick,

@@ -48,16 +48,26 @@ class OptionChain:
         """
         Fetch all BTC 0DTE option tickers in a single bulk call.
         Returns the total number of 0DTE instruments found.
+
+        OKX shares ``uly=BTC-USD`` between CM and UM. We always query
+        with the family-specific ``instFamily`` (BTC-USD for CM,
+        BTC-USD_UM for UM) so OKX filters server-side. The instId
+        prefix check is kept as a belt-and-suspenders client-side
+        guard in case OKX ever changes that semantic.
         """
         expiry_str = today_expiry_instid_str()
         underlying = family.underlying()
+        inst_family = family.instfamily()
         expected_quote = family.quote_token()
         self.calls.clear()
         self.puts.clear()
 
-        tickers = await self._exchange.get_tickers_for_underlying(underlying)
+        tickers = await self._exchange.get_tickers_for_underlying(
+            underlying, inst_family=inst_family,
+        )
         if not tickers:
             log.warning("no_tickers_for_underlying", uly=underlying,
+                        inst_family=inst_family,
                         family=family.label())
             return 0
 
@@ -97,5 +107,6 @@ class OptionChain:
         total = len(self.calls) + len(self.puts)
         log.info("chain_refreshed", expiry=expiry_str,
                  family=family.label(), uly=underlying,
+                 inst_family=inst_family,
                  calls=len(self.calls), puts=len(self.puts), total=total)
         return total

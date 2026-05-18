@@ -5,14 +5,28 @@ Runs from the VPS BEFORE flipping OPTION_FAMILY=UM. Verifies — without
 placing a single order — that the algo's UM unit assumptions agree with
 what OKX returns over the wire:
 
-    1.  UM family lists 0DTE BTC options at all (uly=BTC-USD_UM).
+    1.  UM family lists 0DTE BTC options at all
+        (instType=OPTION + instFamily=BTC-USD_UM).
     2.  Tick size is 5 USD (matches family.default_tick() for UM).
     3.  Contract size assumption (0.01 BTC per contract) is consistent
-        with the live minSz/lotSz returned for at least one ITM option.
+        with the live ctVal × ctMult returned for at least one ITM option.
     4.  UM premium quotes are in USD-per-BTC-of-notional, NOT BTC.
-        (Cross-family probe: UM_ask / spot ≈ CM_ask within tolerance.)
+        (Cross-family probe: UM_mark ≈ CM_mark × spot within tolerance.)
     5.  Account margin currency is USDT/USDC, not BTC. UM auto-borrowing
         BTC for an option position would defeat the entire migration.
+    6.  Simulated chase price stays inside the USD range (50..50,000)
+        and OUT of the BTC range (0.0001..0.5) — catches a unit-confusion
+        regression in the chase ladder.
+
+CRITICAL — OKX shares ``uly=BTC-USD`` between CM and UM. The actual
+discriminator is the ``instFamily`` field on /api/v5/public/instruments:
+
+    CM: instFamily="BTC-USD"
+    UM: instFamily="BTC-USD_UM"
+
+Querying ``uly=BTC-USD_UM`` returns ``code=51014 "Index doesn't exist."``
+(this script v1 hit that bug 2026-05-18). All UM-specific listing
+queries below pass ``instFamily=BTC-USD_UM`` for that reason.
 
 Output is a single PASS / FAIL verdict block at the end of the run.
 ANY single failure means the cutover is unsafe — do NOT flip the env
@@ -21,7 +35,11 @@ var until each check passes.
 Usage on the VPS::
 
     cd ~/okx_0dte_straddle
-    docker-compose run --rm algo python diagnose_um_cutover.py
+    docker-compose run --rm --entrypoint python algo diagnose_um_cutover.py
+
+(Note the ``--entrypoint python`` — without it, compose appends the
+script as args to the existing ``python main.py`` ENTRYPOINT and runs
+the live algo by accident.)
 
 The script does NOT require OPTION_FAMILY=UM to be set in the env —
 it queries both families directly so you can run it on the live CM
@@ -144,11 +162,16 @@ except Exception as e:
 # ── 2. UM instrument family exists ────────────────────────────────
 
 hdr("CHECK 2 — UM family lists 0DTE BTC options")
+# Both CM and UM share uly=BTC-USD on OKX. Pass instFamily=BTC-USD_UM
+# to get only the UM (linear, USD-settled) rows. Querying
+# uly=BTC-USD_UM returns code=51014 "Index doesn't exist."
 try:
-    r = public.get_instruments(instType="OPTION", uly="BTC-USD_UM")
+    r = public.get_instruments(
+        instType="OPTION", uly="BTC-USD", instFamily="BTC-USD_UM",
+    )
     um_rows = r.get("data") or []
     record("um_family_listed", len(um_rows) > 0,
-           f"{len(um_rows)} instruments under uly=BTC-USD_UM")
+           f"{len(um_rows)} instruments under instFamily=BTC-USD_UM")
     if not um_rows:
         sys.exit(3)
 except Exception as e:
@@ -285,8 +308,12 @@ um_strikes_near_spot = sorted(
     um_strikes, key=lambda s: abs(s - spot),
 )[:SAMPLE_STRIKES]
 
-# Pull CM listing for the same expiry
-cm_resp = public.get_instruments(instType="OPTION", uly="BTC-USD")
+# Pull CM listing for the same expiry. instFamily=BTC-USD pins us to the
+# inverse family (688 rows) and excludes the UM rows that would also be
+# returned by a bare uly=BTC-USD query (1162 rows).
+cm_resp = public.get_instruments(
+    instType="OPTION", uly="BTC-USD", instFamily="BTC-USD",
+)
 cm_rows = cm_resp.get("data") or []
 cm_puts_by_strike = {
     float(r["instId"].split("-")[3]): r
@@ -395,17 +422,27 @@ except Exception as e:
 # ── 6. Self-test: simulate a chase price round on a UM ITM put ────
 
 hdr("CHECK 6 — Simulated UM chase price stays in USD range")
+# Build a strike-keyed map of UM puts at the soonest expiry. The
+# previous version of this script referenced an undefined
+# ``um_strikes_for_expiry`` and would have NameError'd here had
+# CHECK 2 not failed first.
+um_puts_for_expiry = {
+    float(r["instId"].split("-")[3]): r
+    for r in um_today
+    if r.get("instId", "").endswith("-P")
+}
+
 um_itm_put = None
 for k in um_strikes_near_spot:
     if k > spot:  # ITM put: strike > spot
-        inst = um_strikes_for_expiry.get(k)
+        inst = um_puts_for_expiry.get(k)
         if inst:
             um_itm_put = inst
             break
 if um_itm_put is None and um_strikes_near_spot:
-    # Fallback: any UM put with valid quotes
+    # Fallback: any UM put close to spot with valid metadata
     for k in um_strikes_near_spot:
-        inst = um_strikes_for_expiry.get(k)
+        inst = um_puts_for_expiry.get(k)
         if inst:
             um_itm_put = inst
             break

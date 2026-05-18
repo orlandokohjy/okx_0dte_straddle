@@ -97,17 +97,45 @@ def display_name() -> str:
 
 # ──────────────────── Symbol / parsing ────────────────────────────
 #
-# OKX uly + instId conventions for the two families:
+# OKX uly + instFamily + instId conventions for the two families:
 #
-#     CM uly = "BTC-USD"      instId = "BTC-USD-{YYMMDD}-{STRIKE}-{C|P}"
-#     UM uly = "BTC-USD_UM"   instId = "BTC-USD_UM-{YYMMDD}-{STRIKE}-{C|P}"
+#     CM:   uly="BTC-USD"  instFamily="BTC-USD"
+#           instId = "BTC-USD-{YYMMDD}-{STRIKE}-{C|P}"
+#     UM:   uly="BTC-USD"  instFamily="BTC-USD_UM"
+#           instId = "BTC-USD_UM-{YYMMDD}-{STRIKE}-{C|P}"
 #
-# Both split into 5 dash-separated tokens because the underscore in
+# CRITICAL — ``uly`` is THE SAME for both families. OKX models linear
+# BTC options as a sub-family of the BTC-USD index. The discriminator
+# is the ``instFamily`` field on /api/v5/public/instruments, NOT the
+# ``uly`` query parameter. Querying ``uly=BTC-USD_UM`` returns
+# ``code=51014 "Index doesn't exist."`` (we hit this bug 2026-05-18
+# during the cutover diagnostic). Always query by ``instFamily`` for
+# family-specific results.
+#
+# instIds split into 5 dash-separated tokens because the underscore in
 # "USD_UM" is preserved (it's not a delimiter). The chain parser uses
-# ``quote_token()`` to filter rows to only this family's instruments.
+# ``quote_token()`` to filter rows by instId prefix.
 
 def underlying() -> str:
-    """The OKX ``uly`` field (also used as instId prefix root)."""
+    """The OKX ``uly`` query parameter — ``BTC-USD`` for BOTH families.
+
+    OKX shares the same index between CM and UM. Use ``instfamily()``
+    if you need the discriminator.
+    """
+    return "BTC-USD"
+
+
+def instfamily() -> str:
+    """The OKX ``instFamily`` field — the actual CM/UM discriminator.
+
+    CM: ``BTC-USD``
+    UM: ``BTC-USD_UM``
+
+    Pass this as the ``instFamily=`` query parameter to
+    /api/v5/public/instruments and /api/v5/market/tickers to filter
+    server-side. Falls back to client-side instId-prefix filtering if
+    the endpoint doesn't accept ``instFamily``.
+    """
     return "BTC-USD" if is_cm() else "BTC-USD_UM"
 
 
@@ -118,7 +146,7 @@ def quote_token() -> str:
 
 def instid_prefix() -> str:
     """Prefix every instrument id starts with ('BTC-USD-' or 'BTC-USD_UM-')."""
-    return f"{underlying()}-"
+    return "BTC-USD-" if is_cm() else "BTC-USD_UM-"
 
 
 # ──────────────────── Native units (tick / fee / fills) ───────────

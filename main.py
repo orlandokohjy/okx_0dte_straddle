@@ -248,6 +248,7 @@ class Algo:
                  option_family=family.label(),
                  option_family_display=family.display_name(),
                  option_family_underlying=family.underlying(),
+                 option_family_instfamily=family.instfamily(),
                  option_family_raw_env=family.RAW)
         if family.RAW and family.RAW != family.label():
             log.warning("option_family_alias_resolved",
