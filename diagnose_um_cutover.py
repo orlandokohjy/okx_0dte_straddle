@@ -69,7 +69,23 @@ domain = os.environ.get("OKX_DOMAIN", "https://www.okx.com")
 ASSUMED_CONTRACT_SIZE_BTC_UM = float(
     os.environ.get("OKX_CONTRACT_SIZE_BTC_UM", "0.01"),
 )
-ASSUMED_TICK_USD_UM = float(os.environ.get("OPTION_TICK_SIZE", "5"))
+# OKX's UM (linear, USD-margined) BTC option tick is exactly 5 USD across
+# all strikes/expiries. We pin the expected value rather than reading
+# OPTION_TICK_SIZE from env because:
+#   - env's OPTION_TICK_SIZE is family-shared and may carry a stale CM
+#     value (e.g. 0.0005 from a copied .env.example).
+#   - The algo overrides this at startup via prime_option_tick_size()
+#     which queries OKX live; the env value is only used as a transient
+#     fallback when the API is unreachable.
+# The OPTION_TICK_SIZE_UM env override is provided as an escape hatch
+# in case OKX changes the tick.
+EXPECTED_TICK_USD_UM = float(os.environ.get("OPTION_TICK_SIZE_UM", "5"))
+# Plausible UM tick range. Real value is 5; we accept 1-100 to allow
+# OKX to widen during market disruption without false-flagging the
+# diagnostic. Anything outside this range likely means we got CM data
+# (BTC tick = 0.0001) or a wrong instrument type back.
+UM_TICK_MIN = 1.0
+UM_TICK_MAX = 100.0
 
 # Cross-family check tolerance: UM_ask_usd / spot vs. CM_ask_btc. They
 # won't match exactly because the two books are independent makers,
@@ -139,8 +155,15 @@ kv("Run UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
 kv("OKX flag", f"{flag} ({'DEMO' if flag == '1' else 'LIVE'})")
 kv("OKX domain", domain)
 kv("Assumed UM contract size", f"{ASSUMED_CONTRACT_SIZE_BTC_UM} BTC")
-kv("Assumed UM tick size", f"${ASSUMED_TICK_USD_UM}")
+kv("Expected UM tick size", f"${EXPECTED_TICK_USD_UM} (range ${UM_TICK_MIN}-${UM_TICK_MAX})")
 kv("Cross-family tolerance", f"±{PRICE_AGREEMENT_TOLERANCE_PCT:.0%}")
+# Surface the env-var OPTION_TICK_SIZE so the operator sees if a stale
+# CM value is leaking in. Doesn't affect runtime — algo overrides via
+# OKX live query — but worth flagging for hygiene.
+env_tick = os.environ.get("OPTION_TICK_SIZE", "")
+if env_tick:
+    kv("Env OPTION_TICK_SIZE (info)",
+       f"{env_tick} (algo overrides via OKX live query)")
 
 
 # ── 1. Spot price ─────────────────────────────────────────────────
@@ -261,10 +284,22 @@ kv("Live UM ctMult (most common)", mc_ct_mult)
 kv("Effective size = ctVal × ctMult",
    f"{mc_effective} BTC per contract")
 
-# Tick should be 5 USD across the family
-tick_ok = abs(mc_tick - ASSUMED_TICK_USD_UM) < 0.01
-record("um_tick_5_usd", tick_ok,
-       f"live={mc_tick}, assumed={ASSUMED_TICK_USD_UM}")
+# Tick should be 5 USD across the family. We accept any value in the
+# plausible UM range [1, 100] USD so the diagnostic doesn't spuriously
+# fail if OKX widens ticks during a market disruption (the algo would
+# happily trade the wider tick anyway). A value outside this range
+# strongly suggests we got CM rows (BTC tick = 0.0001) instead.
+tick_in_range = UM_TICK_MIN <= mc_tick <= UM_TICK_MAX
+tick_matches_expected = abs(mc_tick - EXPECTED_TICK_USD_UM) < 0.01
+tick_ok = tick_in_range
+detail = (
+    f"live=${mc_tick} "
+    f"(expected ${EXPECTED_TICK_USD_UM}, accepted range "
+    f"${UM_TICK_MIN}-${UM_TICK_MAX})"
+)
+if tick_in_range and not tick_matches_expected:
+    detail += " — within range but not exactly the expected 5 USD"
+record("um_tick_in_usd_range", tick_ok, detail)
 
 # Contract-size verification: ctVal × ctMult is the EMPIRICAL BTC size
 # per contract. Both CM and UM return ctVal=1, ctMult=0.01 ⇒ 0.01 BTC.
