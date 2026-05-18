@@ -324,8 +324,9 @@ def _pnl_sign(x: float) -> str:
 def format_brief_period_block(m: PeriodMetrics) -> list[str]:
     """Rich 7-line summary for inline use in the daily report.
 
-    Suppresses the ``Saved vs taker`` line if no leg has recorded the
-    USD-correct value yet (e.g. backfill before the saved-vs-taker fix).
+    Suppresses the ``Maker P&L (vs initial taker)`` line if no leg has
+    recorded the USD-correct value yet (e.g. backfill before the
+    saved-vs-taker fix).
     """
     if m.total_trades == 0:
         return [
@@ -337,7 +338,8 @@ def format_brief_period_block(m: PeriodMetrics) -> list[str]:
         f"  Streaks: {m.max_win_streak}W max / {m.max_loss_streak}L max"
     )
     saved_line = (
-        f"  Saved vs taker: ${m.total_saved_vs_taker_usd:+,.2f}"
+        f"  Maker P&L (vs initial taker): "
+        f"${m.total_saved_vs_taker_usd:+,.2f}"
         if m.total_legs > 0 else ""
     )
     bw_line = (
@@ -397,7 +399,7 @@ def format_period_report(m: PeriodMetrics, *, header: str) -> str:
         exec_block = [
             "",
             "<b>Execution</b>",
-            f"  Total saved vs taker: "
+            f"  Total maker P&L (vs initial taker): "
             f"${m.total_saved_vs_taker_usd:+,.2f}",
             f"  Avg time to fill: {m.avg_fill_seconds:.1f}s",
             f"  Attempts: {m.total_attempts} across {m.total_legs} legs",

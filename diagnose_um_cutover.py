@@ -17,6 +17,17 @@ what OKX returns over the wire:
     6.  Simulated chase price stays inside the USD range (50..50,000)
         and OUT of the BTC range (0.0001..0.5) — catches a unit-confusion
         regression in the chase ladder.
+    7.  ACCOUNT-SIDE order acceptance: places a TINY (1 contract = ~$5
+        notional cap), deeply-mispriced ``post_only`` BUY on a UM put
+        and immediately cancels it. The fill itself never happens (the
+        price is set so far below market that no resting ask can match);
+        what we read off is OKX's ``sCode`` reply on the place_order
+        call — the same one the live algo will see on its first real
+        UM entry. This is the check that would have caught
+        ``sCode=51008 "Insufficient USD balance"`` and
+        ``sCode=51019 "No net long under cross"`` BEFORE the 21:30 SGT
+        cutover on 2026-05-18 instead of at the live entry.
+        Opt out by setting ``DIAGNOSTIC_SKIP_ORDER_TEST=true``.
 
 CRITICAL — OKX shares ``uly=BTC-USD`` between CM and UM. The actual
 discriminator is the ``instFamily`` field on /api/v5/public/instruments:
@@ -125,6 +136,7 @@ try:
     from okx.MarketData import MarketAPI
     from okx.PublicData import PublicAPI
     from okx.Account import AccountAPI
+    from okx.Trade import TradeAPI
 except ImportError:
     print(f"{FAIL} python-okx not installed. Run inside the algo container.")
     sys.exit(2)
@@ -133,6 +145,17 @@ market = MarketAPI(flag=flag, domain=domain, debug=False)
 public = PublicAPI(flag=flag, domain=domain, debug=False)
 account = AccountAPI(api_key, api_secret, passphrase, False,
                      flag=flag, domain=domain, debug=False)
+trade = TradeAPI(api_key, api_secret, passphrase, False,
+                 flag=flag, domain=domain, debug=False)
+
+# tdMode the live algo would use after flipping OPTION_FAMILY=UM.
+# Default matches config.py (isolated). CHECK 7 mirrors this so we
+# detect tdMode-incompatibility (e.g. cross + net-long error 51019)
+# before the operator flips the family in production.
+TD_MODE = os.environ.get("OKX_TD_MODE", "isolated").strip().lower()
+SKIP_ORDER_TEST = os.environ.get(
+    "DIAGNOSTIC_SKIP_ORDER_TEST", "",
+).strip().lower() in ("1", "true", "yes")
 
 
 # ───────────────────────── Result tracking ─────────────────────────
@@ -157,6 +180,10 @@ kv("OKX domain", domain)
 kv("Assumed UM contract size", f"{ASSUMED_CONTRACT_SIZE_BTC_UM} BTC")
 kv("Expected UM tick size", f"${EXPECTED_TICK_USD_UM} (range ${UM_TICK_MIN}-${UM_TICK_MAX})")
 kv("Cross-family tolerance", f"±{PRICE_AGREEMENT_TOLERANCE_PCT:.0%}")
+kv("Active OKX_TD_MODE", TD_MODE)
+kv("Order test (CHECK 7)",
+   "SKIPPED via DIAGNOSTIC_SKIP_ORDER_TEST" if SKIP_ORDER_TEST
+   else "ENABLED — places + cancels 1 contract post_only buy")
 # Surface the env-var OPTION_TICK_SIZE so the operator sees if a stale
 # CM value is leaking in. Doesn't affect runtime — algo overrides via
 # OKX live query — but worth flagging for hygiene.
@@ -517,6 +544,157 @@ else:
         else:
             record("um_chase_simulation", False,
                    "no valid bid/ask on sample")
+
+
+# ── 7. Account-side acceptance: place + cancel a tiny UM order ────
+#
+# All previous checks are read-only. They cannot detect failures that
+# only surface when an order is actually sent to OKX:
+#
+#   sCode=51008 "Insufficient USD balance"
+#         → account holds USDT but isolated UM linear options
+#           require USD/USDC collateral (no auto-conversion).
+#   sCode=51019 "No net long positions under cross margin"
+#         → cross margin mode forbids long options outright. A long
+#           straddle cannot run in cross mode at all.
+#
+# We hit BOTH of these on the 2026-05-18 cutover at the live 21:30 SGT
+# entry. The earlier 9-check diagnostic returned 9/9 PASS minutes
+# before but never tried the order path. CHECK 7 closes that gap by
+# placing a deliberately un-fillable ``post_only`` BUY and reading the
+# OKX response.
+#
+# Safety design:
+#   - 1 contract sz (= 0.01 BTC notional, the minimum on UM).
+#   - Buy a deep-OTM put (strike ≪ spot, so any ask is ≥ tens of $)
+#     at price = 1 tick (~$5). The book will never have a $5 ask, so
+#     post_only sits in the back of the queue. Even in the worst case
+#     of a freak match, max loss = $5 × 0.01 BTC = $0.05.
+#   - Always cancel by ordId, even if place_order failed.
+#   - Skip the place_order entirely under DIAGNOSTIC_SKIP_ORDER_TEST=true.
+
+hdr("CHECK 7 — UM order acceptance (place + cancel a tiny post_only BUY)")
+kv("Active tdMode under test", TD_MODE)
+
+if SKIP_ORDER_TEST:
+    record("um_order_acceptance", False,
+           "skipped via DIAGNOSTIC_SKIP_ORDER_TEST=true — "
+           "rerun without the flag before flipping OPTION_FAMILY=UM")
+elif TD_MODE not in ("isolated", "cross"):
+    record("um_order_acceptance", False,
+           f"OKX_TD_MODE={TD_MODE!r} is invalid (must be 'isolated' or "
+           f"'cross'). Fix .env before running this check.")
+else:
+    # Pick a deeply-OTM UM put for the test. ITM and ATM puts have asks
+    # in the hundreds of dollars; deep-OTM puts have asks in the tens
+    # of dollars. Either way, our $5 buy will never match.
+    deep_otm_strikes = [s for s in um_strikes if s < spot * 0.85]
+    if not deep_otm_strikes:
+        # Fallback: any UM put at the soonest expiry will do — the
+        # post_only $5 buy will not fill regardless of moneyness.
+        deep_otm_strikes = [s for s in um_strikes if s != spot]
+
+    test_inst_id = None
+    if deep_otm_strikes:
+        target = max(deep_otm_strikes)
+        for r in um_today:
+            inst_id = r.get("instId", "")
+            if not inst_id.endswith("-P"):
+                continue
+            try:
+                if abs(float(inst_id.split("-")[3]) - target) < 1e-6:
+                    test_inst_id = inst_id
+                    break
+            except (ValueError, IndexError):
+                continue
+
+    if test_inst_id is None:
+        record("um_order_acceptance", False,
+               "no deeply-OTM UM put found to test — re-run during "
+               "active hours with a populated chain")
+    else:
+        # 1 contract × $5 (one tick) post_only BUY. Max risk: $0.05 if
+        # somehow filled (the ask floor is tens of $).
+        test_px = str(EXPECTED_TICK_USD_UM)
+        kv("Test instrument", test_inst_id)
+        kv("Test order", f"BUY 1 contract @ ${test_px} (post_only, "
+           f"tdMode={TD_MODE})")
+        ord_id = ""
+        s_code = ""
+        s_msg = ""
+        try:
+            resp = trade.place_order(
+                instId=test_inst_id,
+                tdMode=TD_MODE,
+                side="buy",
+                ordType="post_only",
+                sz="1",
+                px=test_px,
+            )
+            outer_code = str(resp.get("code") or "")
+            outer_msg = resp.get("msg") or ""
+            rows = (resp.get("data") or []) if isinstance(resp, dict) else []
+            if rows:
+                r0 = rows[0]
+                ord_id = str(r0.get("ordId") or "")
+                s_code = str(r0.get("sCode") or "")
+                s_msg = str(r0.get("sMsg") or "")
+            else:
+                s_code = outer_code or "no_data"
+                s_msg = outer_msg
+            kv("place_order outer code/msg", f"{outer_code} / {outer_msg}")
+            kv("place_order inner sCode/sMsg", f"{s_code} / {s_msg}")
+            if ord_id:
+                kv("Order id", ord_id)
+        except Exception as e:
+            s_code = "exception"
+            s_msg = repr(e)
+            kv("place_order exception", s_msg)
+
+        # Always try to cancel by ordId, even if place "failed" — some
+        # error codes still leave a resting order. Idempotent.
+        if ord_id:
+            try:
+                cancel_resp = trade.cancel_order(
+                    instId=test_inst_id, ordId=ord_id,
+                )
+                cancel_rows = (cancel_resp.get("data") or []
+                               if isinstance(cancel_resp, dict) else [])
+                cancel_inner = cancel_rows[0] if cancel_rows else {}
+                kv("cancel_order sCode/sMsg",
+                   f"{cancel_inner.get('sCode', '?')} / "
+                   f"{cancel_inner.get('sMsg', '?')}")
+            except Exception as e:
+                # Don't FAIL the check on a cancel exception — the
+                # important signal is whether the place succeeded. The
+                # operator should still inspect the OKX UI for a stuck
+                # order if cancel raised.
+                kv("cancel_order exception", repr(e))
+                print(f"  {WARN} Cancel raised — verify no stuck order "
+                      f"on OKX UI for {test_inst_id}.")
+
+        if s_code == "0":
+            record("um_order_acceptance", True,
+                   f"place_order accepted (sCode=0, tdMode={TD_MODE}); "
+                   f"order cancelled.")
+        else:
+            # Surface the most-likely-cause cheat sheet inline so the
+            # operator doesn't have to look up the code.
+            hint = ""
+            if s_code == "51008":
+                hint = (" — account holds USDT but UM linear options "
+                        "in isolated mode require USD/USDC collateral. "
+                        "Convert USDT→USDC on OKX (instant, zero-fee) "
+                        "OR set OKX_TD_MODE=cross (but see 51019 first).")
+            elif s_code == "51019":
+                hint = (" — cross margin mode forbids net-long options. "
+                        "Long straddles MUST run with OKX_TD_MODE=isolated. "
+                        "If isolated then fails 51008, convert USDT→USDC.")
+            elif s_code == "51000":
+                hint = (" — invalid parameter. Inspect tdMode/sz/px above.")
+            record("um_order_acceptance", False,
+                   f"place_order rejected: sCode={s_code} "
+                   f"(\"{s_msg}\"), tdMode={TD_MODE}{hint}")
 
 
 # ───────────────────────── Verdict ─────────────────────────────────

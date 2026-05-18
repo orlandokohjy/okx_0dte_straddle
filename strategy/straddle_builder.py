@@ -54,7 +54,10 @@ def _format_leg_fill_message(
     open, "exit" for sells at the close). The metrics dict is produced by
     core.exchange._build_fill_metrics; we surface the five numbers that
     matter most to a desk: avg fill, slippage vs mark, time to fill,
-    attempts, and dollars saved vs taker.
+    attempts, and "Maker P&L (vs initial taker)" — the USD difference
+    between the final maker fill and what a taker order at the START of
+    the chase would have paid. Negative values mean the chase ended up
+    costing more than just taking the initial offer.
 
     Native price formatting depends on the active family:
         CM → "0.0035 BTC"
@@ -66,7 +69,14 @@ def _format_leg_fill_message(
     slip = float(metrics.get("slippage_vs_mark_pct", 0) or 0)
     duration = float(metrics.get("duration_sec", 0) or 0)
     attempts = int(metrics.get("attempts", 0) or 0)
-    saved_usd = float(metrics.get("saved_vs_taker_total_usd", 0) or 0)
+    # `saved_vs_taker_total_usd` compares the final maker fill against
+    # the taker price *captured at chase START* (ref_ask for buys,
+    # ref_bid for sells). Negative values mean the chase paid MORE than
+    # if we had taken the initial offer immediately — i.e. the market
+    # drifted away from us during the chase window. Surface as
+    # "Maker P&L vs initial taker" so the operator doesn't mistake it
+    # for a comparison against the *current* taker price.
+    chase_pnl_usd = float(metrics.get("saved_vs_taker_total_usd", 0) or 0)
     fully = bool(result.get("fully_filled", True))
     qty_btc = float(result.get("filled_qty_btc", 0) or 0)
 
@@ -80,8 +90,9 @@ def _format_leg_fill_message(
     )
     timing_line = f"Time to fill: {duration:.1f}s, attempts: {attempts}"
     saved_line = (
-        f"Saved vs taker: ${saved_usd:+.2f}"
-        if saved_usd != 0 else "Saved vs taker: $0.00"
+        f"Maker P&L (vs initial taker): ${chase_pnl_usd:+.2f}"
+        if chase_pnl_usd != 0
+        else "Maker P&L (vs initial taker): $0.00"
     )
     qty_line = f"Filled qty: {qty_btc:.4f} BTC"
     fully_line = "" if fully else "  ⚠️ PARTIAL"
@@ -382,8 +393,16 @@ async def build_straddle(
         )
 
     # ── Register ──
-    # straddle_cost is in OKX-native units (BTC for CM, USD for UM).
-    # Portfolio renderers convert to USD via Straddle helpers.
+    # straddle_cost is in OKX-native units per straddle:
+    #   CM (inverse) → BTC of premium per straddle
+    #   UM (linear)  → USD of premium per straddle
+    # Portfolio renderers convert to USD via family-aware Straddle helpers,
+    # so this stays the source-of-truth value the rest of the system
+    # consumes. The "cost" log line below is for human eyes only and is
+    # converted to USD via family.native_premium_to_usd so the operator
+    # never sees a misleading "$0.01" for a CM trade (regression caught
+    # 2026-05-18: a 0.5 BTC × 0.0085 BTC/BTC straddle was being printed
+    # as "$0.01" because BTC was being formatted with a $ prefix).
     straddle_cost = qty_per_leg * (call_fill + put_fill)
 
     # Capture spot if caller didn't provide it (rare path).
@@ -409,11 +428,28 @@ async def build_straddle(
         family=family.label(),
     )
     portfolio.set_straddle(straddle)
+
+    # Total premium paid across all N straddles, converted to USD for the
+    # log line. CM: native is BTC → USD via spot. UM: native is already
+    # USD → spot is a no-op. If spot is unavailable on a CM run we fall
+    # back to a "n/a" string rather than printing a wrong dollar value.
+    total_cost_usd = family.native_premium_to_usd(
+        call_fill + put_fill,
+        qty_per_leg * num_straddles,
+        entry_spot,
+    )
+    if total_cost_usd > 0:
+        cost_str = f"${total_cost_usd:,.2f}"
+    else:
+        cost_str = (f"n/a (spot=0, native={straddle_cost * num_straddles:.4f} "
+                    f"{family.native_quote_unit_label()})")
     log.info("straddle_built", id=straddle_id, session=session_name,
              num=num_straddles,
-             cost=f"${straddle_cost * num_straddles:,.2f}",
+             cost=cost_str,
              call=call_fill, put=put_fill, strike=pair.strike,
-             spot=entry_spot)
+             spot=entry_spot,
+             family=family.label(),
+             unit=family.native_quote_unit_label())
     return straddle
 
 

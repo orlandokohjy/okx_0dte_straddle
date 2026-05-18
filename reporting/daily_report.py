@@ -595,7 +595,7 @@ def _format_exec_block(
         f"    Mark at start: ${ref_mark_usd:,.2f} -> Fill: ${fill:,.2f}",
         f"    Slippage vs mark: {e.slippage_vs_mark_pct:+.2f}%",
         f"    {quote_label} at start: ${ref_quote_usd:,.2f}  "
-        f"Saved vs taker: ${e.saved_vs_taker_usd:+,.2f}",
+        f"Maker P&L (vs initial taker): ${e.saved_vs_taker_usd:+,.2f}",
     ]
 
 
@@ -633,7 +633,7 @@ def _format_leg_compact(
         f"      Mark at start: ${ref_mark_usd:,.2f} -> Fill: ${fill_usd:,.2f}"
         f"  (slip {e.slippage_vs_mark_pct:+.2f}%)",
         f"      {quote_label} at start: ${ref_quote_usd:,.2f}  "
-        f"Saved vs taker: ${e.saved_vs_taker_usd:+,.2f}",
+        f"Maker P&L (vs initial taker): ${e.saved_vs_taker_usd:+,.2f}",
     ]
 
 
@@ -738,7 +738,7 @@ def _format_execution_quality(m: DailyMetrics) -> list[str]:
         )
         blocks.append(f"  Avg slippage vs mark: {avg_slip:+.2f}%")
         blocks.append(
-            f"  Total saved vs taker: ${total_saved:+,.2f}"
+            f"  Total maker P&L (vs initial taker): ${total_saved:+,.2f}"
         )
 
     return blocks
