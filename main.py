@@ -61,7 +61,19 @@ log = structlog.get_logger(__name__)
 
 
 def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
-    """Rewrite ENTRY_NOW=true to ENTRY_NOW=false in the local .env file."""
+    """Rewrite any "live" ENTRY_NOW value to ``false`` in the local .env.
+
+    Catches every form the algo accepts as a fire trigger:
+      - ``true`` / ``True`` / ``TRUE`` / ``1`` / ``yes``  (legacy boolean)
+      - ``afternoon`` / ``morning``                       (session-name)
+    Anything matching ``false`` / ``0`` / ``no`` / blank is left alone.
+
+    History: the original regex only caught the boolean form, so a
+    ``ENTRY_NOW=afternoon`` value would survive across container
+    restarts and silently re-fire the entry every time the algo came
+    back up. Caught 2026-05-19 after the user used the session-name
+    form during the UM cutover dry-run.
+    """
     try:
         if not os.path.exists(env_path):
             log.debug("entry_now_disable_skipped", reason="no_env_file")
@@ -69,7 +81,10 @@ def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
         with open(env_path, "r") as f:
             content = f.read()
         new_content = re.sub(
-            r"^(\s*ENTRY_NOW\s*=\s*)(true|TRUE|True|1)\b.*$",
+            r"^(\s*ENTRY_NOW\s*=\s*)"
+            r"(true|TRUE|True|1|yes|YES|Yes|"
+            r"afternoon|AFTERNOON|Afternoon|"
+            r"morning|MORNING|Morning)\b.*$",
             r"\1false",
             content,
             flags=re.MULTILINE,
