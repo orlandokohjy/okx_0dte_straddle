@@ -1,41 +1,70 @@
 """
-Force-liquidate a single OKX option position to flat.
+Force-flatten OKX option positions and cancel pending orders.
 
-Designed as an OPERATOR EMERGENCY TOOL — NOT to be run while the live
-algo container is up. The chase_sell loop in the live algo polls its
-own order every 5s and would reprice into a new order; if this script
-runs in parallel, you risk going SHORT after the script's manual sell
-fills (the algo's new order can fill afterwards as the buyer side).
+OPERATOR EMERGENCY PANIC-BUTTON. Designed for the case where the live
+algo's auto-recovery is stuck (e.g. tier-tick rounding making chase_sell
+ineffective, or a partial fill that exceeded the chase deadline) and
+the operator needs to MANUALLY restore flat state before letting the
+algo run again.
 
-Required workflow:
-    1. docker-compose stop algo            # release the chase_sell loop
-    2. python tools/force_liquidate.py <SYMBOL>
-    3. docker-compose start algo           # startup_reconcile will see flat
+CRITICAL: must be run with the live algo STOPPED:
 
-The script:
-    a. Cancels every open order on the symbol (algo's resting orders + any
-       leftovers from manual UI clicks).
-    b. Reads the actual exchange position size.
-    c. Places a TAKER limit sell at the live bid for the full position
-       (or a limit buy at the ask if the position is short — handles
-       both directions).
-    d. Polls until position == 0 or 60s elapses.
-    e. Cancels any leftover orders and prints a final status.
+    docker-compose stop algo
 
-Usage:
+Running this script while the algo container is up creates a race: the
+algo's chase_sell loop polls every 5s and may place a NEW maker sell
+right after this script's taker sell fills, potentially flipping the
+operator into an unintended SHORT position.
+
+The script refuses to run if it detects the algo's lock file
+(state/algo.pid) is held — pass --force to override (NOT recommended).
+
+USAGE
+-----
+
+    # Flatten ALL option positions + cancel ALL option orders (default)
+    python tools/force_liquidate.py
+
+    # Surgical: single symbol only
     python tools/force_liquidate.py BTC-USD-260521-77250-P
+
+    # Preview without placing orders
+    python tools/force_liquidate.py --dry-run
     python tools/force_liquidate.py BTC-USD-260521-77250-P --dry-run
 
-Tick-tier note: if the symbol is a CM BTC option above 0.005 BTC,
-OKX rounds price submissions to the nearest 0.0005-tick. This script
-intentionally crosses the spread (sells at the BID for a long
-position, buys at the ASK for a short position) so the order will
-take liquidity instantly and tick rounding doesn't matter.
+    # Override the lock-file safety check (only if you KNOW the algo is
+    # really stopped, e.g. the lock file is stale from a crashed run)
+    python tools/force_liquidate.py --force
+
+BEHAVIOUR (per call)
+--------------------
+    A. Refuse to run if state/algo.pid is held by a live process.
+    B. Discover all live OKX option positions + all pending option orders
+       (filtered by the active OPTION_FAMILY: CM or UM).
+    C. Print a plan summary.
+    D. Cancel every open order on every targeted instrument.
+    E. For each non-zero position:
+         * Long  → place TAKER limit SELL at the live BID (crosses the spread)
+         * Short → place TAKER limit BUY  at the live ASK
+       Crossing the spread sidesteps tier-tick rounding (any tier tick we
+       round to is still inside the book) and guarantees a near-instant fill.
+    F. Poll up to 60 s per instrument for confirmation of zero position.
+    G. Final cancel sweep + summary print.
+
+EXIT CODES
+----------
+    0  flat across all targeted instruments — algo can be restarted safely
+    2  no OKX credentials in env
+    3  lock file held by a live PID (pass --force to override)
+    4  position fetch failed (network/auth)
+    5  order placement failed for at least one instrument
+    6  timeout — at least one instrument still has live position after 60 s
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -44,83 +73,127 @@ sys.path.insert(0, str(ROOT))
 
 import config
 from core.exchange import OKXExchange
-from utils.logger import log
 
 
-async def _liquidate(symbol: str, *, dry_run: bool) -> int:
-    """Returns 0 on flat success, non-zero on failure."""
-    if not config.HAS_OKX_CREDS:
-        print("[force_liquidate] No OKX credentials configured. Aborting.")
-        return 2
+def _check_lock(force: bool) -> int:
+    """Refuse to run if state/algo.pid is held by a live process.
 
-    exchange = OKXExchange()
-    exchange.connect()
+    The algo writes its PID to state/algo.pid via _acquire_singleton_lock
+    in main.py. Running this script while the algo is up causes a race
+    against the chase_sell reprice loop. Returns 0 if safe to proceed,
+    3 if the lock is held and --force was not passed.
+    """
+    lock_path = f"{config.STATE_DIR}/algo.pid"
+    if not os.path.exists(lock_path):
+        return 0
+    try:
+        with open(lock_path, "r") as f:
+            pid = int((f.read() or "0").strip())
+    except Exception:
+        pid = 0
+    if pid <= 0:
+        if force:
+            return 0
+        print(
+            f"[force_liquidate] lock file {lock_path} exists but is empty "
+            "or unreadable. Pass --force to override."
+        )
+        return 3
+    # Probe the PID. We're typically running OUTSIDE the container so the
+    # PID space is the host's; the algo's PID 1 inside the container won't
+    # exist on the host. We treat "PID does not exist on this host" as
+    # ambiguous — warn but proceed. The DEFINITIVE check is whether you
+    # ran `docker-compose stop algo`.
+    try:
+        os.kill(pid, 0)
+        pid_alive = True
+    except (ProcessLookupError, PermissionError):
+        pid_alive = False
+    except Exception:
+        pid_alive = False
 
+    if pid_alive and not force:
+        print(
+            f"[force_liquidate] LOCK HELD: {lock_path} → pid={pid} is alive "
+            "on this host. Refusing to run.\n"
+            "   ACTION: docker-compose stop algo\n"
+            "   THEN re-run this script.\n"
+            "   (or pass --force if you are CERTAIN the algo is stopped)"
+        )
+        return 3
+    if pid_alive and force:
+        print(
+            f"[force_liquidate] WARN: lock {lock_path} held by pid={pid} but "
+            "--force given. Proceeding (race-condition risk)."
+        )
+        return 0
+    print(
+        f"[force_liquidate] note: lock file {lock_path} present but pid={pid} "
+        "is not visible on this host. Likely stale or container-internal. "
+        "Proceeding."
+    )
+    return 0
+
+
+async def _flatten_one(
+    exchange: OKXExchange,
+    symbol: str,
+    *,
+    dry_run: bool,
+) -> tuple[bool, str]:
+    """Flatten a single instrument. Returns (success, status_line)."""
     # ── A) cancel any open orders on this symbol ──
     try:
-        cleared = await exchange.cancel_orders_for_instrument(symbol)
-        print(f"[force_liquidate] cancelled {cleared} open order(s) on {symbol}")
+        cancelled = await exchange.cancel_orders_for_instrument(symbol)
     except Exception as exc:
-        print(f"[force_liquidate] cancel failed: {exc}")
-        return 3
+        return False, f"{symbol}: cancel-orders failed: {exc}"
+    if cancelled > 0:
+        print(f"  [{symbol}] cancelled {cancelled} open order(s)")
 
     # ── B) read actual exchange position ──
     try:
         positions = await exchange.list_open_positions()
     except Exception as exc:
-        print(f"[force_liquidate] position fetch failed: {exc}")
-        return 4
-
+        return False, f"{symbol}: position fetch failed: {exc}"
     target = next(
         (p for p in positions if p["instrument_name"] == symbol), None,
     )
-    if target is None:
-        print(f"[force_liquidate] no live position on {symbol} — already flat.")
-        return 0
+    if target is None or abs(float(target.get("amount", 0.0))) < 1e-9:
+        return True, f"{symbol}: already flat"
 
     pos_amount = float(target.get("amount", 0.0))
-    if abs(pos_amount) < 1e-9:
-        print(f"[force_liquidate] position size is zero — already flat.")
-        return 0
-
     print(
-        f"[force_liquidate] live position: "
-        f"{symbol} amount={pos_amount:+.4f} "
+        f"  [{symbol}] live position: amount={pos_amount:+.4f} "
         f"avg=${target.get('average_price', 0):,.4f} "
         f"mark=${target.get('mark_price', 0):,.4f} "
-        f"uPnL=${target.get('unrealized_pnl', 0):+,.4f}"
+        f"uPnL=${target.get('unrealized_pnl', 0):+,.2f}"
     )
 
     # ── C) get bid/ask, decide side & price ──
     try:
         ticker = await exchange.get_ticker(symbol)
     except Exception as exc:
-        print(f"[force_liquidate] ticker fetch failed: {exc}")
-        return 5
-
+        return False, f"{symbol}: ticker fetch failed: {exc}"
     bid = float(ticker.bid)
     ask = float(ticker.ask)
     if bid <= 0 or ask <= 0:
-        print(f"[force_liquidate] invalid book bid={bid} ask={ask}")
-        return 6
+        return False, f"{symbol}: invalid book bid={bid} ask={ask}"
 
     if pos_amount > 0:
         side = "sell"
-        price = bid           # cross to bid → instant taker fill
-        qty = pos_amount      # OKX expects same units our code uses
+        price = bid
+        qty = pos_amount
     else:
         side = "buy"
-        price = ask           # cross to ask
+        price = ask
         qty = abs(pos_amount)
 
     print(
-        f"[force_liquidate] flatten plan: side={side} qty={qty:.4f} "
+        f"  [{symbol}] flatten plan: side={side} qty={qty:.4f} "
         f"price={price} (book bid/ask={bid}/{ask})"
     )
-
     if dry_run:
-        print("[force_liquidate] --dry-run — no order placed.")
-        return 0
+        return True, f"{symbol}: dry-run plan ok"
 
     # ── D) place taker limit at the opposite side ──
     order = await exchange._place_limit_order(
@@ -129,19 +202,12 @@ async def _liquidate(symbol: str, *, dry_run: bool) -> int:
     sCode = str(order.get("sCode") or "")
     sMsg = str(order.get("sMsg") or "")
     ord_id = order.get("ordId", "")
-    print(
-        f"[force_liquidate] order placed: ord_id={ord_id} "
-        f"sCode={sCode} sMsg={sMsg}"
-    )
+    print(f"  [{symbol}] order placed: ord_id={ord_id} sCode={sCode} sMsg={sMsg}")
     if sCode not in ("0", ""):
-        print(
-            f"[force_liquidate] order REJECTED. "
-            f"Inspect manually before retrying."
-        )
-        return 7
+        return False, f"{symbol}: order REJECTED sCode={sCode} sMsg={sMsg}"
 
-    # ── E) poll for flat (up to 60s) ──
-    for attempt in range(12):  # 12 * 5s = 60s
+    # ── E) poll for flat (up to 60 s) ──
+    for attempt in range(12):  # 12 * 5 s = 60 s
         await asyncio.sleep(5)
         try:
             pos_now = await exchange.list_open_positions()
@@ -151,41 +217,139 @@ async def _liquidate(symbol: str, *, dry_run: bool) -> int:
             (p for p in pos_now if p["instrument_name"] == symbol), None,
         )
         if live is None or abs(float(live.get("amount", 0.0))) < 1e-9:
-            print(
-                f"[force_liquidate] FLAT confirmed after "
-                f"{(attempt + 1) * 5}s. Cleanup OK."
-            )
             try:
                 await exchange.cancel_orders_for_instrument(symbol)
             except Exception:
                 pass
-            return 0
+            return True, (
+                f"{symbol}: FLAT confirmed after {(attempt + 1) * 5}s"
+            )
         print(
-            f"[force_liquidate] still has position "
-            f"{live.get('amount'):+.4f}, waiting..."
+            f"  [{symbol}] still has position {live.get('amount'):+.4f}, "
+            f"waiting..."
         )
+    return False, f"{symbol}: TIMEOUT — position still open after 60 s"
+
+
+async def _liquidate(
+    symbol: str | None, *, dry_run: bool,
+) -> int:
+    if not config.HAS_OKX_CREDS:
+        print("[force_liquidate] No OKX credentials configured. Aborting.")
+        return 2
+    exchange = OKXExchange()
+    exchange.connect()
+
+    # ── 1) DISCOVER ──
+    try:
+        positions = await exchange.list_open_positions()
+        orders = await exchange.list_open_orders()
+    except Exception as exc:
+        print(f"[force_liquidate] discovery failed: {exc}")
+        return 4
+
+    if symbol is not None:
+        positions = [
+            p for p in positions if p["instrument_name"] == symbol
+        ]
+        orders = [o for o in orders if o.get("instId") == symbol]
+
+    pos_symbols = {p["instrument_name"] for p in positions}
+    ord_symbols = {o.get("instId", "") for o in orders if o.get("instId")}
+    targets = sorted(pos_symbols | ord_symbols)
+
+    print("=" * 72)
+    print(f"[force_liquidate] mode={'SINGLE' if symbol else 'ALL'}  "
+          f"dry_run={dry_run}  family={config.OPTION_FAMILY}")
+    print(f"[force_liquidate] live positions: {len(positions)}")
+    for p in positions:
+        print(
+            f"  • {p['instrument_name']:36s}  "
+            f"amount={float(p.get('amount', 0)):+.4f}  "
+            f"mark=${float(p.get('mark_price', 0)):,.4f}  "
+            f"uPnL=${float(p.get('unrealized_pnl', 0)):+,.2f}"
+        )
+    print(f"[force_liquidate] open orders:    {len(orders)}")
+    for o in orders:
+        print(
+            f"  • {o.get('instId', '?'):36s}  "
+            f"side={o.get('side', '?')}  px={o.get('px', '?')}  "
+            f"sz={o.get('sz', '?')}  state={o.get('state', '?')}"
+        )
+    print(f"[force_liquidate] symbols to flatten: {len(targets)}")
+    print("=" * 72)
+
+    if not targets:
+        print("[force_liquidate] nothing to do — all flat, no open orders.")
+        return 0
+
+    # ── 2) FLATTEN each target ──
+    results: list[tuple[bool, str]] = []
+    for sym in targets:
+        ok, line = await _flatten_one(exchange, sym, dry_run=dry_run)
+        results.append((ok, line))
+        print(f"[force_liquidate] {'OK ' if ok else 'ERR'}  {line}")
+
+    # ── 3) Summary ──
+    print("=" * 72)
+    fails = [(ok, line) for ok, line in results if not ok]
+    if fails:
+        print(f"[force_liquidate] {len(fails)} failures out of "
+              f"{len(results)} targets:")
+        for _, line in fails:
+            print(f"  ✗ {line}")
+        return 5 if any("REJECTED" in line or "failed" in line
+                        for _, line in fails) else 6
+
+    if dry_run:
+        print("[force_liquidate] DRY-RUN OK. No orders placed.")
+        return 0
 
     print(
-        f"[force_liquidate] TIMEOUT — position still open after 60s. "
-        f"Inspect manually."
+        f"[force_liquidate] ALL CLEAR — {len(results)} symbol(s) flat. "
+        "Safe to docker-compose start algo."
     )
-    return 8
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "symbol",
-        help="OKX option instId, e.g. BTC-USD-260521-77250-P",
+        nargs="?",
+        default=None,
+        help=(
+            "Optional OKX option instId (e.g. BTC-USD-260521-77250-P). "
+            "If omitted, ALL option positions and orders for the active "
+            "family are flattened."
+        ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print plan but do not place any orders.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Bypass the algo lock-file check. Use ONLY when you are "
+            "certain the algo container is stopped (e.g. lock file is "
+            "stale from a crashed run)."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    return asyncio.run(_liquidate(args.symbol, dry_run=args.dry_run))
+    rc = _check_lock(args.force)
+    if rc != 0:
+        return rc
+
+    return asyncio.run(
+        _liquidate(args.symbol, dry_run=args.dry_run),
+    )
 
 
 if __name__ == "__main__":
