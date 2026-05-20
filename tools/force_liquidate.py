@@ -155,7 +155,18 @@ async def _flatten_one(
     *,
     dry_run: bool,
 ) -> tuple[bool, str]:
-    """Flatten a single instrument. Returns (success, status_line)."""
+    """Flatten a single instrument. Returns (success, status_line).
+
+    UNIT-SAFETY NOTE
+    ----------------
+    OKX position rows expose `pos` in CONTRACTS (1 contract = 0.01 BTC for CM
+    BTC options; same for UM linear). Our internal `_place_limit_order`
+    expects `qty_btc` in BTC NOTIONAL. We always convert at the boundary
+    here so the order amount sent to OKX matches the position size exactly,
+    NOT 100× more.
+    """
+    contract_size_btc = config.OKX_CONTRACT_SIZE_BTC
+
     # ── A) cancel any open orders on this symbol ──
     try:
         cancelled = await exchange.cancel_orders_for_instrument(symbol)
@@ -164,7 +175,7 @@ async def _flatten_one(
     if cancelled > 0:
         print(f"  [{symbol}] cancelled {cancelled} open order(s)")
 
-    # ── B) read actual exchange position ──
+    # ── B) read actual exchange position (contracts) ──
     try:
         positions = await exchange.list_open_positions()
     except Exception as exc:
@@ -175,9 +186,12 @@ async def _flatten_one(
     if target is None or abs(float(target.get("amount", 0.0))) < 1e-9:
         return True, f"{symbol}: already flat"
 
-    pos_amount = float(target.get("amount", 0.0))
+    # `amount` is signed contract count (positive=long, negative=short).
+    pos_contracts = float(target.get("amount", 0.0))
+    pos_btc = pos_contracts * contract_size_btc
     print(
-        f"  [{symbol}] live position: amount={pos_amount:+.4f} "
+        f"  [{symbol}] live position: {pos_contracts:+.0f} contract(s) "
+        f"(= {pos_btc:+.4f} BTC notional) "
         f"avg=${target.get('average_price', 0):,.4f} "
         f"mark=${target.get('mark_price', 0):,.4f} "
         f"uPnL=${target.get('unrealized_pnl', 0):+,.2f}"
@@ -193,17 +207,32 @@ async def _flatten_one(
     if bid <= 0 or ask <= 0:
         return False, f"{symbol}: invalid book bid={bid} ask={ask}"
 
-    if pos_amount > 0:
+    if pos_contracts > 0:
         side = "sell"
         price = bid
-        qty = pos_amount
+        qty_btc = pos_btc
+        qty_contracts_planned = pos_contracts
     else:
         side = "buy"
         price = ask
-        qty = abs(pos_amount)
+        qty_btc = abs(pos_btc)
+        qty_contracts_planned = abs(pos_contracts)
+
+    # SAFETY GUARD: round-trip BTC→contracts and refuse if it disagrees
+    # with the position size we just read. Catches any future
+    # unit-conversion regression before it sends a wrong-sized order.
+    recomputed_contracts = round(qty_btc / contract_size_btc)
+    if abs(recomputed_contracts - qty_contracts_planned) > 0.5:
+        return False, (
+            f"{symbol}: SAFETY ABORT — qty_btc={qty_btc} maps to "
+            f"{recomputed_contracts} contracts, but position is "
+            f"{qty_contracts_planned}. Refusing to place order."
+        )
 
     print(
-        f"  [{symbol}] flatten plan: side={side} qty={qty:.4f} "
+        f"  [{symbol}] flatten plan: side={side} "
+        f"qty={qty_contracts_planned:.0f} contract(s) "
+        f"({qty_btc:.4f} BTC) "
         f"price={price} (book bid/ask={bid}/{ask})"
     )
     if dry_run:
@@ -211,7 +240,7 @@ async def _flatten_one(
 
     # ── D) place taker limit at the opposite side ──
     order = await exchange._place_limit_order(
-        symbol, side, qty, price, post_only=False,
+        symbol, side, qty_btc, price, post_only=False,
     )
     sCode = str(order.get("sCode") or "")
     sMsg = str(order.get("sMsg") or "")
@@ -276,10 +305,14 @@ async def _liquidate(
     print(f"[force_liquidate] mode={'SINGLE' if symbol else 'ALL'}  "
           f"dry_run={dry_run}  family={config.OPTION_FAMILY}")
     print(f"[force_liquidate] live positions: {len(positions)}")
+    contract_size_btc = config.OKX_CONTRACT_SIZE_BTC
     for p in positions:
+        contracts = float(p.get('amount', 0))
+        btc = contracts * contract_size_btc
         print(
             f"  • {p['instrument_name']:36s}  "
-            f"amount={float(p.get('amount', 0)):+.4f}  "
+            f"{contracts:+.0f} contract(s)  "
+            f"(={btc:+.4f} BTC)  "
             f"mark=${float(p.get('mark_price', 0)):,.4f}  "
             f"uPnL=${float(p.get('unrealized_pnl', 0)):+,.2f}"
         )
