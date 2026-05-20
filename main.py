@@ -52,6 +52,7 @@ from risk.risk_manager import RiskManager
 from strategy.exit_manager import ExitManager
 from strategy.option_selector import select_straddle_pair
 from strategy.position_sizer import size_position
+from strategy.sizing import compute_qty_per_leg, telegram_summary_line
 from strategy.straddle_builder import build_straddle, unwind_straddle
 from utils import volume_tracker
 from utils.logging_config import setup_logging
@@ -80,11 +81,18 @@ def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
             return
         with open(env_path, "r") as f:
             content = f.read()
+        # Match every form main.py treats as a fire trigger:
+        #   booleans:    true / TRUE / True / 1 / yes / YES / Yes
+        #   legacy:      afternoon / AFTERNOON / morning / MORNING
+        #   canonical:   utc_<4 digits> (case-insensitive prefix; covers
+        #                utc_0100 / utc_0900 / utc_1330 / utc_2330 etc.)
+        # Anything matching false / 0 / no / blank is left alone.
         new_content = re.sub(
             r"^(\s*ENTRY_NOW\s*=\s*)"
             r"(true|TRUE|True|1|yes|YES|Yes|"
             r"afternoon|AFTERNOON|Afternoon|"
-            r"morning|MORNING|Morning)\b.*$",
+            r"morning|MORNING|Morning|"
+            r"[Uu][Tt][Cc]_\d{4})\b.*$",
             r"\1false",
             content,
             flags=re.MULTILINE,
@@ -292,6 +300,35 @@ class Algo:
                 "differs from config.OKX_CONTRACT_SIZE_BTC. See "
                 "contract_size_api_mismatch log entry."
             )
+
+        # Validate that OPTION_ENTRY_CHASE_DEADLINE_MIN fits inside every
+        # session's entry-window (entry_utc → close_utc). The chase MUST
+        # complete before the session-close cron fires; otherwise close
+        # runs on a partial position. With the 4-session schedule the
+        # shortest windows are utc_0900 and utc_2330 at 30 min each, so
+        # any deadline > 25 min violates the 5-min safety buffer for
+        # those sessions. We hard-lock instead of warn — running with
+        # the wrong knob is a P0 risk on first deploy.
+        chase_ok, chase_reason = self._validate_chase_deadline_fits_sessions()
+        if not chase_ok:
+            log.error("chase_deadline_validation_failed",
+                      reason=chase_reason,
+                      deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+            if not self._entry_locked:
+                self._entry_locked = True
+                self._lock_reason = chase_reason
+                await notifier.send(
+                    "<b>STARTUP CHASE-DEADLINE MISMATCH</b>\n"
+                    f"{chase_reason}\n\n"
+                    "<b>Entries are LOCKED</b> until reconciled.\n"
+                    "Action: in .env, set\n"
+                    "  <code>OPTION_ENTRY_CHASE_DEADLINE_MIN=25</code>\n"
+                    "(or any value ≤ shortest_session_window − 5 min) "
+                    "and restart the container."
+                )
+        else:
+            log.info("chase_deadline_validation_ok",
+                     deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
             await notifier.send(
                 "<b>STARTUP CONTRACT-SIZE MISMATCH</b>\n"
                 "OKX's live ctVal × ctMult does not match the algo's "
@@ -364,10 +401,43 @@ class Algo:
                 return f"{day_names[ordered[0]]}-{day_names[ordered[-1]]}"
             return ",".join(day_names[d] for d in ordered) or "—"
 
+        # Boot-time pct_equity preview: for each pct_equity session,
+        # estimate the qty/leg the next entry would resolve to using
+        # the current spot and an indicative ITM premium. We skip live
+        # chain-data here (the chain isn't refreshed yet at startup
+        # banner time, and a faulty refresh shouldn't block the banner)
+        # and instead use a heuristic 1.7%-of-spot/leg straddle premium —
+        # representative of recent ITM 0DTE marks at the current vol regime.
+        # Operators see a concrete USD-equivalent risk number BEFORE the
+        # first entry fires, so a runaway equity bug or surprise pct
+        # config is caught at boot rather than at trade time.
+        equity_now = self.portfolio.equity
+        BOOT_PREVIEW_PREMIUM_PCT_OF_SPOT = 0.017
+        per_btc_premium_est = (
+            spot * BOOT_PREVIEW_PREMIUM_PCT_OF_SPOT if spot > 0 else 0.0
+        )
+
+        def _session_preview(s: config.Session) -> str:
+            base = (
+                f"  • [{s.time_label}]  "
+                f"{_days_str(s.weekdays)}  @ {s.describe_sizing()}"
+                f"{'  (close +1d)' if s.crosses_midnight else ''}"
+            )
+            if s.sizing_mode != "pct_equity" or equity_now <= 0 \
+                    or per_btc_premium_est <= 0:
+                return base
+            target_premium_usd = equity_now * s.pct_equity
+            est_qty = target_premium_usd / per_btc_premium_est
+            est_qty = min(est_qty, config.MAX_QTY_PER_LEG_BTC)
+            preview = (
+                f"\n      preview @ ${equity_now:,.0f} equity, "
+                f"${per_btc_premium_est:,.0f}/BTC indicative premium → "
+                f"~{est_qty:.2f} BTC/leg, ~${target_premium_usd:,.0f} premium"
+            )
+            return base + preview
+
         sessions_lines = "\n".join(
-            f"  • [{s.time_label}]  "
-            f"{_days_str(s.weekdays)}  @ {s.qty_per_leg} BTC/leg"
-            for s in config.SESSIONS
+            _session_preview(s) for s in config.SESSIONS
         )
         last_session = config.get_session(config.LAST_CLOSE_SESSION_NAME)
         last_close_label = (
@@ -401,25 +471,52 @@ class Algo:
                 log.info("next_fire", job=job_id, time=format_utc_sgt(ft))
 
         # ENTRY_NOW supports either "true" (legacy single-session boolean)
-        # or a session name ("morning" / "afternoon"). Boolean form picks
-        # the first session in config.SESSIONS so it stays compatible
-        # with old ops runbooks. Auto-disabled after firing so a restart
-        # never silently re-fires.
+        # or a session name. As of 2026-05-20 the canonical session names
+        # are utc_0900 / utc_1330 / utc_2330 / utc_0100; legacy aliases
+        # ("morning" → utc_0100, "afternoon" → utc_1330) still work via
+        # config.get_session(). Boolean form picks the first ENABLED
+        # session so toggling a session off in .env doesn't accidentally
+        # cause ENTRY_NOW=true to fire it. Auto-disabled after firing so
+        # a restart never silently re-fires.
         entry_now_raw = os.getenv("ENTRY_NOW", "").strip().lower()
         if entry_now_raw and entry_now_raw not in ("false", "0", "no"):
             target: config.Session | None = None
             if entry_now_raw in ("true", "1", "yes"):
-                target = config.SESSIONS[0] if config.SESSIONS else None
+                enabled_pool = [s for s in config.SESSIONS if s.enabled]
+                target = enabled_pool[0] if enabled_pool else None
             else:
                 target = config.get_session(entry_now_raw)
             if target is None:
                 log.warning("immediate_entry_unknown_session",
                             raw=entry_now_raw,
                             valid=[s.name for s in config.SESSIONS])
+            elif not target.enabled:
+                # Operator explicitly typed a disabled session. Refuse
+                # to fire it — the disabled flag is the panic-button
+                # and shouldn't be silently overridden by ENTRY_NOW.
+                log.warning("immediate_entry_session_disabled",
+                            session=target.name,
+                            note=(
+                                "Session is disabled "
+                                f"({target.name.upper()}_ENABLED=false). "
+                                "ENTRY_NOW will NOT fire it. Re-enable "
+                                "the session in .env first."
+                            ))
+                _disable_entry_now_in_env_file()
+                if notifier:
+                    await notifier.send(
+                        "<b>⚠️ ENTRY_NOW IGNORED — SESSION DISABLED</b>\n"
+                        f"Requested: <code>{target.name}</code>\n"
+                        f"Reason: <code>{target.name.upper()}_ENABLED=false</code>\n"
+                        "ENTRY_NOW has been auto-disabled in .env. "
+                        "Re-enable the session in .env, then set ENTRY_NOW "
+                        "again if you want to force-fire."
+                    )
             else:
                 log.info("immediate_entry_triggered",
                          session=target.name,
-                         qty_per_leg=target.qty_per_leg)
+                         sizing=target.describe_sizing(),
+                         fallback_qty_per_leg=target.qty_per_leg)
                 _disable_entry_now_in_env_file()
                 await self._on_entry(target)
 
@@ -427,6 +524,45 @@ class Algo:
         await self._shutdown.wait()
 
     # ──────────────────── Startup Safeguards ──────────────────────
+
+    @staticmethod
+    def _validate_chase_deadline_fits_sessions() -> tuple[bool, str]:
+        """Sanity-check OPTION_ENTRY_CHASE_DEADLINE_MIN against every session.
+
+        Returns (ok, reason). The chase deadline must be ≤ session window
+        − ``CLOSE_RACE_BUFFER_MIN`` so a worst-case-deadline chase fill
+        completes before the close cron fires. Cross-midnight sessions
+        compute their window correctly (close_utc + 24h when < entry_utc).
+        """
+        CLOSE_RACE_BUFFER_MIN = 5.0  # min cushion between chase end and close
+        deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+        violations: list[str] = []
+        # Disabled sessions don't fire, so their windows can't race the
+        # close cron — skip them. This lets an operator surgically
+        # disable a misconfigured session without the validator (and
+        # the resulting hard entry-lock) blocking the rest of the
+        # algo from booting.
+        for s in config.SESSIONS:
+            if not s.enabled:
+                continue
+            entry_min = s.entry_utc.hour * 60 + s.entry_utc.minute
+            close_min = s.close_utc.hour * 60 + s.close_utc.minute
+            if close_min < entry_min:
+                close_min += 24 * 60
+            window = close_min - entry_min
+            max_safe_deadline = window - CLOSE_RACE_BUFFER_MIN
+            if deadline > max_safe_deadline:
+                violations.append(
+                    f"{s.name}: window={window:.0f} min, "
+                    f"max_safe_deadline={max_safe_deadline:.0f} min, "
+                    f"configured={deadline:.0f} min"
+                )
+        if violations:
+            return False, (
+                f"OPTION_ENTRY_CHASE_DEADLINE_MIN={deadline:.0f} "
+                f"would race the close cron on: " + "; ".join(violations)
+            )
+        return True, ""
 
     async def _chase_pricing_selftest(self, spot: float) -> bool:
         """
@@ -683,12 +819,17 @@ class Algo:
                             exc_info=True)
 
             # ── 4. Implied position size sanity ──
-            # If we send the configured qty_per_leg (typically 0.5 BTC),
-            # how many contracts is that and what's the USD notional?
-            # Surfaces the assumption explicitly so the operator can
-            # reconcile against the OKX UI on the first trade.
+            # Use the largest session's FALLBACK qty (the value that
+            # would fire under fixed_btc OR if pct_equity sizing fails)
+            # to compute "how many contracts is that and what's the USD
+            # notional". Under pct_equity the actual qty at fire-time
+            # may be substantially larger (e.g. 50% × $7.7k equity →
+            # ~2.85 BTC vs 0.5 BTC fallback), so this is a LOWER-bound
+            # sanity check, not a forecast. The fire-time entry log
+            # surfaces the resolved qty in ``sizing_decision``.
             sample_qty_btc = max(
-                (s.qty_per_leg for s in config.SESSIONS), default=0.5,
+                (s.qty_per_leg for s in config.SESSIONS if s.enabled),
+                default=0.5,
             )
             sample_contracts = sample_qty_btc / config.OKX_CONTRACT_SIZE_BTC
             sample_usd = sample_qty_btc * spot
@@ -841,7 +982,9 @@ class Algo:
         log.info("session_entry_start",
                  session=session.name,
                  label=label,
-                 qty_per_leg=session.qty_per_leg)
+                 sizing_mode=session.sizing_mode,
+                 pct_equity=session.pct_equity,
+                 fallback_qty_per_leg=session.qty_per_leg)
 
         if self._entry_locked:
             log.warning("entry_blocked_lock",
@@ -900,14 +1043,56 @@ class Algo:
                 self.portfolio.sync_equity(live_equity)
 
         equity = self.portfolio.equity
+
+        # ── Per-entry qty resolution ──
+        # Replaces the old "session.qty_per_leg" hard-wire. With
+        # ``sizing_mode=pct_equity`` (default) the qty is computed at
+        # entry-time from current equity + live mid prices so that
+        # premium ≈ pct_equity × equity. With ``sizing_mode=fixed_btc``
+        # the session's qty_per_leg is used unchanged. See strategy/sizing.py.
+        resolved_qty, sizing_audit = compute_qty_per_leg(
+            session,
+            equity_usd=equity,
+            pair=pair,
+            spot_usd=spot,
+        )
+        log.info("sizing_decision", **sizing_audit)
+
+        if resolved_qty <= 0:
+            msg = (
+                f"[{label}] Sizing skipped this entry.\n"
+                f"Reason: {sizing_audit.get('skip_reason', sizing_audit.get('decision'))}\n"
+                f"Equity: ${equity:,.2f}, "
+                f"target_pct: {session.pct_equity:.0%}"
+            )
+            log.warning("entry_skipped_by_sizing", **sizing_audit)
+            await notifier.notify_skip(msg)
+            return
+
         # Premium quotes are in BTC; sizer needs spot to compute USD costs.
+        # Use the RESOLVED qty (not session.qty_per_leg) so the capital-fit
+        # check below operates on the size we'll actually trade.
         sizing = size_position(
             equity, pair.call.ask, pair.put.ask, spot,
-            qty_per_leg=session.qty_per_leg,
+            qty_per_leg=resolved_qty,
         )
 
-        if config.NUM_STRADDLES_OVERRIDE > 0:
-            sizing.num_straddles = config.NUM_STRADDLES_OVERRIDE
+        # Number-of-straddles override:
+        #   pct_equity mode  → ALWAYS 1 straddle. The resolved BTC qty
+        #                      from compute_qty_per_leg() already encodes
+        #                      the operator's target premium; multiplying
+        #                      by num_straddles>1 would overshoot.
+        #   fixed_btc mode   → respect NUM_STRADDLES_OVERRIDE (legacy),
+        #                      so existing test runs still work.
+        if session.sizing_mode == "pct_equity":
+            forced_n = 1
+        elif config.NUM_STRADDLES_OVERRIDE > 0:
+            forced_n = config.NUM_STRADDLES_OVERRIDE
+        else:
+            forced_n = sizing.num_straddles  # capital-fit default
+
+        if forced_n != sizing.num_straddles:
+            sizing.num_straddles = forced_n
             sizing.total_call_cost = (
                 sizing.call_cost_per * sizing.num_straddles
             )
@@ -918,7 +1103,9 @@ class Algo:
                 (sizing.total_call_cost + sizing.total_put_cost) * 1.05
             )
             log.info("straddles_override",
-                     forced=config.NUM_STRADDLES_OVERRIDE)
+                     forced=forced_n,
+                     reason=("pct_equity_always_1" if session.sizing_mode == "pct_equity"
+                             else "NUM_STRADDLES_OVERRIDE"))
 
         if sizing.num_straddles == 0:
             msg = (
@@ -972,15 +1159,19 @@ class Algo:
             ),
         )
 
+        sizing_summary = telegram_summary_line(
+            sizing_audit, resolved_qty, sizing.num_straddles,
+        )
         await notifier.send(
             f"<b>PRE-FLIGHT CHECK [{label}]</b>\n"
+            f"{sizing_summary}\n"
             f"Straddles: {sizing.num_straddles}\n"
-            f"BTC per leg: {session.qty_per_leg}\n"
+            f"BTC per leg: {resolved_qty:.4f}\n"
             f"Spot: ${spot:,.0f} | Strike: ${pair.strike:,.0f}\n"
             f"\n<b>Per straddle:</b>\n"
-            f"  Call cost ({session.qty_per_leg} BTC): "
+            f"  Call cost ({resolved_qty:.4f} BTC): "
             f"${sizing.call_cost_per:,.2f}\n"
-            f"  Put cost ({session.qty_per_leg} BTC): "
+            f"  Put cost ({resolved_qty:.4f} BTC): "
             f"${sizing.put_cost_per:,.2f}\n"
             f"  Total: ${sizing.straddle_cost:,.2f}\n"
             f"\n<b>All {sizing.num_straddles} straddles:</b>\n"
@@ -995,14 +1186,14 @@ class Algo:
         straddle = await build_straddle(
             self.exchange, self.market, self.portfolio,
             pair, sizing.num_straddles,
-            qty_per_leg=session.qty_per_leg,
+            qty_per_leg=resolved_qty,
             session_name=session.name,
             entry_spot=spot,
         )
         if straddle:
             self._consecutive_failures = 0
             volume_tracker.record_trade(
-                sizing.num_straddles, qty_per_leg=session.qty_per_leg,
+                sizing.num_straddles, qty_per_leg=resolved_qty,
             )
             # Convert OKX-native premiums to USD for human-readable display.
             # CM: native is BTC, multiply by spot. UM: native is already
@@ -1016,10 +1207,10 @@ class Algo:
                 straddle.entry_put_price, qty_btc=1.0, spot_usd=entry_spot_usd,
             )
             call_cost_total_usd = (
-                call_fill_usd * session.qty_per_leg * sizing.num_straddles
+                call_fill_usd * resolved_qty * sizing.num_straddles
             )
             put_cost_total_usd = (
-                put_fill_usd * session.qty_per_leg * sizing.num_straddles
+                put_fill_usd * resolved_qty * sizing.num_straddles
             )
             await notifier.notify_entry(
                 num_straddles=sizing.num_straddles,
@@ -1031,11 +1222,12 @@ class Algo:
                 call_cost_total=call_cost_total_usd,
                 put_cost_total=put_cost_total_usd,
                 session_label=label,
-                qty_per_leg=session.qty_per_leg,
+                qty_per_leg=resolved_qty,
             )
             log.info("session_entry_done",
                      session=session.name,
-                     qty_per_leg=session.qty_per_leg,
+                     qty_per_leg=resolved_qty,
+                     sizing_decision=sizing_audit.get("decision"),
                      num_straddles=sizing.num_straddles,
                      family=family.label(),
                      call_fill_native=straddle.entry_call_price,
@@ -1116,10 +1308,12 @@ class Algo:
             actual_pnl = self.portfolio.equity - equity_before
 
             # The trading-day last close is configured in
-            # config.LAST_CLOSE_SESSION_NAME (currently the morning
-            # session, which closes at 02:00 UTC on the expiry day).
-            # That close fires the DAILY REPORT — earlier closes in
-            # the same trading day just emit a plain SESSION CLOSE.
+            # config.LAST_CLOSE_SESSION_NAME (currently utc_0100, which
+            # closes at 02:00 UTC on the expiry day). That close fires
+            # the DAILY REPORT — earlier closes in the same trading day
+            # (utc_0900 / utc_1330 / utc_2330) just emit a plain
+            # SESSION CLOSE. See config._last_close_session_name() for
+            # the chronological-ordering logic that picks utc_0100.
             is_last_close = session.name == config.LAST_CLOSE_SESSION_NAME
 
             if is_last_close:
@@ -1232,9 +1426,14 @@ class Algo:
         Used to decide when to chain the WEEKLY REPORT off the morning
         close — only the Saturday close fires it.
         """
+        # Disabled sessions don't fire and don't gate weekly reports.
+        # If the operator disables every session that would push the
+        # last-trading-day off Friday, the weekly report falls back to
+        # the latest-firing enabled session's trading day.
         weekdays_with_close = {
             (d + s.trading_day_offset_days) % 7
             for s in config.SESSIONS
+            if s.enabled
             for d in s.weekdays
         }
         return max(weekdays_with_close) if weekdays_with_close else 4

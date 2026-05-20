@@ -275,17 +275,22 @@ def _next_scheduled_trading_day(
     after_trading_day: date, max_offset_days: int = 60,
 ) -> Optional[date]:
     """Find the next trading_day strictly greater than `after_trading_day`
-    that any configured ``config.SESSIONS`` would produce.
+    that any ENABLED ``config.SESSIONS`` entry would produce.
 
-    Walks forward day by day; for each calendar day on which a session
-    is configured to fire, computes that session's ``trading_day_for``
-    and returns the smallest trading_day still > `after_trading_day`.
+    Walks forward day by day; for each calendar day on which an enabled
+    session is configured to fire, computes that session's
+    ``trading_day_for`` and returns the smallest trading_day still
+    > `after_trading_day`. Disabled sessions are excluded so the
+    month/year-end report bookends correctly when a session is turned
+    off mid-month.
     """
     candidates: list[date] = []
     for offset in range(0, max_offset_days + 1):
         cal_day = after_trading_day + timedelta(days=offset)
         weekday = cal_day.weekday()
         for s in config.SESSIONS:
+            if not s.enabled:
+                continue
             if weekday in s.weekdays:
                 session_dt = datetime.combine(cal_day, s.entry_utc)
                 td = config.trading_day_for(session_dt)

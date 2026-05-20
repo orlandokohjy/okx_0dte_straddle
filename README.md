@@ -67,8 +67,11 @@ cp .env.example .env
 Default `.env.example` is set to:
 - `OKX_FLAG=1` (demo trading)
 - `DRY_RUN=true` (no orders sent)
-- `MORNING_QTY_PER_LEG=0.25`
-- `AFTERNOON_QTY_PER_LEG=0.5`
+- 4 sessions / day, all `pct_equity` sized:
+  - `utc_0900` (09:00-09:30 UTC, Mon-Fri) — 25% pct_equity
+  - `utc_1330` (13:30-15:30 UTC, Mon-Fri) — 50% pct_equity
+  - `utc_2330` (23:30-24:00 UTC, Mon-Fri; close rolls to next day) — 25% pct_equity
+  - `utc_0100` (01:00-02:00 UTC, Tue-Sat; LAST close → triggers daily report) — 50% pct_equity
 - `NUM_STRADDLES_OVERRIDE=1`
 
 ### 3. First run — DRY_RUN smoke test
@@ -83,12 +86,18 @@ To trigger entry immediately for testing (auto-disables after firing):
 
 ```bash
 # Fire whichever session is listed first in config.SESSIONS
-# (currently the afternoon session, 13:30-15:30 UTC, 0.5 BTC/leg)
+# (currently utc_0900, 09:00-09:30 UTC)
 ENTRY_NOW=true docker-compose up --build
 
 # Or fire a specific session by name
-ENTRY_NOW=afternoon docker-compose up --build
-ENTRY_NOW=morning   docker-compose up --build
+ENTRY_NOW=utc_0900 docker-compose up --build
+ENTRY_NOW=utc_1330 docker-compose up --build
+ENTRY_NOW=utc_2330 docker-compose up --build
+ENTRY_NOW=utc_0100 docker-compose up --build
+
+# Legacy aliases still work and resolve via config.canonical_session_name():
+ENTRY_NOW=afternoon docker-compose up --build   # → utc_1330
+ENTRY_NOW=morning   docker-compose up --build   # → utc_0100
 ```
 
 ### 4. Demo trading run (real demo orders)

@@ -147,7 +147,15 @@ async def build_straddle(
     resulting Straddle so close handlers and the daily report can keep
     each session's results separable.
     """
-    straddle_id = f"OKX-{session_name[:1].upper()}-{uuid.uuid4().hex[:8]}"
+    # Session-distinguishing tag for the straddle id. utc_HHMM names map
+    # to the 4-digit time so all four sessions get unique tags ("0900",
+    # "1330", "2330", "0100"); legacy names fall back to the first letter
+    # ("M" for morning, "A" for afternoon) for backward compatibility.
+    if session_name.startswith("utc_") and len(session_name) >= 8:
+        sess_tag = session_name[4:8]
+    else:
+        sess_tag = (session_name[:1] or "X").upper()
+    straddle_id = f"OKX-{sess_tag}-{uuid.uuid4().hex[:8]}"
     total_qty = qty_per_leg * num_straddles
 
     log.info("building_straddle", id=straddle_id, session=session_name,

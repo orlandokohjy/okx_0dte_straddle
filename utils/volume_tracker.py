@@ -24,9 +24,14 @@ def record_trade(num_straddles: int, qty_per_leg: float) -> None:
       option_contracts = 4  (buy call + buy put + sell call + sell put)
       option_btc       = qty_per_leg × 2 legs × 2 sides
 
-    qty_per_leg is the BTC notional per leg for the firing session
-    (afternoon = 0.5, morning = 0.25, etc.). Volume rows therefore
-    track the actual notional traded per session, not a global default.
+    qty_per_leg is the BTC notional per leg passed in by the caller —
+    typically the entry-time RESOLVED qty from
+    ``strategy.sizing.compute_qty_per_leg``. Under fixed_btc this is
+    the session's static qty (e.g. 0.5 BTC); under pct_equity it's the
+    qty derived from current equity at fire-time (e.g. 2.85 BTC for a
+    50% session at $7.7k equity). Volume rows therefore record the
+    actual notional traded for THIS specific entry, not the historical
+    default.
     """
     contracts_per = 4
     option_btc_per = qty_per_leg * 2 * 2

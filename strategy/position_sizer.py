@@ -15,9 +15,13 @@ Sizing math (all in USD):
     straddle_cost_usd = call_cost_per_usd + put_cost_per_usd
     num_straddles = floor(ALLOC_PCT × equity_usd / buffered_straddle_cost_usd)
 
-`qty_per_leg` is supplied by the caller from the Session that fired the
-entry (see config.SESSIONS) — afternoon may use 0.5 BTC while morning
-uses 0.25 BTC, etc.
+`qty_per_leg` is supplied by the caller. Under the post-2026-05-20
+schedule the caller is ``main._run_entry``, which resolves the qty
+via ``strategy.sizing.compute_qty_per_leg`` from the firing Session's
+``sizing_mode`` (fixed_btc or pct_equity) and current portfolio equity.
+Under fixed_btc this matches the historical behaviour
+(``afternoon=0.5 BTC``, ``morning=0.25 BTC``); under pct_equity the
+qty is computed at entry time so premium ≈ pct_equity × equity.
 """
 from __future__ import annotations
 

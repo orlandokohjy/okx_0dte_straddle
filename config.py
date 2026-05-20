@@ -99,36 +99,120 @@ NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))
 # ──────────────────── Multi-Session Schedule (UTC) ────────────────
 #
 # OKX BTC 0DTE options expire daily at 08:00 UTC. We define a "trading
-# day" as the calendar UTC date of that expiry. A trading day's two
-# entries straddle the previous-day boundary:
+# day" as the calendar UTC date of that expiry. Each trading day has
+# FOUR entries that span 24 hours, all targeting the same 08:00 UTC
+# expiry. They are named by their UTC entry time so the schedule is
+# unambiguous across timezones (a session's name like "morning" was
+# ambiguous between UTC-morning and SGT-morning):
 #
-#   • FIRST entry  : afternoon, 13:30-15:30 UTC the day BEFORE expiry
-#                    (size = 0.50 BTC notional / leg)
-#   • SECOND entry : morning,   01:00-02:00 UTC the day OF expiry
-#                    (size = 0.25 BTC notional / leg)
+#   utc_0900  →  09:00–09:30 UTC      (~23h to expiry)   25% pct_equity
+#   utc_1330  →  13:30–15:30 UTC      (~18.5h to expiry) 50% pct_equity
+#   utc_2330  →  23:30–24:00 UTC      (~8.5h to expiry)  25% pct_equity
+#   utc_0100  →  01:00–02:00 UTC      (~7h to expiry)    50% pct_equity
 #
-# Both sessions share the SAME straddle structure (1 ITM call + 1 ITM
-# put at the same strike) and post to the same trade log so the daily
-# report and combined DAILY SUMMARY telegram aggregate by trading_day.
+# All four sessions share the SAME straddle structure (1 ITM call + 1
+# ITM put at the same strike) and post to the same trade log so the
+# daily report and combined DAILY SUMMARY telegram aggregate by
+# trading_day. Sessions are independent: each one can fail or succeed
+# on its own without affecting the others.
 #
-# Per-session weekday filters give us 5 complete trading-day pairs
-# per week (Tue, Wed, Thu, Fri, Sat) for a total of 10 trades:
-#   • afternoon (1st) fires Mon-Fri UTC  (covers Tue-Sat trading days)
-#   • morning   (2nd) fires Tue-Sat UTC  (covers Tue-Sat trading days)
-# Mon and Sun are dark by design — they would only ever produce
-# half-pair trading days otherwise.
+# Per-session weekday filters give us 5 complete trading-day quartets
+# per week (Tue, Wed, Thu, Fri, Sat) for a total of 20 trades/wk:
+#   • utc_0900 (1st of trading day) fires Mon-Fri UTC
+#   • utc_1330 (2nd of trading day) fires Mon-Fri UTC
+#   • utc_2330 (3rd of trading day) fires Mon-Fri UTC, close rolls to
+#                                   the next calendar day (Tue-Sat 00:00)
+#   • utc_0100 (4th = LAST close) fires Tue-Sat UTC; this close triggers
+#                                   the daily summary report.
+# Mon-and-Sun are dark by design — they would produce partial quartets.
+#
+# SIZING — TWO MODES PER SESSION
+# -------------------------------
+# Each Session has a sizing_mode ("fixed_btc" or "pct_equity"):
+#
+#   fixed_btc   → qty_per_leg is a hard BTC value. Same size every entry.
+#   pct_equity  → premium-as-pct-of-equity. The qty_per_leg is computed
+#                 at entry-time so that the straddle's expected USD
+#                 premium ≈ pct_equity × current_equity. Each session's
+#                 pct_equity can be overridden via env: <NAME>_PCT_EQUITY.
+#
+# The pct_equity formula (see strategy/sizing.py) interprets "x% of
+# equity" as: max-loss-budget = x% of equity = expected straddle premium.
+# This is the natural Kelly-style sizing for long straddles since premium
+# paid IS the maximum theoretical loss.
+#
+# Switch a session between modes via env:
+#   <NAME>_SIZING=pct_equity     (default) or "fixed_btc"
+#   <NAME>_PCT_EQUITY=0.10       (10% — used when SIZING=pct_equity)
+#   <NAME>_QTY_PER_LEG=0.25      (BTC — used when SIZING=fixed_btc, also
+#                                  the fallback when pct_equity sizing
+#                                  fails for any reason)
 EXPIRY_CUTOFF_UTC: time = time(8, 0)
+
+
+# Hard sanity cap on per-leg qty. Catches a runaway equity-tracking bug:
+# if equity is mis-reported as some 100x value, the pct_equity math
+# would otherwise produce enormous orders. With this cap the worst-case
+# is bounded at MAX BTC per leg even if equity blows up.
+#
+# Default 5.0 BTC sized to leave headroom: at last-night's CM premium
+# levels (~$1,360 USD per 1 BTC straddle) and current ~$7,761 equity,
+# a 50% pct_equity session targets ~2.85 BTC. 5.0 BTC default lets
+# equity grow ~75% before this cap binds. Operator should bump via
+# MAX_QTY_PER_LEG_BTC=10.0 (or similar) once equity grows past ~$13k.
+# When the cap DOES bind, sizing.py logs an INFO event so it's visible.
+MAX_QTY_PER_LEG_BTC: float = float(os.getenv("MAX_QTY_PER_LEG_BTC", "5.0"))
+# Lower bound below which we skip the session entirely. OKX's minimum
+# is 1 contract = 0.01 BTC; below that we cannot place an order.
+MIN_QTY_PER_LEG_BTC: float = float(os.getenv("MIN_QTY_PER_LEG_BTC", "0.01"))
+
+
+def _session_env_str(name: str, key: str, default: str) -> str:
+    """Read ``{NAME}_{KEY}`` from env (case-insensitive name) or default."""
+    return os.getenv(f"{name.upper()}_{key.upper()}", default).strip()
+
+
+def _session_env_float(name: str, key: str, default: float) -> float:
+    """Read ``{NAME}_{KEY}`` as a float from env or fall back to default."""
+    raw = _session_env_str(name, key, str(default))
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 @dataclass(frozen=True)
 class Session:
-    name: str               # short identifier ("morning", "afternoon")
+    """One scheduled trading session within a trading day.
+
+    A trading day = the UTC date of the 08:00 UTC option expiry. A
+    session enters and exits long-straddle positions on options
+    expiring at that 08:00 UTC. Sizing is per-entry, governed by
+    ``sizing_mode``.
+    """
+    name: str               # short identifier; canonical form is "utc_HHMM"
     entry_utc: time         # cron-style UTC hh:mm to fire entry
-    close_utc: time         # cron-style UTC hh:mm to fire hard close
-    qty_per_leg: float      # BTC notional per leg for THIS session
-    weekdays: frozenset[int] = field(  # UTC weekdays (0=Mon..6=Sun) on
-        default_factory=lambda: frozenset({0, 1, 2, 3, 4}),  # which to fire
+    close_utc: time         # cron-style UTC hh:mm to fire hard close.
+                            # If close_utc < entry_utc, the close rolls
+                            # over to the NEXT calendar day (e.g. utc_2330
+                            # entry at Mon 23:30, close at Tue 00:00).
+    qty_per_leg: float      # BTC qty per leg under sizing_mode=fixed_btc;
+                            # ALSO the fallback qty if pct_equity sizing
+                            # cannot resolve (e.g. zero equity, missing
+                            # marks, or both bid/ask are 0).
+    sizing_mode: str = "fixed_btc"   # "fixed_btc" or "pct_equity"
+    pct_equity: float = 0.0          # used iff sizing_mode == "pct_equity"
+    weekdays: frozenset[int] = field(  # UTC weekdays (0=Mon..6=Sun) for
+        default_factory=lambda: frozenset({0, 1, 2, 3, 4}),  # ENTRY firing
     )
+    enabled: bool = True             # if False, the scheduler does NOT
+                                     # register entry/close jobs and the
+                                     # session is excluded from "next-trading-
+                                     # day" walkers + last-close detection.
+                                     # Operator panic-button: set
+                                     # <NAME>_ENABLED=false in .env to surgically
+                                     # take a session out of rotation without
+                                     # a code change.
 
     @property
     def trading_day_offset_days(self) -> int:
@@ -142,53 +226,179 @@ class Session:
         return 1 if self.entry_utc >= EXPIRY_CUTOFF_UTC else 0
 
     @property
-    def trading_day_close_position(self) -> tuple[int, int, int]:
-        """Sortable key for ordering sessions WITHIN a trading day.
+    def crosses_midnight(self) -> bool:
+        """True if the close fires on the calendar day AFTER the entry.
 
-        Combines the trading-day offset with the close-time so we can
-        identify which session closes LAST on a given trading day —
-        that's the one that triggers the combined DAILY SUMMARY.
+        Triggered when ``close_utc < entry_utc`` (e.g. utc_2330 entry
+        Mon 23:30 UTC, close Tue 00:00 UTC). The scheduler must use a
+        weekday set shifted +1 day for the close cron in this case.
         """
-        return (
-            -self.trading_day_offset_days,  # earlier-day fires first
-            self.close_utc.hour,
-            self.close_utc.minute,
-        )
+        return self.close_utc < self.entry_utc
+
+    @property
+    def close_weekdays(self) -> frozenset[int]:
+        """UTC weekdays for the CLOSE cron job.
+
+        Same as ``weekdays`` (entry weekdays) unless the close rolls
+        past midnight UTC, in which case shifted +1 day so the close
+        fires on the calendar day after each entry.
+        """
+        if not self.crosses_midnight:
+            return self.weekdays
+        return frozenset((d + 1) % 7 for d in self.weekdays)
+
+    @property
+    def close_minutes_in_trading_day(self) -> int:
+        """Minutes from 08:00 UTC trading-day-start to this session's close.
+
+        Used to chronologically order sessions within a trading day.
+        Handles utc_2330's close-at-midnight cleanly: the close rolls
+        forward 24h before subtracting the trading-day-start offset.
+
+        Sanity:
+            utc_0900 close 09:30  →   90 min into trading day
+            utc_1330 close 15:30  →  450 min
+            utc_2330 close 24:00  →  960 min  (rolled +24h from 00:00)
+            utc_0100 close 02:00  → 1080 min  (offset=0 path)
+        """
+        EXPIRY_HOUR = EXPIRY_CUTOFF_UTC.hour  # 8
+        entry_min = self.entry_utc.hour * 60 + self.entry_utc.minute
+        close_min = self.close_utc.hour * 60 + self.close_utc.minute
+        if close_min < entry_min:
+            close_min += 24 * 60
+        if self.trading_day_offset_days == 1:
+            return close_min - EXPIRY_HOUR * 60
+        return close_min + (24 - EXPIRY_HOUR) * 60
 
     @property
     def time_label(self) -> str:
         """Human-friendly entry/close window for telegram messages.
 
-        Example: ``13:30-15:30 UTC``. We use the timing window as the
-        primary user-visible identifier (instead of "morning" /
-        "afternoon") so the labels are unambiguous across timezones.
+        Example: ``13:30-15:30 UTC``. utc_2330's display close-time is
+        rendered as ``24:00`` instead of ``00:00`` for clarity that it
+        belongs to the same trading session.
         """
-        return (
-            f"{self.entry_utc.strftime('%H:%M')}-"
-            f"{self.close_utc.strftime('%H:%M')} UTC"
-        )
+        close_str = self.close_utc.strftime("%H:%M")
+        if self.crosses_midnight and self.close_utc.hour == 0 \
+                and self.close_utc.minute == 0:
+            close_str = "24:00"
+        return f"{self.entry_utc.strftime('%H:%M')}-{close_str} UTC"
+
+    def describe_sizing(self) -> str:
+        """Compact human-readable summary of the session's sizing config.
+
+        Includes a ``DISABLED`` marker when ``enabled=False`` so the
+        startup banner / scheduled-jobs log makes the operator state
+        unmissable.
+        """
+        if not self.enabled:
+            base = "DISABLED"
+        elif self.sizing_mode == "pct_equity":
+            base = f"pct_equity={self.pct_equity:.0%}"
+        else:
+            base = f"fixed_btc={self.qty_per_leg} BTC"
+        return base
+
+
+def _build_session(
+    name: str,
+    entry_utc: time,
+    close_utc: time,
+    *,
+    default_pct_equity: float,
+    default_qty_per_leg: float,
+    weekdays: frozenset[int],
+) -> Session:
+    """Construct a Session with per-session env-var overrides.
+
+    Each session reads four env vars (case-insensitive name prefix):
+        <NAME>_SIZING        — "fixed_btc" or "pct_equity"  (default: pct_equity)
+        <NAME>_PCT_EQUITY    — float, e.g. 0.25 for 25%      (default: arg)
+        <NAME>_QTY_PER_LEG   — float, BTC                    (default: arg)
+        <NAME>_ENABLED       — bool ("true"/"false"/"1"/"0") (default: true)
+
+    ``<NAME>_ENABLED=false`` is the operator panic-button: it removes
+    the session from the scheduler without a code change. All other
+    knobs still parse so the session can be re-enabled instantly.
+
+    The defaults baked into config.SESSIONS reflect the agreed
+    deployment plan (2026-05-20): all four sessions enabled, in
+    pct_equity mode at the operator-chosen percentages.
+    """
+    sizing_mode = _session_env_str(
+        name, "SIZING", "pct_equity",
+    ).lower()
+    if sizing_mode not in ("fixed_btc", "pct_equity"):
+        sizing_mode = "pct_equity"
+    pct_equity = _session_env_float(name, "PCT_EQUITY", default_pct_equity)
+    qty_per_leg = _session_env_float(name, "QTY_PER_LEG", default_qty_per_leg)
+    enabled_raw = _session_env_str(name, "ENABLED", "true").lower()
+    enabled = enabled_raw not in ("false", "0", "no", "off", "")
+    return Session(
+        name=name,
+        entry_utc=entry_utc,
+        close_utc=close_utc,
+        qty_per_leg=qty_per_leg,
+        sizing_mode=sizing_mode,
+        pct_equity=pct_equity,
+        weekdays=weekdays,
+        enabled=enabled,
+    )
 
 
 SESSIONS: list[Session] = [
-    # FIRST entry of each trading day — fires the day BEFORE expiry.
-    # Mon-Fri UTC, so each fire creates a Tue-Sat trading day.
-    Session(
-        name="afternoon",
-        entry_utc=time(13, 30),
-        close_utc=time(15, 30),
-        qty_per_leg=float(os.getenv("AFTERNOON_QTY_PER_LEG", "0.5")),
+    # 1st of each trading day. Entry Mon-Fri 09:00 UTC, close 09:30 UTC.
+    # ~23h to next 08:00 UTC expiry — longest-DTE of the four.
+    _build_session(
+        "utc_0900",
+        entry_utc=time(9, 0), close_utc=time(9, 30),
+        default_pct_equity=0.25, default_qty_per_leg=0.5,
         weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
     ),
-    # SECOND entry of each trading day — fires the same day as expiry.
-    # Tue-Sat UTC, pairs 1:1 with the afternoon entries above.
-    Session(
-        name="morning",
-        entry_utc=time(1, 0),
-        close_utc=time(2, 0),
-        qty_per_leg=float(os.getenv("MORNING_QTY_PER_LEG", "0.25")),
+    # 2nd of each trading day. Entry Mon-Fri 13:30 UTC, close 15:30 UTC.
+    _build_session(
+        "utc_1330",
+        entry_utc=time(13, 30), close_utc=time(15, 30),
+        default_pct_equity=0.50, default_qty_per_leg=0.5,
+        weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
+    ),
+    # 3rd of each trading day. Entry Mon-Fri 23:30 UTC, close at 00:00
+    # UTC the next calendar day (close_weekdays auto-shifts to Tue-Sat).
+    _build_session(
+        "utc_2330",
+        entry_utc=time(23, 30), close_utc=time(0, 0),
+        default_pct_equity=0.25, default_qty_per_leg=0.5,
+        weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC entry
+    ),
+    # 4th = LAST of each trading day. Entry Tue-Sat 01:00 UTC, close
+    # Tue-Sat 02:00 UTC. Its close triggers the combined daily summary.
+    _build_session(
+        "utc_0100",
+        entry_utc=time(1, 0), close_utc=time(2, 0),
+        default_pct_equity=0.50, default_qty_per_leg=0.25,
         weekdays=frozenset({1, 2, 3, 4, 5}),  # Tue-Sat UTC
     ),
 ]
+
+
+# Legacy session names. trade_log.csv rows from before 2026-05-20 use
+# "morning"/"afternoon" as session_name; new code uses "utc_HHMM". This
+# table maps legacy → canonical so reports can reconcile historical
+# rows seamlessly. The migration script (tools/migrate_session_names.py)
+# rewrites the CSV in-place with a .bak backup, but until that's run
+# (or for any pre-migration row that survives), report code looks here.
+LEGACY_SESSION_NAMES: dict[str, str] = {
+    "morning": "utc_0100",
+    "afternoon": "utc_1330",
+}
+
+
+def canonical_session_name(name: str) -> str:
+    """Map legacy ``morning``/``afternoon`` to canonical ``utc_HHMM``.
+
+    Returns ``name`` unchanged if it's not a known legacy alias.
+    """
+    return LEGACY_SESSION_NAMES.get(name, name)
 
 
 def trading_day_for(entry_dt: datetime) -> date:
@@ -205,26 +415,50 @@ def trading_day_for(entry_dt: datetime) -> date:
     return entry_dt.date()
 
 
-def _last_close_session_name(sessions: list[Session]) -> str:
-    """The session whose close time is the LAST event of a trading day.
+def enabled_sessions() -> list[Session]:
+    """Return the subset of SESSIONS that are runtime-enabled.
 
-    Sorted by trading-day position so afternoon (-1d, 15:30) ranks
-    BEFORE morning (0d, 02:00). The maximum of that ordering is the
-    last close — that's the only session that triggers the combined
-    daily summary.
+    Disabled sessions stay in ``SESSIONS`` so legacy lookups
+    (``get_session(name)`` / report rendering / ENTRY_NOW) still find
+    them, but every scheduling / next-trading-day / last-close path
+    routes through this filter so a disabled session is invisible to
+    the live algo.
     """
-    if not sessions:
+    return [s for s in SESSIONS if s.enabled]
+
+
+def _last_close_session_name(sessions: list[Session]) -> str:
+    """The ENABLED session whose close time is the LAST event of a trading day.
+
+    Sorts by ``close_minutes_in_trading_day`` (minutes from 08:00 UTC
+    trading-day-start to close), which handles cross-midnight closes
+    correctly so utc_2330 (close=960 min) ranks AFTER utc_1330
+    (close=450 min) but BEFORE utc_0100 (close=1080 min). The
+    last-close session triggers the combined DAILY SUMMARY report.
+
+    Disabled sessions are excluded — if an operator turns off
+    utc_0100, the daily summary instead chains off whichever enabled
+    session has the latest close.
+    """
+    pool = [s for s in sessions if s.enabled]
+    if not pool:
         return ""
-    return max(sessions, key=lambda s: s.trading_day_close_position).name
+    return max(pool, key=lambda s: s.close_minutes_in_trading_day).name
 
 
 LAST_CLOSE_SESSION_NAME: str = _last_close_session_name(SESSIONS)
 
 
 def get_session(name: str) -> Session | None:
-    """Lookup a session by name, or None if not configured."""
+    """Lookup a session by name, or None if not configured.
+
+    Accepts both the canonical ``utc_HHMM`` form AND legacy aliases
+    (``morning``/``afternoon``) so an operator-typed ENTRY_NOW=morning
+    keeps working after the rename.
+    """
+    canonical = canonical_session_name(name)
     for s in SESSIONS:
-        if s.name == name:
+        if s.name == canonical:
             return s
     return None
 

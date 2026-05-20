@@ -80,9 +80,12 @@ class Straddle:
     straddle_cost: float
     num_straddles: int
 
-    # Which Session fired this straddle (e.g. "morning" / "afternoon").
-    # Empty for legacy single-session state files; reports treat empty
-    # as "unknown" but still display the row.
+    # Which Session fired this straddle. Canonical names are utc_HHMM
+    # (utc_0900 / utc_1330 / utc_2330 / utc_0100). Pre-2026-05-20 rows
+    # may carry the legacy "morning" / "afternoon" aliases; reports
+    # canonicalise those at read-time. Empty for legacy single-session
+    # state files; reports treat empty as "unknown" but still display
+    # the row.
     session_name: str = ""
 
     # Option family at the time of entry — frozen on the Straddle so a

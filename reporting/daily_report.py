@@ -232,7 +232,17 @@ def _session_chronological_key(t: "TradeRow") -> tuple:
     comes BEFORE the morning entry (same calendar day). We sort by
     entry_time when available and fall back to a session-name hint.
     """
-    name_order = {"afternoon": 0, "morning": 1}
+    # Chronological order within a trading day. Both canonical
+    # ("utc_HHMM") and legacy ("afternoon"/"morning") names map onto
+    # the same slot for backward-compatible historical rows.
+    name_order = {
+        "utc_0900":  0,
+        "utc_1330":  1,
+        "utc_2330":  2,
+        "utc_0100":  3,
+        "afternoon": 1,  # legacy → utc_1330
+        "morning":   3,  # legacy → utc_0100
+    }
     return (t.entry_time or "", name_order.get(t.session, 99))
 
 
@@ -745,21 +755,43 @@ def _format_execution_quality(m: DailyMetrics) -> list[str]:
 
 
 _LEG_ORDINAL = {
-    # Within a trading day, the afternoon entry comes FIRST (it fires
-    # the day before expiry) and the morning entry comes SECOND (it
-    # fires the day of expiry). Both pairs settle the same 08:00 UTC
-    # expiry so they're rolled up under one trading_day report.
-    "afternoon": "1st entry",
-    "morning":   "2nd entry",
+    # Within a trading day (defined as the day of the 08:00 UTC expiry),
+    # sessions fire in this chronological order:
+    #
+    #   utc_0900  → 09:00-09:30 UTC,  ~23h to expiry  (1st of trading day)
+    #   utc_1330  → 13:30-15:30 UTC,  ~18h to expiry  (2nd of trading day)
+    #   utc_2330  → 23:30-24:00 UTC,  ~8h  to expiry  (3rd of trading day)
+    #   utc_0100  → 01:00-02:00 UTC,  ~7h  to expiry  (4th = LAST close)
+    #
+    # Legacy aliases ("morning"/"afternoon") are also looked up so reports
+    # keep rendering the right ordinal for pre-2026-05-20 trade-log rows
+    # that haven't been migrated yet (or for any row that survives the
+    # migration script). canonical_session_name() in the lookup below
+    # collapses both forms onto one ordinal.
+    "utc_0900":  "1st entry",
+    "utc_1330":  "2nd entry",
+    "utc_2330":  "3rd entry",
+    "utc_0100":  "4th entry",
+    # Legacy:
+    "afternoon": "2nd entry",  # afternoon → utc_1330
+    "morning":   "4th entry",  # morning   → utc_0100
 }
 
 
 def _session_time_label(name: str) -> str:
     """Return ``HH:MM-HH:MM UTC`` for a session name, or '' if unknown.
 
-    The trade log stores the session by short name ("morning" /
-    "afternoon"); user-facing reports prefer the entry/close window.
+    The trade log stores the session by short name. As of 2026-05-20
+    the canonical form is ``utc_HHMM``; pre-migration rows may still
+    use the legacy ``morning``/``afternoon`` aliases. We try the
+    canonical name first, then fall back to a direct match so reports
+    render correctly across the rename boundary.
     """
+    canonical = config.canonical_session_name(name)
+    for s in config.SESSIONS:
+        if s.name == canonical:
+            return s.time_label
+    # Direct match for any name still in SESSIONS but not aliased.
     for s in config.SESSIONS:
         if s.name == name:
             return s.time_label
@@ -1217,10 +1249,11 @@ def compute_weekly_report(equity: float) -> Optional[DailyMetrics]:
 def format_weekly_report(m: DailyMetrics) -> str:
     pnl_sign = "+" if m.trade_pnl >= 0 else ""
 
-    # Weekly volume sums per-trade qty_per_leg so morning + afternoon
-    # sessions with different sizes both count correctly. Each
-    # straddle round-trips (open + close) for both legs, so total
-    # traded notional = 4 × qty_per_leg × num_straddles per session.
+    # Weekly volume sums per-trade qty_per_leg so heterogeneous session
+    # sizes count correctly (utc_0900 / utc_1330 / utc_2330 / utc_0100,
+    # each potentially under pct_equity sizing with a different qty per
+    # entry). Each straddle round-trips (open + close) for both legs,
+    # so total traded notional = 4 × qty_per_leg × num_straddles per row.
     # USD values are computed per-trade using each row's own
     # entry_spot/exit_spot so weekly totals are accurate across the
     # spot moves between sessions.

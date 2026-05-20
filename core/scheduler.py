@@ -51,15 +51,37 @@ class Scheduler:
             return ",".join(names[d] for d in sorted(weekdays_set))
 
         for session in config.SESSIONS:
+            # Honour the operator panic-button: <NAME>_ENABLED=false in
+            # .env removes the session from the scheduler entirely. No
+            # entry cron, no close cron, nothing fires for this session.
+            # The session is still discoverable via config.get_session()
+            # so reports rendering historical data still find it.
+            if not session.enabled:
+                log.info(
+                    "session_skipped_disabled",
+                    name=session.name,
+                    note=(
+                        "session.enabled=False (env var "
+                        f"{session.name.upper()}_ENABLED=false). "
+                        "No entry/close cron registered."
+                    ),
+                )
+                continue
+
             entry_t = session.entry_utc
             close_t = session.close_utc
-            sess_days = _wd_str(session.weekdays)
+            entry_days_str = _wd_str(session.weekdays)
+            # Cross-midnight closes (e.g. utc_2330 entry Mon 23:30 → close
+            # Tue 00:00) need a CLOSE weekday set shifted +1 day so the
+            # close fires on the calendar day AFTER each entry. Same-day
+            # closes have close_weekdays == weekdays automatically.
+            close_days_str = _wd_str(session.close_weekdays)
 
             self._scheduler.add_job(
                 on_entry,
                 CronTrigger(
                     hour=entry_t.hour, minute=entry_t.minute,
-                    day_of_week=sess_days, timezone=UTC,
+                    day_of_week=entry_days_str, timezone=UTC,
                 ),
                 id=f"session_entry_{session.name}",
                 name=(
@@ -74,7 +96,7 @@ class Scheduler:
                 on_close,
                 CronTrigger(
                     hour=close_t.hour, minute=close_t.minute,
-                    day_of_week=sess_days, timezone=UTC,
+                    day_of_week=close_days_str, timezone=UTC,
                 ),
                 id=f"session_close_{session.name}",
                 name=(
@@ -90,8 +112,11 @@ class Scheduler:
                 name=session.name,
                 entry=f"{entry_t.hour:02d}:{entry_t.minute:02d} UTC",
                 close=f"{close_t.hour:02d}:{close_t.minute:02d} UTC",
-                qty_per_leg=session.qty_per_leg,
-                days=sess_days,
+                sizing=session.describe_sizing(),
+                fallback_qty_per_leg=session.qty_per_leg,
+                entry_days=entry_days_str,
+                close_days=close_days_str,
+                crosses_midnight=session.crosses_midnight,
                 trading_day_offset_days=session.trading_day_offset_days,
             )
 
