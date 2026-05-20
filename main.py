@@ -300,6 +300,16 @@ class Algo:
                 "differs from config.OKX_CONTRACT_SIZE_BTC. See "
                 "contract_size_api_mismatch log entry."
             )
+            await notifier.send(
+                "<b>STARTUP CONTRACT-SIZE MISMATCH</b>\n"
+                "OKX's live ctVal × ctMult does not match the algo's "
+                "configured BTC-per-contract value. This would cause "
+                "catastrophic position sizing on the next trade.\n\n"
+                "<b>Entries are LOCKED</b> until reconciled.\n"
+                "Action: align OKX_CONTRACT_SIZE_BTC (CM) or "
+                "OKX_CONTRACT_SIZE_BTC_UM (UM) in .env with the live "
+                "API value, then restart."
+            )
 
         # Validate that OPTION_ENTRY_CHASE_DEADLINE_MIN fits inside every
         # session's entry-window (entry_utc → close_utc). The chase MUST
@@ -329,16 +339,6 @@ class Algo:
         else:
             log.info("chase_deadline_validation_ok",
                      deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
-            await notifier.send(
-                "<b>STARTUP CONTRACT-SIZE MISMATCH</b>\n"
-                "OKX's live ctVal × ctMult does not match the algo's "
-                "configured BTC-per-contract value. This would cause "
-                "catastrophic position sizing on the next trade.\n\n"
-                "<b>Entries are LOCKED</b> until reconciled.\n"
-                "Action: align OKX_CONTRACT_SIZE_BTC (CM) or "
-                "OKX_CONTRACT_SIZE_BTC_UM (UM) in .env with the live "
-                "API value, then restart."
-            )
 
         # Auth-required startup safeguards. Run whenever we HAVE credentials,
         # regardless of DRY_RUN — this lets a dry-run boot still validate the
