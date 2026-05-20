@@ -99,6 +99,20 @@ def _check_lock(force: bool) -> int:
             "or unreadable. Pass --force to override."
         )
         return 3
+    # Docker PID-1 collision: when the algo runs in a container as PID 1,
+    # it writes "1" to state/algo.pid. If the operator runs this script
+    # via `docker-compose run --rm algo python tools/force_liquidate.py`
+    # AFTER stopping the algo, the one-off container is also PID 1 and
+    # the state/ volume is shared. os.kill(1, 0) would falsely succeed
+    # against ourselves. Detect & treat as stale.
+    if pid == os.getpid():
+        print(
+            f"[force_liquidate] note: lock file pid={pid} matches our own "
+            "PID. Classic Docker PID-1 collision (stopped algo container "
+            "shared state/ with this one-off run). Lock is stale — "
+            "proceeding."
+        )
+        return 0
     # Probe the PID. We're typically running OUTSIDE the container so the
     # PID space is the host's; the algo's PID 1 inside the container won't
     # exist on the host. We treat "PID does not exist on this host" as
