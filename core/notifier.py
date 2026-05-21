@@ -13,47 +13,130 @@ import config
 log = structlog.get_logger(__name__)
 
 
+# Telegram's hard per-message ceiling is 4096 chars. We use a slightly
+# tighter chunking limit so we have headroom for an eventual "(1/N)"
+# footer if we ever decide to add chunk markers, and to absorb any HTML
+# entity expansion (rare, but defensive).
+_TELEGRAM_CHUNK_LIMIT = 4000
+
+
+def _split_for_telegram(text: str, limit: int = _TELEGRAM_CHUNK_LIMIT) -> list[str]:
+    """Split a long message into chunks ≤ ``limit`` chars.
+
+    Telegram rejects any single sendMessage that exceeds 4096 chars
+    (HTTP 400 ``message is too long``). The full daily report has
+    exceeded this since the per-session breakdown grew, which is why
+    every daily send has been silently dropped.
+
+    Strategy:
+      1. If the message fits, return it unchanged.
+      2. Otherwise split on the strongest break (``\\n\\n``,
+         section/paragraph boundary). HTML tags in this codebase are
+         always closed within a single paragraph so this preserves
+         valid HTML in every chunk.
+      3. If a single paragraph still exceeds the limit (rare — would
+         require a single section bigger than 4 KiB), fall back to
+         single-newline split, then a hard character cut as a last
+         resort. The hard-cut path is the only one that can produce
+         malformed HTML; in practice the report formatter never builds
+         a section that long.
+
+    Returns at least one chunk. Each chunk is non-empty.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current: str = ""
+
+    def _push(s: str) -> None:
+        if s:
+            chunks.append(s)
+
+    def _add(piece: str, separator: str) -> None:
+        nonlocal current
+        if not piece:
+            return
+        candidate = current + separator + piece if current else piece
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            _push(current)
+            current = piece
+
+    for paragraph in text.split("\n\n"):
+        if len(paragraph) <= limit:
+            _add(paragraph, "\n\n")
+            continue
+        # paragraph is itself > limit — split by single newline.
+        _push(current)
+        current = ""
+        for line in paragraph.split("\n"):
+            if len(line) <= limit:
+                _add(line, "\n")
+                continue
+            # line is > limit — hard character cut as last resort.
+            _push(current)
+            current = ""
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+
+    _push(current)
+    return chunks
+
+
 async def _send_to(bot_token: str, chat_id: str, text: str) -> None:
     """Send a Telegram message and SURFACE any failure.
 
     aiohttp does NOT raise on HTTP 4xx/5xx by default; the prior version
-    of this function `await`-ed the POST and threw away the response,
+    of this function ``await``-ed the POST and threw away the response,
     which silently swallowed Telegram API rejections (wrong chat id,
     bot kicked from group, message length > 4096, malformed HTML, etc.).
-    The caller would log e.g. "daily_report_sent" even when nothing
+    The caller would log e.g. ``daily_report_sent`` even when nothing
     actually arrived in the chat.
 
-    Now we read the response body, log the HTTP status + Telegram
-    error description on any non-200, and raise on transport errors so
-    callers can trigger their own "report_failed" branch.
+    Now we:
+      * Chunk the message at paragraph boundaries so single sends never
+        exceed Telegram's 4096-char hard limit.
+      * Read the response body and log ``telegram_send_rejected`` with
+        the HTTP status + Telegram error description on any non-200.
     """
     if not bot_token or not chat_id:
         log.debug("telegram_disabled", chat_id=chat_id, msg=text[:80])
         return
+    chunks = _split_for_telegram(text)
+    if len(chunks) > 1:
+        log.info(
+            "telegram_message_chunked",
+            chat_id=chat_id,
+            total_len=len(text),
+            num_chunks=len(chunks),
+        )
     try:
         import aiohttp
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-            }) as response:
-                body = await response.text()
-                if response.status != 200:
-                    # Telegram returns JSON like:
-                    # {"ok":false,"error_code":400,
-                    #  "description":"Bad Request: chat not found"}
-                    # Logging body[:500] gives operators the actionable
-                    # signal without leaking surrounding context.
-                    log.warning(
-                        "telegram_send_rejected",
-                        chat_id=chat_id,
-                        http_status=response.status,
-                        body=body[:500],
-                        msg_len=len(text),
-                        msg_preview=text[:200],
-                    )
+            for idx, chunk in enumerate(chunks, start=1):
+                async with session.post(url, json={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                }) as response:
+                    body = await response.text()
+                    if response.status != 200:
+                        # Telegram returns JSON like:
+                        # {"ok":false,"error_code":400,
+                        #  "description":"Bad Request: chat not found"}
+                        log.warning(
+                            "telegram_send_rejected",
+                            chat_id=chat_id,
+                            http_status=response.status,
+                            body=body[:500],
+                            chunk_index=idx,
+                            chunk_total=len(chunks),
+                            msg_len=len(chunk),
+                            msg_preview=chunk[:200],
+                        )
     except Exception:
         log.warning("telegram_send_failed", chat_id=chat_id, exc_info=True)
 
