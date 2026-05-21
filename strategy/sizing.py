@@ -65,6 +65,9 @@ Safety guards (in priority order)
 5.  Enforce a hard cap of ``config.MAX_QTY_PER_LEG_BTC`` (default 5.0
     BTC). Catches a runaway equity-tracking bug. When the cap binds
     we log ``sizing_capped_to_max`` at INFO so the operator can bump it.
+    Set ``MAX_QTY_PER_LEG_BTC=0`` in ``.env`` to DISABLE the cap entirely
+    (e.g. when the operator has explicitly chosen to honour the
+    configured pct_equity at all equity levels).
 6.  If the rounded qty is below ``config.MIN_QTY_PER_LEG_BTC`` (default
     0.01 BTC = 1 contract), return 0.0 to signal "skip this session".
     The caller (main._on_entry) treats 0.0 as a clean skip.
@@ -92,6 +95,19 @@ log = structlog.get_logger(__name__)
 # (max ~5 BTC / 0.01 = 500.0), and tight enough that a legitimately-just-
 # under value (e.g. 28.5 contracts) still floors to the lower count.
 _CONTRACT_FLOOR_EPS = 1e-9
+
+
+def _apply_max_cap(qty_btc: float) -> float:
+    """Apply the optional MAX_QTY_PER_LEG_BTC cap.
+
+    A non-positive ``MAX_QTY_PER_LEG_BTC`` (typically ``0``) DISABLES
+    the cap entirely — the operator has opted out of the safety rail.
+    Any positive value is treated as an inclusive ceiling.
+    """
+    cap = config.MAX_QTY_PER_LEG_BTC
+    if cap <= 0:
+        return qty_btc
+    return min(qty_btc, cap)
 
 
 def _round_down_to_contract(qty_btc: float) -> float:
@@ -165,8 +181,7 @@ def compute_qty_per_leg(
 
     # Fast path: fixed_btc mode short-circuits all the dynamic logic.
     if session.sizing_mode != "pct_equity":
-        qty = _round_down_to_contract(session.qty_per_leg)
-        qty = min(qty, config.MAX_QTY_PER_LEG_BTC)
+        qty = _apply_max_cap(_round_down_to_contract(session.qty_per_leg))
         audit.update({
             "decision": "fixed_btc",
             "final_qty_btc": qty,
@@ -175,8 +190,7 @@ def compute_qty_per_leg(
 
     # ── pct_equity mode ──
     if equity_usd <= 0:
-        fallback = _round_down_to_contract(session.qty_per_leg)
-        fallback = min(fallback, config.MAX_QTY_PER_LEG_BTC)
+        fallback = _apply_max_cap(_round_down_to_contract(session.qty_per_leg))
         audit.update({
             "decision": "fallback_zero_equity",
             "final_qty_btc": fallback,
@@ -189,8 +203,7 @@ def compute_qty_per_leg(
     audit["est_premium_per_btc_usd"] = round(per_btc_premium_usd, 2)
 
     if per_btc_premium_usd <= 0:
-        fallback = _round_down_to_contract(session.qty_per_leg)
-        fallback = min(fallback, config.MAX_QTY_PER_LEG_BTC)
+        fallback = _apply_max_cap(_round_down_to_contract(session.qty_per_leg))
         audit.update({
             "decision": "fallback_no_premium_estimate",
             "final_qty_btc": fallback,
@@ -205,7 +218,7 @@ def compute_qty_per_leg(
     audit["raw_qty_btc"] = round(raw_qty, 6)
 
     rounded_raw = _round_down_to_contract(raw_qty)
-    qty = min(rounded_raw, config.MAX_QTY_PER_LEG_BTC)
+    qty = _apply_max_cap(rounded_raw)
     if qty < rounded_raw:
         # Cap binding silently truncates the operator's pct_equity
         # target. Log it so the operator notices and can bump the cap.
@@ -219,7 +232,8 @@ def compute_qty_per_leg(
             target_premium_usd=audit["target_premium_usd"],
             note=(
                 "Final qty capped by MAX_QTY_PER_LEG_BTC. Bump the env "
-                "var to honour the configured pct_equity at higher equity."
+                "var to honour the configured pct_equity at higher equity, "
+                "or set MAX_QTY_PER_LEG_BTC=0 to DISABLE the cap."
             ),
         )
 

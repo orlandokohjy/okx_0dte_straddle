@@ -14,6 +14,19 @@ log = structlog.get_logger(__name__)
 
 
 async def _send_to(bot_token: str, chat_id: str, text: str) -> None:
+    """Send a Telegram message and SURFACE any failure.
+
+    aiohttp does NOT raise on HTTP 4xx/5xx by default; the prior version
+    of this function `await`-ed the POST and threw away the response,
+    which silently swallowed Telegram API rejections (wrong chat id,
+    bot kicked from group, message length > 4096, malformed HTML, etc.).
+    The caller would log e.g. "daily_report_sent" even when nothing
+    actually arrived in the chat.
+
+    Now we read the response body, log the HTTP status + Telegram
+    error description on any non-200, and raise on transport errors so
+    callers can trigger their own "report_failed" branch.
+    """
     if not bot_token or not chat_id:
         log.debug("telegram_disabled", chat_id=chat_id, msg=text[:80])
         return
@@ -21,11 +34,26 @@ async def _send_to(bot_token: str, chat_id: str, text: str) -> None:
         import aiohttp
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         async with aiohttp.ClientSession() as session:
-            await session.post(url, json={
+            async with session.post(url, json={
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
-            })
+            }) as response:
+                body = await response.text()
+                if response.status != 200:
+                    # Telegram returns JSON like:
+                    # {"ok":false,"error_code":400,
+                    #  "description":"Bad Request: chat not found"}
+                    # Logging body[:500] gives operators the actionable
+                    # signal without leaking surrounding context.
+                    log.warning(
+                        "telegram_send_rejected",
+                        chat_id=chat_id,
+                        http_status=response.status,
+                        body=body[:500],
+                        msg_len=len(text),
+                        msg_preview=text[:200],
+                    )
     except Exception:
         log.warning("telegram_send_failed", chat_id=chat_id, exc_info=True)
 
