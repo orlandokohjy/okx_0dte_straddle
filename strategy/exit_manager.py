@@ -33,11 +33,20 @@ class ExitManager:
                      session=session_name, label=session_label)
             return 0.0
 
+        equity_before = self._portfolio.equity
         pnl = await unwind_straddle(
             self._exchange, self._market, self._portfolio,
             reason="session_close",
         )
+        # close_straddle stores entry/exit prices, gross_pnl, fees on
+        # the just-closed Straddle; pull it via the dedicated accessor
+        # so notify_close can render the full breakdown.
+        closed = self._portfolio.last_closed_straddle
         await notifier.notify_close(
-            pnl, "session_close", session_label=session_label,
+            pnl, "session_close",
+            session_label=session_label,
+            straddle=closed,
+            equity_before=equity_before,
+            equity_after=self._portfolio.equity,
         )
         return pnl

@@ -104,7 +104,9 @@ class Straddle:
     exit_time: Optional[str] = None
     exit_call_price: Optional[float] = None
     exit_put_price: Optional[float] = None
-    pnl: Optional[float] = None
+    pnl: Optional[float] = None  # NET P&L (gross − fees)
+    gross_pnl: Optional[float] = None  # Pre-fee P&L (call + put leg P&L)
+    fees: Optional[float] = None  # Total maker fees across all 4 legs (USD)
 
     def _is_um(self) -> bool:
         """Treat empty-string family as CM (legacy)."""
@@ -251,6 +253,15 @@ class Portfolio:
     def open_straddle(self) -> Optional[Straddle]:
         return self._straddle if self.has_open else None
 
+    @property
+    def last_closed_straddle(self) -> Optional[Straddle]:
+        """The most recently closed Straddle, or None if no straddle has
+        ever been opened (or the current one is still open). Used by the
+        SESSION CLOSE Telegram message to render entry/exit detail."""
+        if self._straddle is None or self._straddle.status != "closed":
+            return None
+        return self._straddle
+
     def set_straddle(self, s: Straddle) -> None:
         self._straddle = s
         self._save_positions()
@@ -289,6 +300,8 @@ class Portfolio:
         s.exit_call_price = exit_call_price
         s.exit_put_price = exit_put_price
         s.pnl = net_pnl  # ← ledger snapshot now matches wallet behaviour
+        s.gross_pnl = gross_pnl
+        s.fees = total_fees_usd
 
         self._equity += net_pnl
         self._daily_pnl += net_pnl

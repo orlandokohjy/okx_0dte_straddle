@@ -187,17 +187,166 @@ async def notify_entry(
     )
 
 
-async def notify_close(
-    pnl: float, exit_reason: str, session_label: str = "",
-) -> None:
-    pnl_sign = "+" if pnl >= 0 else ""
+def _fmt_signed_usd(v: float) -> str:
+    sign = "+" if v >= 0 else ""
+    return f"{sign}${v:,.2f}"
+
+
+def _format_close_message(
+    pnl: float,
+    session_label: str = "",
+    straddle: object | None = None,
+    equity_before: float | None = None,
+    equity_after: float | None = None,
+) -> str:
+    """Render the SESSION CLOSE message body.
+
+    Falls back to the legacy two-line format (header + Net P&L) if the
+    straddle reference isn't supplied — keeps the function safe for
+    legacy call-sites and for the "nothing was open" path that should
+    never reach the rich branch in practice.
+    """
     header = "<b>SESSION CLOSE</b>"
     if session_label:
         header = f"<b>SESSION CLOSE [{session_label}]</b>"
-    await send(
-        f"{header}\n"
-        f"P&L: {pnl_sign}${pnl:,.2f}\n"
+
+    if straddle is None:
+        return f"{header}\nNet P&amp;L: {_fmt_signed_usd(pnl)}\n"
+
+    # Pull what we need off the Straddle dataclass without importing it
+    # (avoids a circular import). Every attribute used here is set on
+    # the straddle by core.portfolio.close_straddle before notify_close
+    # is invoked.
+    s = straddle
+    is_um = (getattr(s, "family", "") or "CM").upper() == "UM"
+    quote_unit = "USD" if is_um else "BTC"
+
+    qty = float(getattr(s, "qty_per_leg", 0.0))
+    num = int(getattr(s, "num_straddles", 1))
+    strike = float(getattr(s, "strike", 0.0))
+    entry_spot = float(getattr(s, "entry_spot_price", 0.0) or 0.0)
+    exit_spot = float(getattr(s, "exit_spot_price", 0.0) or 0.0) or entry_spot
+    spot_delta = exit_spot - entry_spot
+
+    call_leg = getattr(s, "call_leg", None)
+    put_leg = getattr(s, "put_leg", None)
+    call_inst = getattr(call_leg, "instrument", "?") if call_leg else "?"
+    put_inst = getattr(put_leg, "instrument", "?") if put_leg else "?"
+
+    entry_call = float(getattr(s, "entry_call_price", 0.0) or 0.0)
+    entry_put = float(getattr(s, "entry_put_price", 0.0) or 0.0)
+    exit_call = float(getattr(s, "exit_call_price", 0.0) or 0.0)
+    exit_put = float(getattr(s, "exit_put_price", 0.0) or 0.0)
+
+    # Per-leg USD value at entry / exit. For CM, native_premium × spot.
+    # For UM, native_premium IS USD.
+    if is_um:
+        call_entry_usd = entry_call * qty * num
+        call_exit_usd = exit_call * qty * num
+        put_entry_usd = entry_put * qty * num
+        put_exit_usd = exit_put * qty * num
+    else:
+        call_entry_usd = entry_call * entry_spot * qty * num
+        call_exit_usd = exit_call * exit_spot * qty * num
+        put_entry_usd = entry_put * entry_spot * qty * num
+        put_exit_usd = exit_put * exit_spot * qty * num
+
+    call_pnl = call_exit_usd - call_entry_usd
+    put_pnl = put_exit_usd - put_entry_usd
+
+    gross = float(getattr(s, "gross_pnl", None) or (call_pnl + put_pnl))
+    fees = float(getattr(s, "fees", None) or 0.0)
+    net = float(getattr(s, "pnl", pnl) or pnl)
+
+    # Native-quote formatting: BTC needs 4 dp, USD 2 dp. Handles both.
+    def _fmt_native(v: float) -> str:
+        return f"{v:.4f} {quote_unit}" if not is_um else f"${v:,.2f}"
+
+    lines: list[str] = [header]
+    lines.append(f"ID: {getattr(s, 'id', '?')}")
+
+    if strike > 0:
+        if entry_spot > 0 and abs(spot_delta) > 0.01:
+            lines.append(
+                f"Strike: ${strike:,.0f}  |  "
+                f"Spot: ${entry_spot:,.0f} → ${exit_spot:,.0f} "
+                f"({_fmt_signed_usd(spot_delta)})"
+            )
+        elif entry_spot > 0:
+            lines.append(
+                f"Strike: ${strike:,.0f}  |  Spot: ${entry_spot:,.0f}"
+            )
+        else:
+            lines.append(f"Strike: ${strike:,.0f}")
+
+    qty_line = f"Qty: {qty:.4f} BTC/leg"
+    if num != 1:
+        qty_line += f" × {num} straddles"
+    lines.append(qty_line)
+    lines.append("")  # blank line before legs
+
+    # ── Call leg ──
+    lines.append(f"<b>Call</b> {call_inst}")
+    lines.append(
+        f"  Entry: {_fmt_native(entry_call)} "
+        f"({_fmt_signed_usd(call_entry_usd).lstrip('+')})"
     )
+    lines.append(
+        f"  Exit:  {_fmt_native(exit_call)} "
+        f"({_fmt_signed_usd(call_exit_usd).lstrip('+')})"
+    )
+    lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(call_pnl)}")
+
+    # ── Put leg ──
+    lines.append(f"<b>Put</b> {put_inst}")
+    lines.append(
+        f"  Entry: {_fmt_native(entry_put)} "
+        f"({_fmt_signed_usd(put_entry_usd).lstrip('+')})"
+    )
+    lines.append(
+        f"  Exit:  {_fmt_native(exit_put)} "
+        f"({_fmt_signed_usd(put_exit_usd).lstrip('+')})"
+    )
+    lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(put_pnl)}")
+    lines.append("")
+
+    # ── P&L breakdown ──
+    lines.append(f"<b>Gross P&amp;L:</b> {_fmt_signed_usd(gross)}  "
+                 f"<i>(call + put)</i>")
+    lines.append(f"<b>Fees:</b>      -${fees:,.2f}")
+    lines.append(f"<b>Net P&amp;L:</b>   {_fmt_signed_usd(net)}")
+
+    if equity_before is not None and equity_after is not None:
+        lines.append("")
+        lines.append(
+            f"Equity: ${equity_before:,.2f} → ${equity_after:,.2f}"
+        )
+
+    return "\n".join(lines)
+
+
+async def notify_close(
+    pnl: float, exit_reason: str, session_label: str = "",
+    straddle: object | None = None,
+    equity_before: float | None = None,
+    equity_after: float | None = None,
+) -> None:
+    """SESSION CLOSE message.
+
+    Backward-compatible: ``straddle`` / ``equity_before`` / ``equity_after``
+    are optional. When supplied, the message renders entry/exit prices
+    per leg, gross P&L, fees, net P&L, and the equity delta. When not,
+    falls back to the legacy two-line format so existing call-sites
+    don't crash.
+    """
+    body = _format_close_message(
+        pnl,
+        session_label=session_label,
+        straddle=straddle,
+        equity_before=equity_before,
+        equity_after=equity_after,
+    )
+    await send(body)
 
 
 async def notify_skip(reason: str) -> None:
