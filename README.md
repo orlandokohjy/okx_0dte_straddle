@@ -1,3 +1,10 @@
+> **⚠️ AGENTS / OPERATORS — READ [`AGENTS.md`](./AGENTS.md) FIRST.**
+> It encodes the deploy/ops/code conventions for this live trading
+> system. Violating those conventions has caused real production
+> incidents. The `.cursor/rules/`, `CLAUDE.md`, `.cursorrules`,
+> `.clinerules`, `.aider.conf.yml`, and `GEMINI.md` files all point
+> there.
+
 # OKX 0DTE Pure Straddle Algo
 
 Multi-session long-straddle on OKX BTC options. Two entries per

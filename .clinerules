@@ -1,0 +1,13 @@
+Cline / Roo Cline: Before touching anything in this repository, read
+AGENTS.md at the repo root.
+
+It documents:
+- The exact Docker service name (`algo`) and compose binary
+  (`docker-compose`, hyphenated V1)
+- When `--no-cache` is and isn't appropriate
+- Tick-rounding invariants (must use `core.family.round_price_to_tick`)
+- Maker-only invariants on `chase_buy`/`chase_sell`
+- The hardcoded session schedule and reporting cadence
+- Things prior agent sessions got wrong — DO NOT REPEAT them
+
+AGENTS.md is the single source of truth.

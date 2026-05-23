@@ -1,0 +1,17 @@
+CRITICAL: Before doing anything in this repository, read AGENTS.md at
+the repo root. It encodes deploy/ops/code conventions for a live
+trading system. Violating those conventions has caused real
+production incidents.
+
+AGENTS.md is the single source of truth. The .cursor/rules/ folder
+contains the always-apply rule that enforces this. This file (the
+legacy .cursorrules format) exists for backward compatibility with
+older Cursor versions.
+
+Key invariants you MUST respect (full list in AGENTS.md):
+- Docker service is `algo`, never `okx-straddle`
+- Compose binary is `docker-compose` (hyphenated, V1), not `docker compose`
+- Never use `--no-cache` on routine code-only deploys
+- Tick rounding goes through `core.family.round_price_to_tick`
+- `chase_buy` and `chase_sell` must keep `post_only=True`
+- Session day-of-week is hardcoded in `config.SESSIONS`

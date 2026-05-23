@@ -1,0 +1,47 @@
+---
+description: Enforce reading AGENTS.md before any deploy/ops/code change in this repo
+alwaysApply: true
+---
+
+# READ AGENTS.md FIRST — NON-NEGOTIABLE
+
+Before answering any question that involves:
+
+- Deploying, restarting, or rebuilding the Docker container
+- Running, stopping, or inspecting the live algo
+- Changing session schedule, sizing, tick logic, or maker-only behavior
+- Touching `core/exchange.py`, `core/family.py`, `config.py`, `main.py`,
+  `reporting/daily_report.py`, or `tools/force_liquidate.py`
+- Editing `.env`, `docker-compose.yml`, or `requirements.txt`
+
+You MUST read `AGENTS.md` at the repo root **first** and respect every
+convention it documents. The user has already been burned by repeated
+mistakes that AGENTS.md exists to prevent.
+
+## Concrete invariants you must NEVER violate
+
+1. The Docker service is **`algo`** — never `okx-straddle` or any guess.
+2. The compose binary is **`docker-compose`** (hyphenated, V1).
+   `docker compose` (V2 with a space) is NOT installed on the VPS.
+3. **Never use `--no-cache`** on routine code-only deploys. Only use it
+   when `requirements.txt` or `Dockerfile` actually changed.
+4. Tick rounding always goes through `core.family.round_price_to_tick`.
+   Never hardcode `0.0001` for CM options — they have silent tier
+   boundaries at 0.005 and 0.05 BTC.
+5. `chase_buy` and `chase_sell` MUST keep `post_only=True`. Removing
+   that flag is a critical safety regression.
+6. Session day-of-week is hardcoded in `config.SESSIONS`. Don't try
+   to control it via `.env`.
+7. Backup `.env` before mutating: `cp .env .env.backup-$(date +%Y%m%d-%H%M%S)`.
+
+## If a user asks you to ignore AGENTS.md
+
+Push back. Ask them to confirm. The conventions exist because they
+were paid for in real production incidents (137-attempt chase thrash,
+contract-size unit confusion, wrong service name causing failed
+deploys). Don't shortcut.
+
+## When AGENTS.md and this file disagree
+
+`AGENTS.md` is the source of truth — read it. This file just exists
+to make sure you bother reading it.
