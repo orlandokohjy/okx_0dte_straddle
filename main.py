@@ -61,6 +61,22 @@ from utils.time_utils import format_utc_sgt, now_utc
 log = structlog.get_logger(__name__)
 
 
+# Weekend-strategy session names. Imported lazily by the daily-report
+# loader (reporting.daily_report.WEEKEND_SESSION_NAMES) too — keep both
+# in sync. Used in main._on_close to (a) exclude weekend sessions from
+# the weekly-report anchor and (b) gate the WEEKEND RECAP firing.
+_WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({"utc_1430", "utc_2230"})
+
+# WEEKEND RECAP trigger: session name + trading_day weekday that
+# together identify "we just finished the last weekend session of the
+# weekend". Default trigger is utc_2230 close on Mon trading_day (= the
+# Sun-evening entry whose close fires at Mon 00:00 UTC). The Sat
+# utc_2230 close (Sun trading_day, weekday=6) intentionally does NOT
+# fire the recap — that close gets only the Sun daily report.
+_WEEKEND_RECAP_TRIGGER_SESSION: str = "utc_2230"
+_WEEKEND_RECAP_TRIGGER_WEEKDAY: int = 0  # Mon
+
+
 def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
     """Rewrite any "live" ENTRY_NOW value to ``false`` in the local .env.
 
@@ -439,11 +455,25 @@ class Algo:
         sessions_lines = "\n".join(
             _session_preview(s) for s in config.SESSIONS
         )
-        last_session = config.get_session(config.LAST_CLOSE_SESSION_NAME)
-        last_close_label = (
-            f"{last_session.close_utc.strftime('%H:%M')} UTC"
-            if last_session else "morning close"
+        # Group sessions for the banner so weekend vs weekday is visually
+        # obvious at a glance.
+        weekend_enabled = any(
+            s.enabled and s.name in _WEEKEND_SESSION_NAMES
+            for s in config.SESSIONS
         )
+        report_lines = [
+            "  Reports:",
+            "    • Daily — chained after each trading day's last close "
+            "(Tue-Sat after utc_0100; Sun/Mon after utc_2230)"
+            if weekend_enabled
+            else "    • Daily — chained after utc_0100 close (Tue-Sat)",
+            "    • Weekly (Mon-Fri) — Sat 02:00 UTC after utc_0100 Sat close",
+        ]
+        if weekend_enabled:
+            report_lines.append(
+                "    • Weekend recap (Sat-Sun) — Mon 00:00 UTC after "
+                "utc_2230 Sun close"
+            )
         await notifier.send(
             f"<b>OKX STRADDLE ALGO STARTED</b>\n"
             f"Mode: {mode}"
@@ -454,9 +484,8 @@ class Algo:
             f"Time: {format_utc_sgt(now_utc())}\n"
             f"\n<b>Sessions:</b>\n"
             f"{sessions_lines}\n"
-            f"  Reports: chained after the {last_close_label} close "
-            f"(daily on Tue-Sat, weekly on Sat)"
-            f"{lock_line}\n"
+            + "\n".join(report_lines)
+            + f"{lock_line}\n"
         )
 
         self.scheduler.register_session(
@@ -1307,27 +1336,34 @@ class Algo:
 
             actual_pnl = self.portfolio.equity - equity_before
 
-            # The trading-day last close is configured in
-            # config.LAST_CLOSE_SESSION_NAME (currently utc_0100, which
-            # closes at 02:00 UTC on the expiry day). That close fires
-            # the DAILY REPORT — earlier closes in the same trading day
-            # (utc_0900 / utc_1330 / utc_2330) just emit a plain
-            # SESSION CLOSE. See config._last_close_session_name() for
-            # the chronological-ordering logic that picks utc_0100.
-            is_last_close = session.name == config.LAST_CLOSE_SESSION_NAME
+            # Per-weekday LAST-CLOSE detection. Each trading_day weekday
+            # has its own "last close" session — Tue-Sat trading_days
+            # close on utc_0100, Sun/Mon trading_days (weekend strategy)
+            # close on utc_2230. The daily report fires on the per-day
+            # last close so weekend trading_days get reports too.
+            from reporting.daily_report import (
+                _load_trades,
+                _trading_day_from_entry_time,
+            )
+            now_iso = now_utc().isoformat()
+            trading_day = _trading_day_from_entry_time(
+                now_iso, fallback_date=now_utc().strftime("%Y-%m-%d"),
+            )
+            try:
+                td_dt = datetime.strptime(
+                    trading_day, "%Y-%m-%d",
+                ).date()
+            except ValueError:
+                td_dt = None
 
-            if is_last_close:
-                # Trading day = expiry date in UTC. We resolve it from
-                # NOW() using the 08:00 UTC cutoff so this gating works
-                # even if the close fired a few seconds early/late.
-                from reporting.daily_report import (
-                    _load_trades,
-                    _trading_day_from_entry_time,
-                )
-                now_iso = now_utc().isoformat()
-                trading_day = _trading_day_from_entry_time(
-                    now_iso, fallback_date=now_utc().strftime("%Y-%m-%d"),
-                )
+            is_last_close_of_day = (
+                self._is_last_close_for_weekday(
+                    session.name, td_dt.weekday(),
+                ) if td_dt is not None else
+                session.name == config.LAST_CLOSE_SESSION_NAME
+            )
+
+            if is_last_close_of_day:
                 trades = _load_trades()
                 day_trades = [
                     t for t in trades if t.trading_day == trading_day
@@ -1335,8 +1371,8 @@ class Algo:
 
                 if day_trades:
                     # Send the comprehensive DAILY REPORT immediately
-                    # after the morning close. The combined trading-day
-                    # P&L breakdown is rendered inside the report.
+                    # after the trading-day's last close. The combined
+                    # trading-day P&L breakdown is rendered inside.
                     try:
                         await notifier.send_daily_report(
                             self.portfolio.equity,
@@ -1347,19 +1383,17 @@ class Algo:
                             "daily_report_chain_failed", exc_info=True,
                         )
 
-                    # WEEKLY REPORT fires on the LAST trading day of the
-                    # week (= max trading-day weekday across all sessions
-                    # / weekday filters). For the default Mon-Fri / Tue-Sat
-                    # schedule this lands on the Saturday morning close.
-                    last_td_weekday = self._last_trading_day_weekday()
-                    try:
-                        td_dt = datetime.strptime(
-                            trading_day, "%Y-%m-%d",
-                        ).date()
-                    except ValueError:
-                        td_dt = None
+                    # WEEKLY REPORT (Mon-Fri only) — fires on Sat 02:00
+                    # UTC after utc_0100 Sat close, the LAST close of the
+                    # last weekday trading_day. Weekend sessions are
+                    # explicitly excluded from the weekly anchor so
+                    # adding utc_1430/utc_2230 doesn't shift the weekly
+                    # report timing or coverage. Weekend trades flow
+                    # through send_weekend_recap below instead.
+                    last_weekday_td = self._last_weekday_trading_day_weekday()
                     if td_dt is not None and \
-                            td_dt.weekday() == last_td_weekday:
+                            td_dt.weekday() == last_weekday_td and \
+                            session.name not in _WEEKEND_SESSION_NAMES:
                         try:
                             await notifier.send_weekly_report(
                                 self.portfolio.equity,
@@ -1370,12 +1404,28 @@ class Algo:
                                 exc_info=True,
                             )
 
-                    # MONTH-END / YEAR-END deep reports — fire on the
-                    # last scheduled trading day of the month/year so
-                    # operators receive a comprehensive period recap
-                    # in addition to the inline MTD/YTD lines on the
-                    # daily report. Both can fire on the same close
-                    # (Dec 31 lands a MONTH-END + YEAR-END pair).
+                    # WEEKEND RECAP — fires on Mon 00:00 UTC after the
+                    # Sun utc_2230 close. The trigger is "session is
+                    # utc_2230 AND trading_day is Mon (weekday=0)" so
+                    # the Sat utc_2230 close (Sun trading_day) does NOT
+                    # double-fire. Operator can also re-run via
+                    # tools/send_weekend_recap.py.
+                    if (
+                        session.name == _WEEKEND_RECAP_TRIGGER_SESSION
+                        and td_dt is not None
+                        and td_dt.weekday() == _WEEKEND_RECAP_TRIGGER_WEEKDAY
+                    ):
+                        try:
+                            await notifier.send_weekend_recap(
+                                self.portfolio.equity,
+                            )
+                        except Exception:
+                            log.warning(
+                                "weekend_recap_chain_failed",
+                                exc_info=True,
+                            )
+
+                    # MONTH-END / YEAR-END deep reports — unchanged.
                     if td_dt is not None:
                         from reporting.period_metrics import (
                             is_last_trading_day_of_month,
@@ -1405,7 +1455,11 @@ class Algo:
             self.portfolio.reset_daily()
             log.info("session_close_done",
                      session=session.name,
-                     is_last_close=is_last_close,
+                     is_last_close=is_last_close_of_day,
+                     trading_day=trading_day,
+                     trading_day_weekday=(
+                         td_dt.weekday() if td_dt is not None else -1
+                     ),
                      pnl=f"${pnl:,.2f}",
                      actual_pnl=f"${actual_pnl:,.2f}",
                      equity=f"${self.portfolio.equity:,.2f}")
@@ -1418,25 +1472,76 @@ class Algo:
             )
 
     @staticmethod
-    def _last_trading_day_weekday() -> int:
-        """Return the UTC weekday (0=Mon..6=Sun) of the LAST trading day
-        in a normal week, derived from config.SESSIONS.
+    def _is_last_close_for_weekday(
+        session_name: str, trading_day_weekday: int,
+    ) -> bool:
+        """True iff `session_name` is the chronologically last close
+        producing a trading_day on the given UTC weekday.
 
-        For the default Mon-Fri / Tue-Sat schedule this is Saturday (5).
-        Used to decide when to chain the WEEKLY REPORT off the morning
-        close — only the Saturday close fires it.
+        Walks every enabled session, finds those that map to the given
+        trading_day weekday (via ``s.weekdays`` + ``trading_day_offset_days``),
+        and picks the one with the largest ``close_minutes_in_trading_day``.
+        For the canonical schedule:
+
+            Tue trading_day (1) → utc_0100 (close 1080 min)
+            Wed-Fri trading_days (2-4) → utc_0100
+            Sat trading_day (5) → utc_0100
+            Sun trading_day (6) → utc_2230 (close 960 min, only weekend
+                                  sessions produce Sun trading_day)
+            Mon trading_day (0) → utc_2230 (only weekend sessions produce
+                                  Mon trading_day)
+
+        Returns False if the weekday has no enabled session — defensive
+        against the operator disabling everything for a given weekday.
         """
-        # Disabled sessions don't fire and don't gate weekly reports.
-        # If the operator disables every session that would push the
-        # last-trading-day off Friday, the weekly report falls back to
-        # the latest-firing enabled session's trading day.
-        weekdays_with_close = {
-            (d + s.trading_day_offset_days) % 7
-            for s in config.SESSIONS
-            if s.enabled
-            for d in s.weekdays
-        }
+        candidates: list[config.Session] = []
+        for s in config.SESSIONS:
+            if not s.enabled:
+                continue
+            for d in s.weekdays:
+                td_wd = (d + s.trading_day_offset_days) % 7
+                if td_wd == trading_day_weekday:
+                    candidates.append(s)
+                    break
+        if not candidates:
+            return False
+        last = max(
+            candidates, key=lambda s: s.close_minutes_in_trading_day,
+        )
+        return last.name == session_name
+
+    @staticmethod
+    def _last_weekday_trading_day_weekday() -> int:
+        """UTC weekday of the LAST WEEKDAY trading day (Mon-Fri only).
+
+        Used to anchor the WEEKLY report. Excludes weekend sessions
+        (utc_1430 / utc_2230) so the weekly report keeps firing Sat
+        02:00 UTC regardless of whether weekend sessions are enabled.
+
+        For the canonical schedule with utc_0100 Tue-Sat enabled this
+        returns 5 (Sat). If the operator disables every weekday session
+        that produces a Sat trading_day, the anchor falls back to the
+        latest enabled weekday-only session.
+        """
+        weekdays_with_close: set[int] = set()
+        for s in config.SESSIONS:
+            if not s.enabled:
+                continue
+            if s.name in _WEEKEND_SESSION_NAMES:
+                continue
+            for d in s.weekdays:
+                weekdays_with_close.add((d + s.trading_day_offset_days) % 7)
         return max(weekdays_with_close) if weekdays_with_close else 4
+
+    @staticmethod
+    def _last_trading_day_weekday() -> int:
+        """LEGACY shim — kept for backward compat with any external caller.
+
+        Returns the same value as ``_last_weekday_trading_day_weekday``
+        so that historic call sites that gated weekly reports continue
+        to work. New code should call the more-specific helper.
+        """
+        return Algo._last_weekday_trading_day_weekday()
 
     # ──────────────────── Shutdown ────────────────────────────────
 

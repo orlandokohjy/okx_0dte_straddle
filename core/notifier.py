@@ -394,6 +394,36 @@ async def send_weekly_report(equity: float) -> None:
         log.warning("weekly_report_failed", exc_info=True)
 
 
+async def send_weekend_recap(equity: float) -> None:
+    """Generate and send the weekend recap to the report group chat.
+
+    Fires after the LAST close of the weekend (utc_2230 Sun → Mon
+    00:00 UTC) so weekend-strategy trades are reported separately from
+    the Mon-Fri weekly. Skipped silently if no weekend trades exist
+    in the most recent Sat-Sun window (e.g. operator disabled both
+    weekend sessions).
+    """
+    from reporting.daily_report import (
+        compute_weekend_recap, format_weekend_recap,
+    )
+    try:
+        metrics = compute_weekend_recap(equity)
+        if metrics is None:
+            log.info(
+                "weekend_recap_skipped",
+                reason="no weekend trades this window",
+            )
+            return
+        await send_report(format_weekend_recap(metrics))
+        log.info(
+            "weekend_recap_sent",
+            window=metrics.trade_date,
+            trades=metrics.total_trades,
+        )
+    except Exception:
+        log.warning("weekend_recap_failed", exc_info=True)
+
+
 async def send_month_end_report(equity: float, trading_day: str) -> None:
     """Comprehensive MONTH-END REPORT — fires after the last close
     of the last trading day of the month.

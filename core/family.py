@@ -175,10 +175,123 @@ def tick_implausible_threshold() -> float:
     refuses to override its default if OKX returns something larger than
     this — guards against the 2026-05-07 unit-confusion regression.
 
-    CM: > 0.01 BTC is impossible (real tick is 0.0001).
+    CM: > 0.01 BTC is impossible (real tick is 0.0001 / 0.0005 / 0.005
+        depending on premium tier — see ``effective_tick_for_price``).
     UM: > 100 USD is impossible (real tick is 5).
     """
     return 0.01 if is_cm() else 100.0
+
+
+# ──────────────────── Tiered tick sizes (CM only) ─────────────────
+#
+# OKX BTC-USD inverse (CM) options use a TIERED tick size that is NOT
+# reported by /api/v5/public/instruments — the API returns 0.0001 BTC
+# uniformly across all instruments in the family. The actual tier
+# boundaries (verified empirically 2026-05-22 from the OKX trading UI):
+#
+#     premium native BTC range          effective tick
+#     ────────────────────────────────  ─────────────
+#     px <  0.005 BTC                   0.0001 BTC
+#     0.005 ≤ px < 0.05 BTC             0.0005 BTC
+#     px ≥  0.05 BTC                    0.005  BTC   (deep ITM only)
+#
+# Bug observed live 2026-05-21 utc_0900 close: chase_sell repriced from
+# 0.0055 → 0.0058 (incrementing by 0.0001 as the API claimed valid),
+# OKX silently rounded it back to 0.0055, the algo thought its order had
+# moved but it was sitting at the same price. Result: 137 reprice
+# attempts, 711-second chase, 21.8% slippage vs mark.
+#
+# UM (linear) is uniform 5 USD across all premiums (no tiers observed).
+
+# Tier boundaries in OKX-native premium price (BTC for CM, USD for UM).
+# Each entry: (lower_inclusive_bound, tick_at_or_above_bound).
+_CM_TIER_TABLE: tuple[tuple[float, float], ...] = (
+    (0.0,    0.0001),  # default tier — premiums below 0.005 BTC
+    (0.005,  0.0005),  # mid tier — most ITM 0DTE premiums land here
+    (0.05,   0.005),   # deep-ITM tier — rarely binding for 0DTE
+)
+
+
+def effective_tick_for_price(
+    price_native: float,
+    *,
+    instrument_default_tick: float = 0.0,
+) -> float:
+    """Return the OKX-effective tick size for a price in OKX-native units.
+
+    For CM (inverse), applies the tiered tick table above so chase
+    increments respect OKX's silent rounding boundaries. For UM (linear),
+    returns the uniform tick (defaults to 5 USD).
+
+    ``instrument_default_tick`` is the per-instrument or family-default
+    tick size from /api/v5/public/instruments. We always use it as a
+    LOWER bound — if OKX ever publishes a tick larger than our table's
+    base tier (e.g. they widen ticks during a market disruption), we
+    honour that wider tick rather than risking a post-only reject.
+
+    Examples (CM):
+        effective_tick_for_price(0.0042)   → 0.0001
+        effective_tick_for_price(0.0050)   → 0.0005
+        effective_tick_for_price(0.0089)   → 0.0005
+        effective_tick_for_price(0.0500)   → 0.005
+
+    The tier lookup is by OKX-native price (BTC for CM, USD for UM),
+    NOT by BTC-equivalent — this function lives at the same layer as
+    ``chase_buy`` / ``chase_sell`` which deal exclusively in native units.
+    """
+    if not is_cm():
+        # UM has no tiered ticks per-OKX; honour instrument default or
+        # family default (5 USD), whichever is larger.
+        return max(instrument_default_tick, default_tick())
+
+    # CM: walk the tier table. Largest matching lower-bound wins.
+    px = max(0.0, price_native)
+    tier_tick = _CM_TIER_TABLE[0][1]
+    for bound, tick in _CM_TIER_TABLE:
+        if px >= bound:
+            tier_tick = tick
+        else:
+            break
+    return max(instrument_default_tick, tier_tick)
+
+
+def round_price_to_tick(
+    price_native: float,
+    *,
+    instrument_default_tick: float = 0.0,
+    direction: str = "nearest",
+) -> tuple[float, float]:
+    """Round a native price to the effective tick at that price tier.
+
+    Returns ``(rounded_price, effective_tick)`` so the caller can log
+    both. ``direction`` is one of:
+        "nearest" → bankers-style round (price/tick) × tick.
+        "down"    → floor(price/tick) × tick — used by maker buys to
+                    avoid crossing the spread accidentally.
+        "up"      → ceil(price/tick)  × tick — used by maker sells.
+
+    The effective tick is selected via ``effective_tick_for_price`` on
+    the *un-rounded* input price. This is correct for normal chase
+    increments; the only edge case is when an unrounded price sits
+    exactly on a tier boundary (e.g. 0.005 BTC), where rounding either
+    direction lands on a multiple of either 0.0001 or 0.0005, so any
+    consistent choice is safe.
+    """
+    import math
+    eff_tick = effective_tick_for_price(
+        price_native,
+        instrument_default_tick=instrument_default_tick,
+    )
+    if eff_tick <= 0:
+        return price_native, eff_tick
+    ratio = price_native / eff_tick
+    if direction == "down":
+        n = math.floor(ratio + 1e-9)
+    elif direction == "up":
+        n = math.ceil(ratio - 1e-9)
+    else:
+        n = round(ratio)
+    return round(n * eff_tick, 8), eff_tick
 
 
 def contract_size_btc() -> float:

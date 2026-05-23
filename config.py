@@ -99,32 +99,40 @@ NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))
 # ──────────────────── Multi-Session Schedule (UTC) ────────────────
 #
 # OKX BTC 0DTE options expire daily at 08:00 UTC. We define a "trading
-# day" as the calendar UTC date of that expiry. Each trading day has
-# FOUR entries that span 24 hours, all targeting the same 08:00 UTC
-# expiry. They are named by their UTC entry time so the schedule is
-# unambiguous across timezones (a session's name like "morning" was
-# ambiguous between UTC-morning and SGT-morning):
+# day" as the calendar UTC date of that expiry. Sessions are named by
+# their UTC entry time so the schedule is unambiguous across timezones
+# (a session's name like "morning" was ambiguous between UTC-morning
+# and SGT-morning).
 #
-#   utc_0900  →  09:00–09:30 UTC      (~23h to expiry)   25% pct_equity
-#   utc_1330  →  13:30–15:30 UTC      (~18.5h to expiry) 50% pct_equity
-#   utc_2330  →  23:30–24:00 UTC      (~8.5h to expiry)  25% pct_equity
-#   utc_0100  →  01:00–02:00 UTC      (~7h to expiry)    50% pct_equity
+# WEEKDAY (Mon-Fri) — pct_equity sized — six trading days/wk (Tue-Sat)
+# ───────────────────────────────────────────────────────────────────
+#   utc_0900  →  09:00–09:30 UTC  Mon-Fri  ~23h to expiry   10% pct_equity
+#   utc_1330  →  13:30–15:30 UTC  Mon-Fri  ~18.5h to expiry 25% pct_equity
+#   utc_2330  →  23:30–24:00 UTC  Mon-Fri  ~8.5h to expiry  10% pct_equity
+#   utc_0100  →  01:00–02:00 UTC  Tue-Sat  ~7h to expiry    50% pct_equity
+#                                          ↑ LAST close → daily report
 #
-# All four sessions share the SAME straddle structure (1 ITM call + 1
-# ITM put at the same strike) and post to the same trade log so the
-# daily report and combined DAILY SUMMARY telegram aggregate by
-# trading_day. Sessions are independent: each one can fail or succeed
-# on its own without affecting the others.
+# WEEKEND (Sat-Sun) — fixed_btc 0.5 BTC sized — Sun + Mon trading days
+# ───────────────────────────────────────────────────────────────────
+#   utc_1430  →  14:30–15:30 UTC  Sat,Sun  ~17.5h to expiry 0.5 BTC fixed
+#   utc_2230  →  22:30–24:00 UTC  Sat,Sun  ~9.5h to expiry  0.5 BTC fixed
+#                                          ↑ LAST close on weekend
+#                                            trading day → daily report
+#                                          ↑ Sun→Mon close also triggers
+#                                            the WEEKEND RECAP.
 #
-# Per-session weekday filters give us 5 complete trading-day quartets
-# per week (Tue, Wed, Thu, Fri, Sat) for a total of 20 trades/wk:
-#   • utc_0900 (1st of trading day) fires Mon-Fri UTC
-#   • utc_1330 (2nd of trading day) fires Mon-Fri UTC
-#   • utc_2330 (3rd of trading day) fires Mon-Fri UTC, close rolls to
-#                                   the next calendar day (Tue-Sat 00:00)
-#   • utc_0100 (4th = LAST close) fires Tue-Sat UTC; this close triggers
-#                                   the daily summary report.
-# Mon-and-Sun are dark by design — they would produce partial quartets.
+# Daily reports CHAIN off the LAST close of every trading day:
+#   • Tue-Sat trading_days  →  utc_0100 close fires daily report.
+#   • Sun trading_day        →  utc_2230 (Sat entry) close fires daily.
+#   • Mon trading_day        →  utc_2230 (Sun entry) close fires daily
+#                               AND the weekend recap (Sat+Sun trades).
+# Weekly report still fires on Sat 02:00 UTC after utc_0100 Sat close,
+# covering Mon-Fri entries only (weekend trades are reported via the
+# weekend recap so weekday vs weekend strategy P&L stay separated).
+#
+# All sessions share the SAME straddle structure (1 ITM call + 1 ITM
+# put at the same strike) and post to the same trade log. Sessions are
+# independent: any one can fail without affecting the others.
 #
 # SIZING — TWO MODES PER SESSION
 # -------------------------------
@@ -347,38 +355,94 @@ def _build_session(
 
 
 SESSIONS: list[Session] = [
-    # 1st of each trading day. Entry Mon-Fri 09:00 UTC, close 09:30 UTC.
+    # ═══════════════════════ WEEKDAY SESSIONS ══════════════════════
+    # 1st of each weekday trading day. Entry Mon-Fri 09:00 UTC.
     # ~23h to next 08:00 UTC expiry — longest-DTE of the four.
     _build_session(
         "utc_0900",
         entry_utc=time(9, 0), close_utc=time(9, 30),
-        default_pct_equity=0.25, default_qty_per_leg=0.5,
+        default_pct_equity=0.10, default_qty_per_leg=0.5,
         weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
     ),
-    # 2nd of each trading day. Entry Mon-Fri 13:30 UTC, close 15:30 UTC.
+    # 2nd of each weekday trading day. Entry Mon-Fri 13:30 UTC.
     _build_session(
         "utc_1330",
         entry_utc=time(13, 30), close_utc=time(15, 30),
-        default_pct_equity=0.50, default_qty_per_leg=0.5,
+        default_pct_equity=0.25, default_qty_per_leg=0.5,
         weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
     ),
-    # 3rd of each trading day. Entry Mon-Fri 23:30 UTC, close at 00:00
-    # UTC the next calendar day (close_weekdays auto-shifts to Tue-Sat).
+    # 3rd of each weekday trading day. Entry Mon-Fri 23:30 UTC, close
+    # 00:00 UTC the next calendar day (close_weekdays auto-shifts to
+    # Tue-Sat).
     _build_session(
         "utc_2330",
         entry_utc=time(23, 30), close_utc=time(0, 0),
-        default_pct_equity=0.25, default_qty_per_leg=0.5,
+        default_pct_equity=0.10, default_qty_per_leg=0.5,
         weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC entry
     ),
-    # 4th = LAST of each trading day. Entry Tue-Sat 01:00 UTC, close
-    # Tue-Sat 02:00 UTC. Its close triggers the combined daily summary.
+    # 4th = LAST close of each WEEKDAY trading day. Entry Tue-Sat 01:00
+    # UTC, close Tue-Sat 02:00 UTC. Its close triggers the daily report
+    # for Tue-Sat trading_days AND the weekly report on Sat.
     _build_session(
         "utc_0100",
         entry_utc=time(1, 0), close_utc=time(2, 0),
         default_pct_equity=0.50, default_qty_per_leg=0.25,
         weekdays=frozenset({1, 2, 3, 4, 5}),  # Tue-Sat UTC
     ),
+    # ═══════════════════════ WEEKEND SESSIONS ══════════════════════
+    # Default: ENABLED, fixed_btc 0.5 BTC. Operator can disable per
+    # session via UTC_1430_ENABLED=false / UTC_2230_ENABLED=false.
+    #
+    # 1st of each WEEKEND trading day. Entry Sat,Sun 14:30 UTC.
+    # ~17.5h to next 08:00 UTC expiry. Sat entry → Sun trading_day,
+    # Sun entry → Mon trading_day.
+    _build_session(
+        "utc_1430",
+        entry_utc=time(14, 30), close_utc=time(15, 30),
+        default_pct_equity=0.25,   # honoured iff operator flips SIZING=pct_equity
+        default_qty_per_leg=0.5,    # default fixed_btc qty
+        weekdays=frozenset({5, 6}), # Sat,Sun UTC entry
+    ),
+    # 2nd = LAST close of each WEEKEND trading day. Entry Sat,Sun 22:30
+    # UTC, close at 00:00 UTC the next calendar day. Sat→Sun close
+    # fires the daily report for the Sun trading_day. Sun→Mon close
+    # fires the daily report for Mon trading_day AND the WEEKEND RECAP
+    # (Sat+Sun trades summary).
+    _build_session(
+        "utc_2230",
+        entry_utc=time(22, 30), close_utc=time(0, 0),
+        default_pct_equity=0.25,    # honoured iff operator flips SIZING=pct_equity
+        default_qty_per_leg=0.5,    # default fixed_btc qty
+        weekdays=frozenset({5, 6}), # Sat,Sun UTC entry
+    ),
 ]
+
+
+# Operator default for weekend sessions: fixed_btc 0.5 BTC. _build_session
+# would otherwise default to pct_equity (the weekday convention). We
+# resolve it here so the operator gets the documented behaviour without
+# having to set UTC_1430_SIZING / UTC_2230_SIZING in their .env.
+def _force_default_sizing_mode(name: str, default_mode: str) -> None:
+    """Mutate SESSIONS[name].sizing_mode unless the operator overrode it.
+
+    Cannot be expressed cleanly inside ``_build_session`` because the
+    weekday default is "pct_equity" — passing "fixed_btc" via a per-
+    session helper here keeps the canonical default centralised on
+    ``Session.sizing_mode = "fixed_btc"``.
+    """
+    raw = os.getenv(f"{name.upper()}_SIZING", "").strip().lower()
+    if raw in ("fixed_btc", "pct_equity"):
+        return  # operator override — respect it
+    for idx, s in enumerate(SESSIONS):
+        if s.name != name:
+            continue
+        from dataclasses import replace
+        SESSIONS[idx] = replace(s, sizing_mode=default_mode)
+        break
+
+
+_force_default_sizing_mode("utc_1430", "fixed_btc")
+_force_default_sizing_mode("utc_2230", "fixed_btc")
 
 
 # Legacy session names. trade_log.csv rows from before 2026-05-20 use

@@ -1177,9 +1177,15 @@ class OKXExchange:
         t_started = time.time()
         ref_bid = ref_ask = ref_mark = 0.0
         captured_ref = False
-        tick = self.get_tick_size(instrument)
-        if tick <= 0:
-            tick = config.OPTION_TICK_SIZE
+        # Base tick from OKX. CM tier-aware tick is computed PER-PRICE
+        # below via family.round_price_to_tick — see family.py
+        # ``effective_tick_for_price`` for OKX's silent tier boundaries
+        # (0.0001 below 0.005 BTC, 0.0005 above). The base_tick is used
+        # as a lower-bound floor in case OKX widens ticks during a
+        # market disruption.
+        base_tick = self.get_tick_size(instrument)
+        if base_tick <= 0:
+            base_tick = config.OPTION_TICK_SIZE
 
         # Resting-order state across iterations (queue-priority preserve)
         rested_ord_id: str = ""
@@ -1275,6 +1281,16 @@ class OKXExchange:
                 ref_bid, ref_ask, ref_mark = bid, ask, mark
                 captured_ref = True
 
+            # Tier-aware tick at the CURRENT mid/ask price tier. CM
+            # premiums above 0.005 BTC use a 0.0005 tick; the API still
+            # reports 0.0001 so we must compute it ourselves. Use the
+            # ASK as the reference price for the tick lookup since the
+            # buy chase is anchored on the sell side of the book.
+            tick_ref_price = ask if ask > 0 else (mark or last_price)
+            tick = family.effective_tick_for_price(
+                tick_ref_price, instrument_default_tick=base_tick,
+            )
+
             effective_bid = bid if bid > 0 else max(mark - tick, tick)
             target_top = max(effective_bid, ask - tick)
             new_price = last_price + (target_top - last_price) \
@@ -1297,18 +1313,30 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            new_price = round(new_price / tick) * tick
+            # Round DOWN to the tier-effective tick — buys must never
+            # round up across a tier boundary (would risk crossing).
+            new_price, eff_tick = family.round_price_to_tick(
+                new_price, instrument_default_tick=base_tick, direction="down",
+            )
+            if eff_tick != base_tick:
+                log.debug("chase_buy_tier_tick_engaged",
+                          instrument=instrument, attempt=attempt,
+                          tick_ref_price=tick_ref_price,
+                          base_tick=base_tick,
+                          effective_tick=eff_tick,
+                          new_price=new_price)
             last_price = new_price
 
             # ── 1. Keep-alive: same price as resting order? ──
             same_price = (rested_ord_id and
-                          abs(rested_price - new_price) < tick * 0.5)
+                          abs(rested_price - new_price) < eff_tick * 0.5)
 
             if same_price:
                 log.info("chase_buy_keep_alive",
                          instrument=instrument, attempt=attempt,
                          price=new_price, bid=bid, ask=ask, mark=mark,
-                         tick=tick, ord_id=rested_ord_id,
+                         tick=eff_tick, base_tick=base_tick,
+                         ord_id=rested_ord_id,
                          remaining_contracts=remaining_contracts,
                          filled_so_far=filled_contracts,
                          target_contracts=target_contracts)
@@ -1359,7 +1387,8 @@ class OKXExchange:
 
             log.info("chase_buy_attempt",
                      instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark, tick=tick,
+                     price=new_price, bid=bid, ask=ask, mark=mark,
+                     tick=eff_tick, base_tick=base_tick,
                      remaining_contracts=remaining_contracts,
                      filled_so_far=filled_contracts,
                      target_contracts=target_contracts)
@@ -1535,9 +1564,12 @@ class OKXExchange:
         t_started = time.time()
         ref_bid = ref_ask = ref_mark = 0.0
         captured_ref = False
-        tick = self.get_tick_size(instrument)
-        if tick <= 0:
-            tick = config.OPTION_TICK_SIZE
+        # Base tick from OKX. CM tier-aware tick is computed PER-PRICE
+        # below — see chase_buy for the rationale + family.py for the
+        # tier table.
+        base_tick = self.get_tick_size(instrument)
+        if base_tick <= 0:
+            base_tick = config.OPTION_TICK_SIZE
 
         # Resting-order state across iterations (queue-priority preserve)
         rested_ord_id: str = ""
@@ -1616,6 +1648,14 @@ class OKXExchange:
                 ref_bid, ref_ask, ref_mark = bid, ask, mark
                 captured_ref = True
 
+            # Tier-aware tick at the CURRENT bid/mark price tier. Sell
+            # chase is anchored on the bid side, so we use bid (or mark
+            # fallback) as the price for tier lookup.
+            tick_ref_price = bid if bid > 0 else (mark or last_price)
+            tick = family.effective_tick_for_price(
+                tick_ref_price, instrument_default_tick=base_tick,
+            )
+
             effective_ask = ask if ask > 0 else max(mark + tick, tick * 2)
             effective_bid = bid if bid > 0 else max(mark - tick, tick)
 
@@ -1643,18 +1683,30 @@ class OKXExchange:
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
 
-            new_price = round(new_price / tick) * tick
+            # Round UP to the tier-effective tick — sells must never
+            # round down across a tier boundary (would risk crossing).
+            new_price, eff_tick = family.round_price_to_tick(
+                new_price, instrument_default_tick=base_tick, direction="up",
+            )
+            if eff_tick != base_tick:
+                log.debug("chase_sell_tier_tick_engaged",
+                          instrument=instrument, attempt=attempt,
+                          tick_ref_price=tick_ref_price,
+                          base_tick=base_tick,
+                          effective_tick=eff_tick,
+                          new_price=new_price)
             last_price = new_price
 
             # ── 1. Keep-alive: same price as resting order? ──
             same_price = (rested_ord_id and
-                          abs(rested_price - new_price) < tick * 0.5)
+                          abs(rested_price - new_price) < eff_tick * 0.5)
 
             if same_price:
                 log.info("chase_sell_keep_alive",
                          instrument=instrument, attempt=attempt,
                          price=new_price, bid=bid, ask=ask, mark=mark,
-                         tick=tick, ord_id=rested_ord_id,
+                         tick=eff_tick, base_tick=base_tick,
+                         ord_id=rested_ord_id,
                          remaining_contracts=remaining_contracts,
                          filled_so_far=filled_contracts,
                          target_contracts=target_contracts)
@@ -1702,7 +1754,8 @@ class OKXExchange:
 
             log.info("chase_sell_attempt",
                      instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark, tick=tick,
+                     price=new_price, bid=bid, ask=ask, mark=mark,
+                     tick=eff_tick, base_tick=base_tick,
                      remaining_contracts=remaining_contracts,
                      filled_so_far=filled_contracts,
                      target_contracts=target_contracts)

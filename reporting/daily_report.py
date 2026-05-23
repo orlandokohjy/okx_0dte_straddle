@@ -236,10 +236,17 @@ def _session_chronological_key(t: "TradeRow") -> tuple:
     # ("utc_HHMM") and legacy ("afternoon"/"morning") names map onto
     # the same slot for backward-compatible historical rows.
     name_order = {
+        # WEEKDAY trading days: utc_0900 → utc_1330 → utc_2330 → utc_0100
         "utc_0900":  0,
         "utc_1330":  1,
         "utc_2330":  2,
         "utc_0100":  3,
+        # WEEKEND trading days (Sun, Mon): only utc_1430 + utc_2230 fire,
+        # so 0+1 are reused — they never collide with weekday rows on
+        # the same trading_day because weekday/weekend trading_days are
+        # disjoint by construction.
+        "utc_1430":  0,
+        "utc_2230":  1,
         "afternoon": 1,  # legacy → utc_1330
         "morning":   3,  # legacy → utc_0100
     }
@@ -755,23 +762,33 @@ def _format_execution_quality(m: DailyMetrics) -> list[str]:
 
 
 _LEG_ORDINAL = {
-    # Within a trading day (defined as the day of the 08:00 UTC expiry),
-    # sessions fire in this chronological order:
+    # Within a trading day (= day of the 08:00 UTC expiry), sessions fire
+    # in this chronological order.
     #
-    #   utc_0900  → 09:00-09:30 UTC,  ~23h to expiry  (1st of trading day)
-    #   utc_1330  → 13:30-15:30 UTC,  ~18h to expiry  (2nd of trading day)
-    #   utc_2330  → 23:30-24:00 UTC,  ~8h  to expiry  (3rd of trading day)
+    # WEEKDAY trading days (Tue-Sat):
+    #   utc_0900  → 09:00-09:30 UTC,  ~23h to expiry  (1st)
+    #   utc_1330  → 13:30-15:30 UTC,  ~18h to expiry  (2nd)
+    #   utc_2330  → 23:30-24:00 UTC,  ~8h  to expiry  (3rd)
     #   utc_0100  → 01:00-02:00 UTC,  ~7h  to expiry  (4th = LAST close)
     #
-    # Legacy aliases ("morning"/"afternoon") are also looked up so reports
-    # keep rendering the right ordinal for pre-2026-05-20 trade-log rows
-    # that haven't been migrated yet (or for any row that survives the
-    # migration script). canonical_session_name() in the lookup below
-    # collapses both forms onto one ordinal.
+    # WEEKEND trading days (Sun, Mon):
+    #   utc_1430  → 14:30-15:30 UTC,  ~17.5h to expiry (1st)
+    #   utc_2230  → 22:30-24:00 UTC,  ~9.5h  to expiry (2nd = LAST close)
+    #
+    # Weekday and weekend trading days are disjoint by construction
+    # (weekday sessions don't fire Sat/Sun entries → never produce
+    # Sun/Mon trading_days; weekend sessions only fire Sat/Sun entries
+    # → never produce Tue-Sat trading_days). So the two ordinal spaces
+    # never collide on the same trading_day.
+    #
+    # Legacy aliases ("morning"/"afternoon") still look up so reports
+    # rendered against pre-2026-05-20 trade-log rows still pretty-print.
     "utc_0900":  "1st entry",
     "utc_1330":  "2nd entry",
     "utc_2330":  "3rd entry",
     "utc_0100":  "4th entry",
+    "utc_1430":  "weekend 1st",
+    "utc_2230":  "weekend 2nd",
     # Legacy:
     "afternoon": "2nd entry",  # afternoon → utc_1330
     "morning":   "4th entry",  # morning   → utc_0100
@@ -1323,5 +1340,282 @@ def format_weekly_report(m: DailyMetrics) -> str:
     if m.ytd is not None:
         lines.append("")
         lines.extend(format_brief_period_block(m.ytd))
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════ Weekend Recap ════════════════════════════════
+#
+# The weekend recap is the W-B counterpart to the weekly report. It
+# fires after the LAST close of the weekend (utc_2230 Sun → Mon 00:00
+# UTC) and covers ONLY the weekend-entry trades — keeping weekday
+# strategy P&L cleanly separated from weekend strategy P&L.
+#
+# Why filter by session NAME instead of trading_day weekday:
+#   • A weekend trade entered Sat 14:30 UTC has trading_day=Sun and
+#     entry_date=Sat. A weekend trade entered Sun 22:30 UTC has
+#     trading_day=Mon and entry_date=Sun. Filtering on either field
+#     alone misses one of the two days. Filtering on session name
+#     guarantees we capture every weekend-strategy trade regardless of
+#     how its trading_day mapped through the 08:00 UTC cutoff.
+#   • Operationally simpler: when the operator adds a third weekend
+#     session in the future, they just add it to WEEKEND_SESSION_NAMES.
+
+# Sessions that belong to the weekend recap window. Keep this list in
+# sync with config.SESSIONS' Sat/Sun-entry sessions. Used by the
+# weekend recap loader and by main.py to decide when to fire the recap.
+WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({"utc_1430", "utc_2230"})
+
+
+def _weekend_window(today_utc: datetime) -> tuple[str, str]:
+    """Return (sat_date, sun_date) ISO strings for the most-recent weekend.
+
+    "Most-recent" means the Sat-Sun pair that just passed at the time
+    the recap fires. With the canonical fire timing (Mon 00:00 UTC, after
+    Sun utc_2230 close), this resolves to:
+
+        ``today.weekday() == 0`` (Mon)  →  Sat = today - 2d, Sun = today - 1d
+
+    For other call times (manual recap re-run from tools/) we still pick
+    the most recent past Sat-Sun, walking back from `today_utc.date()`:
+
+        Tue–Sat call → previous calendar week's Sat/Sun.
+        Sun call     → today's Sat-Sun (the recap is firing during the
+                       weekend itself; useful for ad-hoc operator inspection).
+        Sun  near 23:59 UTC just before the trigger → still the current weekend.
+    """
+    d = today_utc.date()
+    wd = d.weekday()  # 0=Mon..6=Sun
+    if wd == 0:
+        # Mon — point to the Sat-Sun pair we just finished.
+        sat = d - timedelta(days=2)
+    elif wd == 6:
+        # Sun — point to the Sat-Sun pair currently in progress.
+        sat = d - timedelta(days=1)
+    elif wd == 5:
+        # Sat — current weekend, recap will likely be empty until Sun.
+        sat = d
+    else:
+        # Tue-Fri call (manual re-run) — previous weekend.
+        # last Mon = d - wd days; Sun before = last Mon - 1, Sat = -2.
+        sat = d - timedelta(days=wd + 2)
+    sun = sat + timedelta(days=1)
+    return sat.strftime("%Y-%m-%d"), sun.strftime("%Y-%m-%d")
+
+
+def compute_weekend_recap(equity: float) -> Optional[DailyMetrics]:
+    """Build a DailyMetrics scoped to the most-recent weekend's trades.
+
+    Returns ``None`` if no weekend-strategy trades fall in the window
+    (e.g. operator disabled both weekend sessions, or first weekend
+    after deploy). The caller suppresses an empty Telegram push.
+
+    Membership rule: ``t.session in WEEKEND_SESSION_NAMES`` AND
+    ``t.date in {sat_date, sun_date}``.
+    """
+    all_trades = _load_trades()
+    if not all_trades:
+        return None
+
+    sat_date, sun_date = _weekend_window(datetime.utcnow())
+    weekend_dates = {sat_date, sun_date}
+    trades = [
+        t for t in all_trades
+        if t.session in WEEKEND_SESSION_NAMES
+        and (t.date or "")[:10] in weekend_dates
+    ]
+    if not trades:
+        return None
+
+    pnls = [t.net_pnl for t in trades]
+    returns = [
+        t.net_pnl / t.capital_before if t.capital_before > 0 else 0.0
+        for t in trades
+    ]
+
+    equity_start = trades[0].capital_before
+    equities = [equity_start]
+    for t in trades:
+        equities.append(t.capital_after)
+
+    wins = [p for p in pnls if p >= 0]
+    losses = [p for p in pnls if p < 0]
+    n_wins, n_losses = len(wins), len(losses)
+    total = len(trades)
+    win_rate = n_wins / total if total > 0 else 0.0
+    avg_win = sum(wins) / n_wins if n_wins > 0 else 0.0
+    avg_loss = sum(losses) / n_losses if n_losses > 0 else 0.0
+
+    gross_wins = sum(wins)
+    gross_losses = abs(sum(losses))
+    profit_factor = (
+        gross_wins / gross_losses if gross_losses > 0 else float("inf")
+    )
+
+    current_streak, max_win_streak, max_loss_streak = _compute_streaks(pnls)
+    max_dd, current_dd, hwm = _compute_drawdown_series(equities)
+
+    mean_ret = sum(returns) / len(returns) if returns else 0.0
+    daily_vol = (
+        (sum((r - mean_ret) ** 2 for r in returns) / len(returns)) ** 0.5
+        if len(returns) > 1 else 0.0
+    )
+    # Annualisation factor is fuzzy for a 2-day strategy. We DON'T
+    # multiply by sqrt(252) here — the resulting Sharpe would be
+    # apples-to-oranges with the weekday weekly Sharpe. Caller can
+    # eyeball mean_ret / daily_vol if they want.
+    sharpe = mean_ret / daily_vol if daily_vol > 0 else 0.0
+
+    expectancy = sum(pnls) / total if total > 0 else 0.0
+    expectancy_ratio = expectancy / abs(avg_loss) if avg_loss != 0 else 0.0
+
+    weekend_return = sum(pnls) / equity_start if equity_start > 0 else 0.0
+
+    latest = trades[-1]
+    inception = _inception_equity(all_trades)
+    cum_return = (equity - inception) / inception if inception > 0 else 0.0
+
+    total_straddles = sum(t.num_straddles for t in trades)
+
+    return DailyMetrics(
+        trade_date=f"{sat_date} → {sun_date}",
+        trade_pnl=sum(pnls),
+        trade_return_pct=weekend_return,
+        strike=latest.strike,
+        num_straddles=total_straddles,
+        equity=equity,
+        initial_capital=inception,
+        total_trades=total,
+        total_pnl=sum(pnls),
+        cumulative_return_pct=cum_return,
+        wins=n_wins,
+        losses=n_losses,
+        win_rate=win_rate,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        profit_factor=profit_factor,
+        best_trade=max(pnls) if pnls else 0.0,
+        worst_trade=min(pnls) if pnls else 0.0,
+        current_streak=current_streak,
+        max_win_streak=max_win_streak,
+        max_loss_streak=max_loss_streak,
+        sharpe_ratio=sharpe,
+        sortino_ratio=0.0,
+        calmar_ratio=0.0,
+        max_drawdown_pct=max_dd,
+        current_drawdown_pct=current_dd,
+        high_water_mark=hwm,
+        expectancy=expectancy,
+        expectancy_ratio=expectancy_ratio,
+        daily_vol=daily_vol,
+        annualised_vol=0.0,
+        call_premium_entry=latest.call_premium_entry,
+        call_premium_exit=latest.call_premium_exit,
+        put_premium_entry=latest.put_premium_entry,
+        put_premium_exit=latest.put_premium_exit,
+        total_capital_used=sum(t.total_capital_used for t in trades),
+        starting_equity=trades[0].capital_before if trades else 0.0,
+        entry_spot=latest.entry_spot,
+        exit_spot=latest.exit_spot,
+        today_trades=trades,
+        qty_per_leg=latest.qty_per_leg or config.QTY_PER_LEG,
+        inception_equity=inception,
+        inception_date=trades[0].date if trades else "",
+    )
+
+
+def format_weekend_recap(m: DailyMetrics) -> str:
+    """Format the weekend recap for Telegram (HTML).
+
+    Mirrors the weekly report style but explicitly labels itself as
+    "WEEKEND RECAP" so the operator never confuses it with the
+    Mon-Fri weekly report. Includes a per-session breakdown and the
+    same volume / equity blocks; SKIPS the MTD/YTD blocks (those live
+    on the daily report and are duplicated already).
+    """
+    pnl_sign = "+" if m.trade_pnl >= 0 else ""
+    weekend_trades = m.today_trades or []
+
+    if weekend_trades:
+        opened_calls = sum(
+            t.qty_per_leg * t.num_straddles for t in weekend_trades
+        )
+        opened_usd = sum(
+            2 * t.qty_per_leg * t.num_straddles * (t.entry_spot or 0.0)
+            for t in weekend_trades
+        )
+        closed_usd = sum(
+            2 * t.qty_per_leg * t.num_straddles * (t.exit_spot or 0.0)
+            for t in weekend_trades
+        )
+    else:
+        qpl = m.qty_per_leg or config.QTY_PER_LEG
+        opened_calls = qpl * m.num_straddles
+        opened_usd = 2 * opened_calls * (m.entry_spot or 0.0)
+        closed_usd = 2 * opened_calls * (m.exit_spot or m.entry_spot or 0.0)
+    opened_puts = opened_calls
+    closed_calls, closed_puts = opened_calls, opened_puts
+    open_total = opened_calls + opened_puts
+    close_total = closed_calls + closed_puts
+    traded_total = open_total + close_total
+    traded_usd = opened_usd + closed_usd
+
+    cum_pnl_wallet = (
+        m.equity - m.inception_equity if m.inception_equity > 0 else 0.0
+    )
+    inception_suffix = (
+        f"  <i>since ${m.inception_equity:,.0f} on {m.inception_date}</i>"
+        if m.inception_equity > 0 else ""
+    )
+
+    lines = [
+        f"<b>WEEKEND RECAP — {m.trade_date}</b> "
+        f"<i>[{option_family.label()} family]</i>",
+        "",
+        f"  Weekend P&L: {pnl_sign}${m.trade_pnl:,.2f} "
+        f"({pnl_sign}{m.trade_return_pct:.2%})",
+        f"  Trades: {m.total_trades} ({m.wins}W / {m.losses}L)",
+        f"  Equity: ${m.equity:,.2f}",
+        f"  Cumulative: ${cum_pnl_wallet:,.2f} "
+        f"({m.cumulative_return_pct:+.1%}){inception_suffix}",
+        "",
+        "<b>Performance</b>",
+        f"  Win rate: {m.win_rate:.1%}",
+        f"  Avg win: ${m.avg_win:,.2f}  |  Avg loss: ${m.avg_loss:,.2f}",
+        f"  Best: ${m.best_trade:,.2f}  |  Worst: ${m.worst_trade:,.2f}",
+        f"  Profit factor: {m.profit_factor:.2f}",
+        f"  Expectancy: ${m.expectancy:,.2f} "
+        f"(× {m.expectancy_ratio:.2f} avg loss)",
+        "",
+        "<b>Volume (this weekend)</b>",
+        f"  Straddles: {m.num_straddles}",
+        f"  Opened: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
+        f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
+        f"  Closed: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
+        f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
+        f"  <b>Total traded notional: {traded_total:.4f} BTC"
+        f"{_usd_bracket(traded_usd)}</b>",
+    ]
+
+    # Per-session breakdown so operators can see whether utc_1430 or
+    # utc_2230 carried the weekend's P&L.
+    by_session: dict[str, list] = {}
+    for t in weekend_trades:
+        by_session.setdefault(t.session, []).append(t)
+    if by_session:
+        lines.extend(["", "<b>By session</b>"])
+        for sname in sorted(by_session.keys(), key=lambda s: _LEG_ORDINAL.get(s, "")):
+            rows = by_session[sname]
+            sub_pnl = sum(t.net_pnl for t in rows)
+            sub_sign = "+" if sub_pnl >= 0 else ""
+            sub_wins = sum(1 for t in rows if t.net_pnl >= 0)
+            sub_losses = len(rows) - sub_wins
+            ordinal = _LEG_ORDINAL.get(sname, "")
+            label = _session_time_label(sname) or sname
+            lines.append(
+                f"  • {label} ({ordinal})  "
+                f"{sub_sign}${sub_pnl:,.2f}  "
+                f"({sub_wins}W/{sub_losses}L over {len(rows)} entries)"
+            )
 
     return "\n".join(lines)
