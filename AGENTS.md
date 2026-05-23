@@ -45,8 +45,52 @@ for nothing on a code-only deploy.
 
 ### Force-liquidate / panic flatten
 
+The Dockerfile has `ENTRYPOINT ["python", "main.py"]` — this means
+**any `docker-compose run` or `docker-compose exec` command you pass
+gets appended as ARGS to main.py**, NOT executed as a separate command.
+You MUST clear the entrypoint with `--entrypoint ""` to run anything
+other than the algo itself.
+
+**The lock file `state/algo.pid` is held by pid=1 inside the running
+algo container. The force_liquidate tool refuses to run while the
+lock is held to prevent races on order management.**
+
+Two correct recipes:
+
 ```bash
+# RECIPE A — when the algo container is RUNNING (preferred for ops)
+# Use exec, since main.py is already pid 1 inside the container and
+# we just shell into it. exec does NOT use the entrypoint.
 docker-compose exec algo python tools/force_liquidate.py
+# This will REFUSE with LOCK HELD — that's correct. Then either:
+#   - stop the algo first (Recipe B), OR
+#   - pass --force ONLY if you are CERTAIN no chase is in flight
+
+# RECIPE B — algo stopped, run via ephemeral container
+docker-compose stop algo
+docker-compose run --rm --entrypoint "" algo \
+    python tools/force_liquidate.py
+# After it completes:
+docker-compose start algo
+```
+
+WRONG (will silently boot a second copy of main.py):
+
+```bash
+docker-compose run --rm algo python tools/force_liquidate.py
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# This becomes: python main.py python tools/force_liquidate.py
+# main.py ignores the extra args and starts the full algo. The
+# force_liquidate script never runs. You end up with TWO algo
+# copies (the original + the ephemeral) and the orphan is untouched.
+```
+
+The same `--entrypoint ""` rule applies to ANY one-shot diagnostic:
+
+```bash
+# Health check, position check, whatever — always clear entrypoint
+docker-compose run --rm --entrypoint "" algo \
+    python -c "import config; print([s.name for s in config.SESSIONS])"
 ```
 
 ### Inspect live session config inside the container
@@ -188,6 +232,22 @@ it's also `utc_2230` (Sun close). Tue-Sat use `utc_0100`.
    APScheduler job for reports would create duplicates.
 10. **Telegram notifier**: HTML mode (`<b>`, `<i>`). Markdown will not
     render and the bot will reject it.
+
+## Dockerfile ENTRYPOINT trap (added 2026-05-23)
+
+**The Dockerfile uses `ENTRYPOINT ["python", "main.py"]` — exec form.**
+That means `docker-compose run --rm algo <whatever>` ALWAYS runs
+main.py and treats your `<whatever>` as ignored args. To run any
+other command, you MUST clear the entrypoint:
+
+```bash
+docker-compose run --rm --entrypoint "" algo python tools/whatever.py
+```
+
+This trap has burned us once (utc_1430 orphan close, 2026-05-23 15:35
+UTC). Symptom: a second main.py boot sequence appears in the output
+when you expected a script's output. If that happens, IMMEDIATELY
+`docker stop` the phantom container before retrying.
 
 ## NEVER invent class / method / function names
 
