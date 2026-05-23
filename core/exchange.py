@@ -79,10 +79,11 @@ async def _notify_chase_failure(
     """
     try:
         from core import notifier
-        title = (
-            "CHASE FATAL REJECT" if reason == "fatal_reject"
-            else "CHASE DEADLINE EXHAUSTED"
-        )
+        title_map = {
+            "fatal_reject": "CHASE FATAL REJECT",
+            "chase_loop_exception": "CHASE EXCEPTION (CLEANUP RAN)",
+        }
+        title = title_map.get(reason, "CHASE DEADLINE EXHAUSTED")
         body_lines = [
             f"<b>{title}</b>",
             f"Side: {side.upper()}",
@@ -99,6 +100,12 @@ async def _notify_chase_failure(
             body_lines.append(
                 "Order was rejected by OKX with a non-recoverable code. "
                 "Check account/margin/td_mode."
+            )
+        elif reason == "chase_loop_exception":
+            body_lines.append(
+                "Chase loop raised an exception. Resting-order cleanup ran "
+                "(or fallback cancel-all-for-instrument was attempted). "
+                "Verify on the exchange that no orphan order survived."
             )
         else:
             body_lines.append(
@@ -1245,222 +1252,277 @@ class OKXExchange:
             self._accumulate_fee(fees_by_ord_id, rested_ord_id, status)
             return state, acc
 
-        while time.time() < deadline and filled_contracts < target_contracts:
-            attempt += 1
+        # Wrap chase loop in try/except so a transient exception
+        # (e.g. httpx.RemoteProtocolError) cannot bypass the post-
+        # loop cleanup below and leak a resting order as an orphan
+        # position. See 2026-05-23 utc_1430 incident.
+        chase_loop_exception: BaseException | None = None
+        try:
+            while time.time() < deadline and filled_contracts < target_contracts:
+                attempt += 1
 
-            # ── 0. Credit any fills on the existing resting order ──
-            if rested_ord_id:
-                rested_state, _ = await _credit_resting_fills(rested_price)
-                if rested_state in ("filled", "canceled", "cancelled"):
-                    log.info("chase_buy_resting_terminal",
+                # ── 0. Credit any fills on the existing resting order ──
+                if rested_ord_id:
+                    rested_state, _ = await _credit_resting_fills(rested_price)
+                    if rested_state in ("filled", "canceled", "cancelled"):
+                        log.info("chase_buy_resting_terminal",
+                                 instrument=instrument, attempt=attempt,
+                                 ord_id=rested_ord_id, state=rested_state)
+                        rested_ord_id = ""
+                        rested_price = 0.0
+                        rested_credited = 0
+                    if filled_contracts >= target_contracts:
+                        break
+
+                remaining_contracts = target_contracts - filled_contracts
+                remaining_qty_btc = remaining_contracts * ct_val
+
+                ticker = await self.get_ticker(instrument)
+                mark = await self.get_option_mark_price(instrument)
+                if mark <= 0:
+                    mark = ticker.last if ticker.last > 0 else ticker.ask
+
+                bid, ask = ticker.bid, ticker.ask
+                if ask <= 0:
+                    log.warning("chase_no_ask",
+                                instrument=instrument, attempt=attempt,
+                                bid=bid, ask=ask)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                if not captured_ref:
+                    ref_bid, ref_ask, ref_mark = bid, ask, mark
+                    captured_ref = True
+
+                # Tier-aware tick at the CURRENT mid/ask price tier. CM
+                # premiums above 0.005 BTC use a 0.0005 tick; the API still
+                # reports 0.0001 so we must compute it ourselves. Use the
+                # ASK as the reference price for the tick lookup since the
+                # buy chase is anchored on the sell side of the book.
+                tick_ref_price = ask if ask > 0 else (mark or last_price)
+                tick = family.effective_tick_for_price(
+                    tick_ref_price, instrument_default_tick=base_tick,
+                )
+
+                effective_bid = bid if bid > 0 else max(mark - tick, tick)
+                target_top = max(effective_bid, ask - tick)
+                new_price = last_price + (target_top - last_price) \
+                    * config.OPTION_CHASE_GAP_NARROW_PCT
+
+                improvement_floor = effective_bid + tick
+                floor_price = effective_bid if improvement_floor >= ask else improvement_floor
+                new_price = max(new_price, floor_price)
+
+                ceiling_price = ask - tick
+                if ceiling_price < effective_bid:
+                    ceiling_price = effective_bid
+                new_price = min(new_price, ceiling_price)
+
+                max_price = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
+                if new_price > max_price:
+                    log.warning("chase_buy_cap_hit",
+                                instrument=instrument, new_price=new_price,
+                                mark=mark, max_price=max_price, attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                # Round DOWN to the tier-effective tick — buys must never
+                # round up across a tier boundary (would risk crossing).
+                new_price, eff_tick = family.round_price_to_tick(
+                    new_price, instrument_default_tick=base_tick, direction="down",
+                )
+                if eff_tick != base_tick:
+                    log.debug("chase_buy_tier_tick_engaged",
+                              instrument=instrument, attempt=attempt,
+                              tick_ref_price=tick_ref_price,
+                              base_tick=base_tick,
+                              effective_tick=eff_tick,
+                              new_price=new_price)
+                last_price = new_price
+
+                # ── 1. Keep-alive: same price as resting order? ──
+                same_price = (rested_ord_id and
+                              abs(rested_price - new_price) < eff_tick * 0.5)
+
+                if same_price:
+                    log.info("chase_buy_keep_alive",
                              instrument=instrument, attempt=attempt,
-                             ord_id=rested_ord_id, state=rested_state)
+                             price=new_price, bid=bid, ask=ask, mark=mark,
+                             tick=eff_tick, base_tick=base_tick,
+                             ord_id=rested_ord_id,
+                             remaining_contracts=remaining_contracts,
+                             filled_so_far=filled_contracts,
+                             target_contracts=target_contracts)
+                    # Just wait for the existing order to fill; preserves
+                    # FIFO queue priority at this price level.
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                # ── 2. Reprice: cancel resting order, credit any final fills ──
+                if rested_ord_id:
+                    log.info("chase_buy_reprice",
+                             instrument=instrument, attempt=attempt,
+                             from_price=rested_price, to_price=new_price,
+                             ord_id=rested_ord_id)
+                    stale_status = {
+                        "state": "live",
+                        "accFillSz": str(rested_credited),
+                    }
+                    filled_this, avg_px_this, order_state = \
+                        await self._reconcile_after_wait(
+                            instrument, rested_ord_id, stale_status,
+                            rested_price, side="buy", attempt=attempt,
+                            fees_by_ord_id=fees_by_ord_id,
+                        )
+                    # Credit any *new* fills that landed during the cancel race
+                    delta = max(0, filled_this - rested_credited)
+                    if delta > 0:
+                        filled_contracts += delta
+                        weighted_value += delta * avg_px_this
+                        log.info("chase_buy_reprice_partial_credit",
+                                 instrument=instrument, attempt=attempt,
+                                 delta=delta, total_filled=filled_contracts,
+                                 vwap=weighted_value / filled_contracts,
+                                 state=order_state)
                     rested_ord_id = ""
                     rested_price = 0.0
                     rested_credited = 0
-                if filled_contracts >= target_contracts:
-                    break
+                    if order_state == "still_live_after_retries":
+                        log.error("chase_buy_aborting_to_avoid_duplicate",
+                                  instrument=instrument,
+                                  attempt=attempt,
+                                  filled_so_far=filled_contracts)
+                        break
+                    if filled_contracts >= target_contracts:
+                        break
+                    remaining_contracts = target_contracts - filled_contracts
+                    remaining_qty_btc = remaining_contracts * ct_val
 
-            remaining_contracts = target_contracts - filled_contracts
-            remaining_qty_btc = remaining_contracts * ct_val
-
-            ticker = await self.get_ticker(instrument)
-            mark = await self.get_option_mark_price(instrument)
-            if mark <= 0:
-                mark = ticker.last if ticker.last > 0 else ticker.ask
-
-            bid, ask = ticker.bid, ticker.ask
-            if ask <= 0:
-                log.warning("chase_no_ask",
-                            instrument=instrument, attempt=attempt,
-                            bid=bid, ask=ask)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            if not captured_ref:
-                ref_bid, ref_ask, ref_mark = bid, ask, mark
-                captured_ref = True
-
-            # Tier-aware tick at the CURRENT mid/ask price tier. CM
-            # premiums above 0.005 BTC use a 0.0005 tick; the API still
-            # reports 0.0001 so we must compute it ourselves. Use the
-            # ASK as the reference price for the tick lookup since the
-            # buy chase is anchored on the sell side of the book.
-            tick_ref_price = ask if ask > 0 else (mark or last_price)
-            tick = family.effective_tick_for_price(
-                tick_ref_price, instrument_default_tick=base_tick,
-            )
-
-            effective_bid = bid if bid > 0 else max(mark - tick, tick)
-            target_top = max(effective_bid, ask - tick)
-            new_price = last_price + (target_top - last_price) \
-                * config.OPTION_CHASE_GAP_NARROW_PCT
-
-            improvement_floor = effective_bid + tick
-            floor_price = effective_bid if improvement_floor >= ask else improvement_floor
-            new_price = max(new_price, floor_price)
-
-            ceiling_price = ask - tick
-            if ceiling_price < effective_bid:
-                ceiling_price = effective_bid
-            new_price = min(new_price, ceiling_price)
-
-            max_price = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
-            if new_price > max_price:
-                log.warning("chase_buy_cap_hit",
-                            instrument=instrument, new_price=new_price,
-                            mark=mark, max_price=max_price, attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            # Round DOWN to the tier-effective tick — buys must never
-            # round up across a tier boundary (would risk crossing).
-            new_price, eff_tick = family.round_price_to_tick(
-                new_price, instrument_default_tick=base_tick, direction="down",
-            )
-            if eff_tick != base_tick:
-                log.debug("chase_buy_tier_tick_engaged",
-                          instrument=instrument, attempt=attempt,
-                          tick_ref_price=tick_ref_price,
-                          base_tick=base_tick,
-                          effective_tick=eff_tick,
-                          new_price=new_price)
-            last_price = new_price
-
-            # ── 1. Keep-alive: same price as resting order? ──
-            same_price = (rested_ord_id and
-                          abs(rested_price - new_price) < eff_tick * 0.5)
-
-            if same_price:
-                log.info("chase_buy_keep_alive",
+                log.info("chase_buy_attempt",
                          instrument=instrument, attempt=attempt,
                          price=new_price, bid=bid, ask=ask, mark=mark,
                          tick=eff_tick, base_tick=base_tick,
-                         ord_id=rested_ord_id,
                          remaining_contracts=remaining_contracts,
                          filled_so_far=filled_contracts,
                          target_contracts=target_contracts)
-                # Just wait for the existing order to fill; preserves
-                # FIFO queue priority at this price level.
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
 
-            # ── 2. Reprice: cancel resting order, credit any final fills ──
-            if rested_ord_id:
-                log.info("chase_buy_reprice",
-                         instrument=instrument, attempt=attempt,
-                         from_price=rested_price, to_price=new_price,
-                         ord_id=rested_ord_id)
+                order = await self._place_limit_order(
+                    instrument, "buy", remaining_qty_btc, new_price,
+                    post_only=True,
+                )
+                ord_id = order.get("ordId")
+                sCode = str(order.get("sCode") or "")
+                sMsg = str(order.get("sMsg") or "")
+                if ord_id:
+                    last_ord_id = ord_id
+
+                # Post-only reject (would cross) → narrow next loop
+                if sCode == "51120" or "would immediately match" in sMsg.lower() \
+                        or "post_only" in sMsg.lower():
+                    log.info("chase_buy_post_only_rejected",
+                             instrument=instrument, attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                if sCode in FATAL_CODES:
+                    log.error("chase_buy_fatal_reject",
+                              instrument=instrument, sCode=sCode, sMsg=sMsg,
+                              attempt=attempt, filled_so_far=filled_contracts,
+                              hint="check OKX_TD_MODE / account margin / balance")
+                    await _notify_chase_failure(
+                        side="buy", instrument=instrument,
+                        qty_btc=qty_btc, reason="fatal_reject",
+                        sCode=sCode, sMsg=sMsg, attempt=attempt,
+                    )
+                    # If anything filled before the fatal reject, surface it as
+                    # a partial result so the caller can flatten it cleanly.
+                    # If nothing filled, return None.
+                    break
+
+                if not ord_id or sCode not in ("0", ""):
+                    log.warning("chase_buy_order_rejected",
+                                instrument=instrument, sCode=sCode, sMsg=sMsg,
+                                attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                # Order successfully placed → mark as resting and wait
+                rested_ord_id = ord_id
+                rested_price = new_price
+                rested_credited = 0
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+
+        except Exception as exc:
+            chase_loop_exception = exc
+            log.error("chase_buy_loop_exception",
+                      instrument=instrument, attempt=attempt,
+                      filled_so_far=filled_contracts,
+                      rested_ord_id=rested_ord_id,
+                      rested_price=rested_price,
+                      rested_credited=rested_credited,
+                      exc_info=True)
+
+        # ── Loop exit / exception cleanup: cancel any resting order ──
+        # Wrapped in try/except so a cleanup failure does NOT mask the
+        # loop exception captured above. Last-ditch fallback uses
+        # cancel_orders_for_instrument so an orphan can't accrue
+        # while OKX is intermittently flaky.
+        if rested_ord_id:
+            try:
                 stale_status = {
                     "state": "live",
                     "accFillSz": str(rested_credited),
                 }
-                filled_this, avg_px_this, order_state = \
+                filled_this, avg_px_this, _state = \
                     await self._reconcile_after_wait(
                         instrument, rested_ord_id, stale_status,
                         rested_price, side="buy", attempt=attempt,
                         fees_by_ord_id=fees_by_ord_id,
                     )
-                # Credit any *new* fills that landed during the cancel race
                 delta = max(0, filled_this - rested_credited)
                 if delta > 0:
                     filled_contracts += delta
                     weighted_value += delta * avg_px_this
-                    log.info("chase_buy_reprice_partial_credit",
+                    log.info("chase_buy_exit_partial_credit",
                              instrument=instrument, attempt=attempt,
-                             delta=delta, total_filled=filled_contracts,
-                             vwap=weighted_value / filled_contracts,
-                             state=order_state)
+                             delta=delta, total_filled=filled_contracts)
                 rested_ord_id = ""
                 rested_price = 0.0
                 rested_credited = 0
-                if order_state == "still_live_after_retries":
-                    log.error("chase_buy_aborting_to_avoid_duplicate",
+            except Exception:
+                log.error("chase_buy_cleanup_reconcile_failed",
+                          instrument=instrument,
+                          ord_id=rested_ord_id,
+                          rested_price=rested_price,
+                          exc_info=True)
+                try:
+                    cancelled = await self.cancel_orders_for_instrument(
+                        instrument,
+                    )
+                    log.warning("chase_buy_emergency_cancel_done",
+                                instrument=instrument,
+                                cancelled=cancelled,
+                                note="orphan_risk_check_post_close_reconcile")
+                except Exception:
+                    log.error("chase_buy_emergency_cancel_failed",
                               instrument=instrument,
-                              attempt=attempt,
-                              filled_so_far=filled_contracts)
-                    break
-                if filled_contracts >= target_contracts:
-                    break
-                remaining_contracts = target_contracts - filled_contracts
-                remaining_qty_btc = remaining_contracts * ct_val
+                              exc_info=True)
+                rested_ord_id = ""
+                rested_price = 0.0
+                rested_credited = 0
 
-            log.info("chase_buy_attempt",
-                     instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark,
-                     tick=eff_tick, base_tick=base_tick,
-                     remaining_contracts=remaining_contracts,
-                     filled_so_far=filled_contracts,
-                     target_contracts=target_contracts)
-
-            order = await self._place_limit_order(
-                instrument, "buy", remaining_qty_btc, new_price,
-                post_only=True,
+        # If the chase loop raised, surface it AFTER cleanup so any
+        # resting order has already been cancelled. The caller
+        # (build_straddle) sees the same exception type as before;
+        # what changes is that no orphan is left behind.
+        if chase_loop_exception is not None:
+            await _notify_chase_failure(
+                side="buy", instrument=instrument,
+                qty_btc=qty_btc, reason="chase_loop_exception",
+                sCode="", sMsg=type(chase_loop_exception).__name__,
+                attempt=attempt,
             )
-            ord_id = order.get("ordId")
-            sCode = str(order.get("sCode") or "")
-            sMsg = str(order.get("sMsg") or "")
-            if ord_id:
-                last_ord_id = ord_id
-
-            # Post-only reject (would cross) → narrow next loop
-            if sCode == "51120" or "would immediately match" in sMsg.lower() \
-                    or "post_only" in sMsg.lower():
-                log.info("chase_buy_post_only_rejected",
-                         instrument=instrument, attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            if sCode in FATAL_CODES:
-                log.error("chase_buy_fatal_reject",
-                          instrument=instrument, sCode=sCode, sMsg=sMsg,
-                          attempt=attempt, filled_so_far=filled_contracts,
-                          hint="check OKX_TD_MODE / account margin / balance")
-                await _notify_chase_failure(
-                    side="buy", instrument=instrument,
-                    qty_btc=qty_btc, reason="fatal_reject",
-                    sCode=sCode, sMsg=sMsg, attempt=attempt,
-                )
-                # If anything filled before the fatal reject, surface it as
-                # a partial result so the caller can flatten it cleanly.
-                # If nothing filled, return None.
-                break
-
-            if not ord_id or sCode not in ("0", ""):
-                log.warning("chase_buy_order_rejected",
-                            instrument=instrument, sCode=sCode, sMsg=sMsg,
-                            attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            # Order successfully placed → mark as resting and wait
-            rested_ord_id = ord_id
-            rested_price = new_price
-            rested_credited = 0
-            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-
-        # ── Loop exit: ensure any remaining resting order is cancelled ──
-        if rested_ord_id:
-            stale_status = {
-                "state": "live",
-                "accFillSz": str(rested_credited),
-            }
-            filled_this, avg_px_this, _state = \
-                await self._reconcile_after_wait(
-                    instrument, rested_ord_id, stale_status,
-                    rested_price, side="buy", attempt=attempt,
-                    fees_by_ord_id=fees_by_ord_id,
-                )
-            delta = max(0, filled_this - rested_credited)
-            if delta > 0:
-                filled_contracts += delta
-                weighted_value += delta * avg_px_this
-                log.info("chase_buy_exit_partial_credit",
-                         instrument=instrument, attempt=attempt,
-                         delta=delta, total_filled=filled_contracts)
-            rested_ord_id = ""
-            rested_price = 0.0
-            rested_credited = 0
+            raise chase_loop_exception
 
         # ── Build result ──
         if filled_contracts == 0:
@@ -1613,117 +1675,222 @@ class OKXExchange:
             self._accumulate_fee(fees_by_ord_id, rested_ord_id, status)
             return state, acc
 
-        while time.time() < deadline and filled_contracts < target_contracts:
-            attempt += 1
+        # Wrap chase loop in try/except so a transient exception
+        # (e.g. httpx.RemoteProtocolError) cannot bypass the post-
+        # loop cleanup below and leak a resting order as an orphan
+        # position. See 2026-05-23 utc_1430 incident.
+        chase_loop_exception: BaseException | None = None
+        try:
+            while time.time() < deadline and filled_contracts < target_contracts:
+                attempt += 1
 
-            # ── 0. Credit any fills on the existing resting order ──
-            if rested_ord_id:
-                rested_state, _ = await _credit_resting_fills(rested_price)
-                if rested_state in ("filled", "canceled", "cancelled"):
-                    log.info("chase_sell_resting_terminal",
+                # ── 0. Credit any fills on the existing resting order ──
+                if rested_ord_id:
+                    rested_state, _ = await _credit_resting_fills(rested_price)
+                    if rested_state in ("filled", "canceled", "cancelled"):
+                        log.info("chase_sell_resting_terminal",
+                                 instrument=instrument, attempt=attempt,
+                                 ord_id=rested_ord_id, state=rested_state)
+                        rested_ord_id = ""
+                        rested_price = 0.0
+                        rested_credited = 0
+                    if filled_contracts >= target_contracts:
+                        break
+
+                remaining_contracts = target_contracts - filled_contracts
+                remaining_qty_btc = remaining_contracts * ct_val
+
+                ticker = await self.get_ticker(instrument)
+                mark = await self.get_option_mark_price(instrument)
+                if mark <= 0:
+                    mark = ticker.last if ticker.last > 0 else ticker.bid
+
+                bid, ask = ticker.bid, ticker.ask
+                if bid <= 0 and mark <= 0:
+                    log.warning("chase_no_bid_or_mark",
+                                instrument=instrument, attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                if not captured_ref:
+                    ref_bid, ref_ask, ref_mark = bid, ask, mark
+                    captured_ref = True
+
+                # Tier-aware tick at the CURRENT bid/mark price tier. Sell
+                # chase is anchored on the bid side, so we use bid (or mark
+                # fallback) as the price for tier lookup.
+                tick_ref_price = bid if bid > 0 else (mark or last_price)
+                tick = family.effective_tick_for_price(
+                    tick_ref_price, instrument_default_tick=base_tick,
+                )
+
+                effective_ask = ask if ask > 0 else max(mark + tick, tick * 2)
+                effective_bid = bid if bid > 0 else max(mark - tick, tick)
+
+                target_bot = min(effective_ask, effective_bid + tick)
+                new_price = last_price - (last_price - target_bot) \
+                    * config.OPTION_CHASE_GAP_NARROW_PCT
+
+                improvement_ceiling = effective_ask - tick
+                if improvement_ceiling <= effective_bid:
+                    ceiling_price = effective_ask
+                else:
+                    ceiling_price = improvement_ceiling
+                new_price = min(new_price, ceiling_price)
+
+                floor_price = effective_bid + tick
+                if floor_price > effective_ask:
+                    floor_price = effective_ask
+                new_price = max(new_price, floor_price)
+
+                min_price = mark / config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
+                if new_price < min_price:
+                    log.warning("chase_sell_floor_hit",
+                                instrument=instrument, new_price=new_price,
+                                mark=mark, min_price=min_price, attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                # Round UP to the tier-effective tick — sells must never
+                # round down across a tier boundary (would risk crossing).
+                new_price, eff_tick = family.round_price_to_tick(
+                    new_price, instrument_default_tick=base_tick, direction="up",
+                )
+                if eff_tick != base_tick:
+                    log.debug("chase_sell_tier_tick_engaged",
+                              instrument=instrument, attempt=attempt,
+                              tick_ref_price=tick_ref_price,
+                              base_tick=base_tick,
+                              effective_tick=eff_tick,
+                              new_price=new_price)
+                last_price = new_price
+
+                # ── 1. Keep-alive: same price as resting order? ──
+                same_price = (rested_ord_id and
+                              abs(rested_price - new_price) < eff_tick * 0.5)
+
+                if same_price:
+                    log.info("chase_sell_keep_alive",
                              instrument=instrument, attempt=attempt,
-                             ord_id=rested_ord_id, state=rested_state)
+                             price=new_price, bid=bid, ask=ask, mark=mark,
+                             tick=eff_tick, base_tick=base_tick,
+                             ord_id=rested_ord_id,
+                             remaining_contracts=remaining_contracts,
+                             filled_so_far=filled_contracts,
+                             target_contracts=target_contracts)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                # ── 2. Reprice: cancel resting order, credit any final fills ──
+                if rested_ord_id:
+                    log.info("chase_sell_reprice",
+                             instrument=instrument, attempt=attempt,
+                             from_price=rested_price, to_price=new_price,
+                             ord_id=rested_ord_id)
+                    stale_status = {
+                        "state": "live",
+                        "accFillSz": str(rested_credited),
+                    }
+                    filled_this, avg_px_this, order_state = \
+                        await self._reconcile_after_wait(
+                            instrument, rested_ord_id, stale_status,
+                            rested_price, side="sell", attempt=attempt,
+                            fees_by_ord_id=fees_by_ord_id,
+                        )
+                    delta = max(0, filled_this - rested_credited)
+                    if delta > 0:
+                        filled_contracts += delta
+                        weighted_value += delta * avg_px_this
+                        log.info("chase_sell_reprice_partial_credit",
+                                 instrument=instrument, attempt=attempt,
+                                 delta=delta, total_filled=filled_contracts,
+                                 vwap=weighted_value / filled_contracts,
+                                 state=order_state)
                     rested_ord_id = ""
                     rested_price = 0.0
                     rested_credited = 0
-                if filled_contracts >= target_contracts:
-                    break
+                    if order_state == "still_live_after_retries":
+                        log.error("chase_sell_aborting_to_avoid_duplicate",
+                                  instrument=instrument,
+                                  attempt=attempt,
+                                  filled_so_far=filled_contracts)
+                        break
+                    if filled_contracts >= target_contracts:
+                        break
+                    remaining_contracts = target_contracts - filled_contracts
+                    remaining_qty_btc = remaining_contracts * ct_val
 
-            remaining_contracts = target_contracts - filled_contracts
-            remaining_qty_btc = remaining_contracts * ct_val
-
-            ticker = await self.get_ticker(instrument)
-            mark = await self.get_option_mark_price(instrument)
-            if mark <= 0:
-                mark = ticker.last if ticker.last > 0 else ticker.bid
-
-            bid, ask = ticker.bid, ticker.ask
-            if bid <= 0 and mark <= 0:
-                log.warning("chase_no_bid_or_mark",
-                            instrument=instrument, attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            if not captured_ref:
-                ref_bid, ref_ask, ref_mark = bid, ask, mark
-                captured_ref = True
-
-            # Tier-aware tick at the CURRENT bid/mark price tier. Sell
-            # chase is anchored on the bid side, so we use bid (or mark
-            # fallback) as the price for tier lookup.
-            tick_ref_price = bid if bid > 0 else (mark or last_price)
-            tick = family.effective_tick_for_price(
-                tick_ref_price, instrument_default_tick=base_tick,
-            )
-
-            effective_ask = ask if ask > 0 else max(mark + tick, tick * 2)
-            effective_bid = bid if bid > 0 else max(mark - tick, tick)
-
-            target_bot = min(effective_ask, effective_bid + tick)
-            new_price = last_price - (last_price - target_bot) \
-                * config.OPTION_CHASE_GAP_NARROW_PCT
-
-            improvement_ceiling = effective_ask - tick
-            if improvement_ceiling <= effective_bid:
-                ceiling_price = effective_ask
-            else:
-                ceiling_price = improvement_ceiling
-            new_price = min(new_price, ceiling_price)
-
-            floor_price = effective_bid + tick
-            if floor_price > effective_ask:
-                floor_price = effective_ask
-            new_price = max(new_price, floor_price)
-
-            min_price = mark / config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
-            if new_price < min_price:
-                log.warning("chase_sell_floor_hit",
-                            instrument=instrument, new_price=new_price,
-                            mark=mark, min_price=min_price, attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            # Round UP to the tier-effective tick — sells must never
-            # round down across a tier boundary (would risk crossing).
-            new_price, eff_tick = family.round_price_to_tick(
-                new_price, instrument_default_tick=base_tick, direction="up",
-            )
-            if eff_tick != base_tick:
-                log.debug("chase_sell_tier_tick_engaged",
-                          instrument=instrument, attempt=attempt,
-                          tick_ref_price=tick_ref_price,
-                          base_tick=base_tick,
-                          effective_tick=eff_tick,
-                          new_price=new_price)
-            last_price = new_price
-
-            # ── 1. Keep-alive: same price as resting order? ──
-            same_price = (rested_ord_id and
-                          abs(rested_price - new_price) < eff_tick * 0.5)
-
-            if same_price:
-                log.info("chase_sell_keep_alive",
+                log.info("chase_sell_attempt",
                          instrument=instrument, attempt=attempt,
                          price=new_price, bid=bid, ask=ask, mark=mark,
                          tick=eff_tick, base_tick=base_tick,
-                         ord_id=rested_ord_id,
                          remaining_contracts=remaining_contracts,
                          filled_so_far=filled_contracts,
                          target_contracts=target_contracts)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
 
-            # ── 2. Reprice: cancel resting order, credit any final fills ──
-            if rested_ord_id:
-                log.info("chase_sell_reprice",
-                         instrument=instrument, attempt=attempt,
-                         from_price=rested_price, to_price=new_price,
-                         ord_id=rested_ord_id)
+                order = await self._place_limit_order(
+                    instrument, "sell", remaining_qty_btc, new_price,
+                    post_only=True,
+                )
+                ord_id = order.get("ordId")
+                sCode = str(order.get("sCode") or "")
+                sMsg = str(order.get("sMsg") or "")
+                if ord_id:
+                    last_ord_id = ord_id
+
+                if sCode == "51120" or "would immediately match" in sMsg.lower() \
+                        or "post_only" in sMsg.lower():
+                    log.info("chase_sell_post_only_rejected",
+                             instrument=instrument, attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                if sCode in FATAL_CODES:
+                    log.error("chase_sell_fatal_reject",
+                              instrument=instrument, sCode=sCode, sMsg=sMsg,
+                              attempt=attempt, filled_so_far=filled_contracts)
+                    await _notify_chase_failure(
+                        side="sell", instrument=instrument,
+                        qty_btc=qty_btc, reason="fatal_reject",
+                        sCode=sCode, sMsg=sMsg, attempt=attempt,
+                    )
+                    break
+
+                if not ord_id or sCode not in ("0", ""):
+                    log.warning("chase_sell_order_rejected",
+                                instrument=instrument, sCode=sCode, sMsg=sMsg,
+                                attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                # Order successfully placed → mark as resting and wait
+                rested_ord_id = ord_id
+                rested_price = new_price
+                rested_credited = 0
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+
+        except Exception as exc:
+            chase_loop_exception = exc
+            log.error("chase_sell_loop_exception",
+                      instrument=instrument, attempt=attempt,
+                      filled_so_far=filled_contracts,
+                      rested_ord_id=rested_ord_id,
+                      rested_price=rested_price,
+                      rested_credited=rested_credited,
+                      exc_info=True)
+
+        # ── Loop exit / exception cleanup: cancel any resting order ──
+        # Wrapped in try/except so a cleanup failure does NOT mask the
+        # loop exception captured above. Last-ditch fallback uses
+        # cancel_orders_for_instrument so an orphan can't accrue
+        # while OKX is intermittently flaky.
+        if rested_ord_id:
+            try:
                 stale_status = {
                     "state": "live",
                     "accFillSz": str(rested_credited),
                 }
-                filled_this, avg_px_this, order_state = \
+                filled_this, avg_px_this, _state = \
                     await self._reconcile_after_wait(
                         instrument, rested_ord_id, stale_status,
                         rested_price, side="sell", attempt=attempt,
@@ -1733,96 +1900,46 @@ class OKXExchange:
                 if delta > 0:
                     filled_contracts += delta
                     weighted_value += delta * avg_px_this
-                    log.info("chase_sell_reprice_partial_credit",
+                    log.info("chase_sell_exit_partial_credit",
                              instrument=instrument, attempt=attempt,
-                             delta=delta, total_filled=filled_contracts,
-                             vwap=weighted_value / filled_contracts,
-                             state=order_state)
+                             delta=delta, total_filled=filled_contracts)
                 rested_ord_id = ""
                 rested_price = 0.0
                 rested_credited = 0
-                if order_state == "still_live_after_retries":
-                    log.error("chase_sell_aborting_to_avoid_duplicate",
+            except Exception:
+                log.error("chase_sell_cleanup_reconcile_failed",
+                          instrument=instrument,
+                          ord_id=rested_ord_id,
+                          rested_price=rested_price,
+                          exc_info=True)
+                try:
+                    cancelled = await self.cancel_orders_for_instrument(
+                        instrument,
+                    )
+                    log.warning("chase_sell_emergency_cancel_done",
+                                instrument=instrument,
+                                cancelled=cancelled,
+                                note="orphan_risk_check_post_close_reconcile")
+                except Exception:
+                    log.error("chase_sell_emergency_cancel_failed",
                               instrument=instrument,
-                              attempt=attempt,
-                              filled_so_far=filled_contracts)
-                    break
-                if filled_contracts >= target_contracts:
-                    break
-                remaining_contracts = target_contracts - filled_contracts
-                remaining_qty_btc = remaining_contracts * ct_val
+                              exc_info=True)
+                rested_ord_id = ""
+                rested_price = 0.0
+                rested_credited = 0
 
-            log.info("chase_sell_attempt",
-                     instrument=instrument, attempt=attempt,
-                     price=new_price, bid=bid, ask=ask, mark=mark,
-                     tick=eff_tick, base_tick=base_tick,
-                     remaining_contracts=remaining_contracts,
-                     filled_so_far=filled_contracts,
-                     target_contracts=target_contracts)
-
-            order = await self._place_limit_order(
-                instrument, "sell", remaining_qty_btc, new_price,
-                post_only=True,
+        # If the chase loop raised, surface it AFTER cleanup so any
+        # resting order has already been cancelled. The caller
+        # (build_straddle) sees the same exception type as before;
+        # what changes is that no orphan is left behind.
+        if chase_loop_exception is not None:
+            await _notify_chase_failure(
+                side="sell", instrument=instrument,
+                qty_btc=qty_btc, reason="chase_loop_exception",
+                sCode="", sMsg=type(chase_loop_exception).__name__,
+                attempt=attempt,
             )
-            ord_id = order.get("ordId")
-            sCode = str(order.get("sCode") or "")
-            sMsg = str(order.get("sMsg") or "")
-            if ord_id:
-                last_ord_id = ord_id
-
-            if sCode == "51120" or "would immediately match" in sMsg.lower() \
-                    or "post_only" in sMsg.lower():
-                log.info("chase_sell_post_only_rejected",
-                         instrument=instrument, attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            if sCode in FATAL_CODES:
-                log.error("chase_sell_fatal_reject",
-                          instrument=instrument, sCode=sCode, sMsg=sMsg,
-                          attempt=attempt, filled_so_far=filled_contracts)
-                await _notify_chase_failure(
-                    side="sell", instrument=instrument,
-                    qty_btc=qty_btc, reason="fatal_reject",
-                    sCode=sCode, sMsg=sMsg, attempt=attempt,
-                )
-                break
-
-            if not ord_id or sCode not in ("0", ""):
-                log.warning("chase_sell_order_rejected",
-                            instrument=instrument, sCode=sCode, sMsg=sMsg,
-                            attempt=attempt)
-                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-                continue
-
-            # Order successfully placed → mark as resting and wait
-            rested_ord_id = ord_id
-            rested_price = new_price
-            rested_credited = 0
-            await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
-
-        # ── Loop exit: ensure any remaining resting order is cancelled ──
-        if rested_ord_id:
-            stale_status = {
-                "state": "live",
-                "accFillSz": str(rested_credited),
-            }
-            filled_this, avg_px_this, _state = \
-                await self._reconcile_after_wait(
-                    instrument, rested_ord_id, stale_status,
-                    rested_price, side="sell", attempt=attempt,
-                    fees_by_ord_id=fees_by_ord_id,
-                )
-            delta = max(0, filled_this - rested_credited)
-            if delta > 0:
-                filled_contracts += delta
-                weighted_value += delta * avg_px_this
-                log.info("chase_sell_exit_partial_credit",
-                         instrument=instrument, attempt=attempt,
-                         delta=delta, total_filled=filled_contracts)
-            rested_ord_id = ""
-            rested_price = 0.0
-            rested_credited = 0
+            raise chase_loop_exception
 
         if filled_contracts == 0:
             if attempt > 0 and time.time() >= deadline:
