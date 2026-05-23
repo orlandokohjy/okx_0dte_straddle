@@ -189,6 +189,63 @@ it's also `utc_2230` (Sun close). Tue-Sat use `utc_0100`.
 10. **Telegram notifier**: HTML mode (`<b>`, `<i>`). Markdown will not
     render and the bot will reject it.
 
+## NEVER invent class / method / function names
+
+Before writing ANY one-shot diagnostic command (e.g. `docker-compose exec
+algo python -c "..."`), GREP the actual code to confirm names. Common
+landmines that have already burned us:
+
+- The exchange wrapper class is **`OKXExchange`**, not `Exchange`.
+- It MUST be `.connect()`-ed (sync) before any async method call —
+  the constructor only sets fields, it does not initialize SDK clients.
+- The async loop entrypoint is `asyncio.run(coro())`, and the OKX SDK
+  is sync — every call goes through `self._call(fn, **kwargs)` which
+  uses `asyncio.to_thread`.
+- If you need to inspect live state, prefer reading existing logs
+  (`docker-compose logs --tail=200 algo`) over running ad-hoc python.
+
+When you must run python, the ONLY safe pattern is:
+
+```bash
+# Good — uses real class names + connect()
+docker-compose exec algo python -c "
+import asyncio
+from core.exchange import OKXExchange
+async def go():
+    ex = OKXExchange()
+    ex.connect()
+    print(await ex.get_spot_price())
+asyncio.run(go())
+"
+```
+
+Always grep before writing the import line. ALWAYS.
+
+## Transient API failures are normal, not deploy bugs
+
+`httpx.RemoteProtocolError: Server disconnected` and similar
+HTTP/2-edge errors during chase setup are TRANSIENT exchange-side
+issues, not bugs in our code. Symptoms:
+
+- Both legs fail within milliseconds of each other (shared HTTP/2 pool)
+- Error originates in `get_option_mark_price` / `get_ticker` /
+  similar read-only API calls
+- `put_partial_qty: 0.0`, `call_partial_qty: 0.0` in the log
+- `both_legs_failed_skipping_session` triggers cleanly
+
+The algo handles this correctly:
+- No partial position
+- SESSION SKIPPED telegram fires
+- Failure counter increments (3 strikes → circuit-break)
+- Next cron fire is unaffected
+
+DO NOT redeploy on a single transient API failure. The container is
+fine; httpx self-heals its connection pool. Only intervene if:
+1. Multiple consecutive sessions fail (sustained outage), OR
+2. The container itself crashes (`docker-compose ps` shows it down), OR
+3. The failure counter hits the limit (3) — at which point the algo
+   has already entered safe mode.
+
 ---
 
 ## When in doubt
