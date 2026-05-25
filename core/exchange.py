@@ -56,6 +56,67 @@ from core import family
 log = structlog.get_logger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Transient HTTP retry policy for `_call`
+# ─────────────────────────────────────────────────────────────────────
+# OKX's HTTP/2 frontend periodically issues a GOAWAY / drops the socket
+# mid-flight, which surfaces as ``httpcore.RemoteProtocolError("Server
+# disconnected")``. Without retry, a single such blip kills whichever
+# read happened to land on the dropped connection — and the chase loop
+# then aborts the entire entry session. See incidents:
+#   2026-05-23 utc_1430 (Sat) — get_option_mark_price → orphan put
+#   2026-05-25 utc_0900 (Mon) — get_ticker → both legs aborted clean
+# Both losses were transient socket-close events, not OKX rejecting the
+# request. Retrying with a short backoff lets the SDK pick up a fresh
+# pooled connection and the call almost always succeeds the second time.
+try:
+    import httpx as _httpx
+    import httpcore as _httpcore
+    _TRANSIENT_HTTP_EXCEPTIONS: tuple[type[BaseException], ...] = (
+        _httpx.RemoteProtocolError,
+        _httpx.ReadTimeout,
+        _httpx.WriteTimeout,
+        _httpx.ConnectError,
+        _httpx.PoolTimeout,
+        _httpcore.RemoteProtocolError,
+        _httpcore.ReadTimeout,
+        _httpcore.WriteTimeout,
+        _httpcore.ConnectError,
+        _httpcore.PoolTimeout,
+        ConnectionResetError,
+        ConnectionAbortedError,
+    )
+except ImportError:  # pragma: no cover — httpx/httpcore are pulled in by python-okx
+    _TRANSIENT_HTTP_EXCEPTIONS = (ConnectionResetError, ConnectionAbortedError)
+
+# OKX SDK function names that are SAFE to auto-retry on a transient
+# HTTP failure. Two categories:
+#   1. Read-only calls — idempotent by definition.
+#   2. Cancel calls    — idempotent on OKX (re-cancelling a cancelled
+#                        or filled order returns a benign code).
+# DELIBERATELY EXCLUDED:
+#   - place_order   (could create a duplicate order if the first
+#                    request actually reached OKX before the socket
+#                    died and we retry on the response read)
+#   - create_rfq    (same — would broadcast a duplicate RFQ)
+#   - execute_quote (same — would execute a quote twice)
+# A failed write bubbles up exactly as before; the chase loop's
+# try/except + cleanup block (commit 76c9427) handles it safely.
+_RETRY_SAFE_FNS: frozenset = frozenset({
+    # Reads
+    "get_index_tickers", "get_ticker", "get_tickers",
+    "get_mark_price", "get_instruments",
+    "get_account_balance", "get_positions",
+    "get_order_list", "get_order",
+    "get_quotes",
+    # Idempotent writes
+    "cancel_order", "cancel_batch_orders", "cancel_rfq",
+})
+
+_RETRY_MAX_RETRIES = 3
+_RETRY_BACKOFF_SEC = (0.2, 0.4, 0.8)  # cumulative ≤ 1.4 s before we abandon
+
+
 def _utc_iso(t_unix: float) -> str:
     """Convert a unix timestamp to a UTC ISO8601 string."""
     return datetime.fromtimestamp(t_unix, tz=timezone.utc).isoformat()
@@ -377,13 +438,73 @@ class OKXExchange:
     # ──────────────────── Internal call helper ────────────────────
 
     async def _call(self, fn, *args, **kwargs) -> dict:
-        """Run a sync SDK call in a thread; bump error_count on failure."""
-        try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
-        except Exception:
-            self.error_count += 1
-            log.error("okx_call_failed", fn=fn.__name__, exc_info=True)
-            raise
+        """Run a sync SDK call in a thread; bump error_count on failure.
+
+        For SDK calls in ``_RETRY_SAFE_FNS`` (read-only / idempotent), a
+        transient HTTP failure (see ``_TRANSIENT_HTTP_EXCEPTIONS``) is
+        retried up to ``_RETRY_MAX_RETRIES`` times with the backoff
+        schedule in ``_RETRY_BACKOFF_SEC`` before being re-raised.
+
+        Non-idempotent writes (``place_order``, ``create_rfq``,
+        ``execute_quote``) are NEVER auto-retried — duplicate fills
+        are a far worse failure mode than a missed entry, and the
+        chase loop's existing try/except + cleanup block (commit
+        76c9427) already prevents an orphan when a write raises.
+
+        Non-transient exceptions (anything outside the whitelist of
+        transient HTTP errors) are re-raised immediately regardless
+        of which fn is being called.
+        """
+        fn_name = getattr(fn, "__name__", "")
+        retryable = fn_name in _RETRY_SAFE_FNS
+        max_attempts = _RETRY_MAX_RETRIES + 1 if retryable else 1
+
+        last_exc: BaseException | None = None
+        for attempt_idx in range(max_attempts):
+            try:
+                return await asyncio.to_thread(fn, *args, **kwargs)
+            except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+                last_exc = exc
+                # Either fn isn't whitelisted for retry, OR we've burned
+                # our budget — surface the same error path as pre-fix.
+                if not retryable or attempt_idx >= _RETRY_MAX_RETRIES:
+                    self.error_count += 1
+                    log.error(
+                        "okx_call_failed",
+                        fn=fn_name,
+                        attempt=attempt_idx + 1,
+                        retryable=retryable,
+                        exc_type=type(exc).__name__,
+                        exc_info=True,
+                    )
+                    raise
+                backoff = _RETRY_BACKOFF_SEC[
+                    min(attempt_idx, len(_RETRY_BACKOFF_SEC) - 1)
+                ]
+                log.warning(
+                    "okx_call_transient_retry",
+                    fn=fn_name,
+                    attempt=attempt_idx + 1,
+                    max_attempts=max_attempts,
+                    backoff_sec=backoff,
+                    exc_type=type(exc).__name__,
+                )
+                await asyncio.sleep(backoff)
+            except Exception:
+                # Non-transient exception (OKX business reject, code bug,
+                # JSON parse failure, …) — bubble up exactly as before.
+                self.error_count += 1
+                log.error("okx_call_failed", fn=fn_name, exc_info=True)
+                raise
+
+        # Loop exited without returning; only reachable if every retry
+        # raised a transient exception AND we somehow skipped the
+        # `raise` inside the final iteration. Defensive fallback.
+        if last_exc is not None:  # pragma: no cover
+            raise last_exc
+        raise RuntimeError(  # pragma: no cover
+            f"_call exited unexpectedly for {fn_name!r}"
+        )
 
     @staticmethod
     def _data_or_empty(resp: Any) -> list:
