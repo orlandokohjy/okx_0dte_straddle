@@ -26,8 +26,8 @@ docker-compose build algo                         # NO --no-cache
 docker-compose up -d --force-recreate algo
 docker-compose logs -f --tail=200 algo
 
-# Apply env-only changes (no rebuild)
-docker-compose restart algo
+# Apply env-only changes (NO rebuild, but MUST recreate to re-read .env)
+docker-compose up -d --force-recreate algo        # NOT `restart`
 
 # Status / logs
 docker-compose ps
@@ -42,6 +42,40 @@ docker-compose up -d
 change, or when the operator explicitly wants a fresh base-image pull.
 Never default to `--no-cache` — it adds 2-3 minutes of pip reinstall
 for nothing on a code-only deploy.
+
+#### `restart` does NOT re-read `.env` (Compose v1 footgun)
+
+`docker-compose restart algo` sends SIGTERM to the container's main
+process and restarts it **inside the same container**. The env vars
+that `env_file: .env` injected when the container was first created
+are baked in and stay frozen — `.env` edits will NOT take effect.
+
+For ANY change to `.env` (sizing toggles, session enable/disable,
+secrets rotation, log level, etc.) the canonical command is:
+
+```bash
+docker-compose up -d --force-recreate algo
+```
+
+That destroys + recreates the container with a fresh env injection.
+No `build` is needed because the image itself didn't change. Then
+verify the new env actually applied — e.g. for session-sizing
+changes:
+
+```bash
+docker-compose exec algo python -c "
+import config
+days=['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+for s in config.SESSIONS:
+    d=', '.join(days[i] for i in sorted(s.weekdays))
+    print(f'{s.name:10s} entry {s.entry_utc} UTC days: {d:30s} sizing={s.describe_sizing()} enabled={s.enabled}')
+"
+```
+
+The 2026-05-26 sizing-flip incident burned a cycle on this exact trap:
+`.env` was edited correctly, `restart` ran cleanly, but `describe_sizing()`
+still showed the pre-edit `pct_equity` mode because the container
+hadn't been recreated. `--force-recreate` resolved it in one shot.
 
 ### Force-liquidate / panic flatten
 
