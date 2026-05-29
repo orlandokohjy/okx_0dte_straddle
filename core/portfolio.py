@@ -278,11 +278,13 @@ class Portfolio:
         gross_pnl = s.combined_pnl(
             exit_call_price, exit_put_price, exit_spot=s.exit_spot_price,
         )
-        # Sum maker fees across all 4 legs (BTC fees converted to USD at
-        # fill-time spot by the exchange layer). Subtracting from gross
-        # gives a net P&L that matches the wallet equity to within
-        # MTM/settlement drift only — fees were the bulk of the
-        # historical "Drift vs wallet" component.
+        # Sum signed maker fees across all 4 legs (BTC fees converted to
+        # USD at fill-time spot by the exchange layer). The sign follows
+        # OKX: negative = fee paid (cost), positive = maker rebate
+        # received (credit). ADDING to gross gives a net P&L that matches
+        # the wallet equity to within MTM/settlement drift only. On a VIP
+        # tier with a maker rebate (post_only fills), total_fees_usd is
+        # positive and correctly increases net P&L.
         ce = s.call_leg.entry_metrics or {}
         cx = s.call_leg.exit_metrics or {}
         pe = s.put_leg.entry_metrics or {}
@@ -293,7 +295,7 @@ class Portfolio:
             + float(pe.get("fee_usd") or 0.0)
             + float(px.get("fee_usd") or 0.0)
         )
-        net_pnl = gross_pnl - total_fees_usd
+        net_pnl = gross_pnl + total_fees_usd
 
         s.status = "closed"
         s.exit_time = now_utc().isoformat()
@@ -402,7 +404,8 @@ class Portfolio:
                 + float(pe.get("fee_usd") or 0.0)
                 + float(px.get("fee_usd") or 0.0)
             )
-            gross_pnl = (s.pnl or 0.0) + fees  # s.pnl is NET, so back out
+            # net = gross + signed_fees → back out gross = net − signed_fees
+            gross_pnl = (s.pnl or 0.0) - fees
         net_pnl = s.pnl or 0.0  # always NET (wallet-aligned)
 
         row = {

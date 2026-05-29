@@ -362,16 +362,16 @@ def native_premium_to_usd(
 
 
 def fee_to_usd(fee_native: float, spot_usd: float) -> float:
-    """Convert a fee from OKX-native units to USD.
+    """Convert a fee from OKX-native units to USD, preserving sign.
 
-    CM fees are charged in BTC; UM fees in USD. Always returns the
-    absolute USD value regardless of OKX's sign convention (OKX
-    reports negative ``fee`` when the trader paid).
+    CM fees are charged in BTC; UM fees in USD. The sign follows OKX's
+    convention as a P&L contribution: negative when the trader paid a
+    fee (a cost), positive when the trader received a maker rebate (a
+    credit). Callers add the result to gross P&L.
     """
-    fee_abs = abs(fee_native)
     if is_cm():
-        return fee_abs * spot_usd if spot_usd > 0 else 0.0
-    return fee_abs
+        return fee_native * spot_usd if spot_usd > 0 else 0.0
+    return fee_native
 
 
 def native_decimals() -> int:

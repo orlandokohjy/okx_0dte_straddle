@@ -285,8 +285,9 @@ def _build_fill_metrics(
     saved_total_usd = family.native_premium_to_usd(
         saved_per_btc_native, qty_btc, spot_usd,
     ) if (saved_per_btc_native and (family.is_um() or spot_usd > 0)) else 0.0
-    fee_native_abs = abs(fee_native)
-    fee_usd = family.fee_to_usd(fee_native_abs, spot_usd)
+    # Signed fee: negative = cost paid, positive = maker rebate received.
+    # Carried through to portfolio where it is ADDED to gross P&L.
+    fee_usd = family.fee_to_usd(fee_native, spot_usd)
 
     decimals = family.native_decimals()
 
@@ -317,9 +318,10 @@ def _build_fill_metrics(
         "saved_vs_taker_total_btc": round(saved_total_native, 6),
         "saved_vs_taker_total_usd": round(saved_total_usd, 2),
         # Legacy key name (fee_btc) — for CM holds native BTC fee, for UM
-        # holds native USD fee. Daily report consumes fee_usd only.
-        "fee_btc": round(fee_native_abs, 8 if family.is_cm() else 4),
-        "fee_native": round(fee_native_abs, 8 if family.is_cm() else 4),
+        # holds native USD fee. Signed: negative = cost, positive = rebate.
+        # Daily report consumes fee_usd only.
+        "fee_btc": round(fee_native, 8 if family.is_cm() else 4),
+        "fee_native": round(fee_native, 8 if family.is_cm() else 4),
         "fee_usd": round(fee_usd, 4),
     }
 
@@ -1050,8 +1052,11 @@ class OKXExchange:
             return
         raw = self._f(status, "fee", default=0.0)
         # OKX `fee` is negative when fee was charged, positive on rebate.
-        # We track absolute BTC outlay; subtract from gross P&L downstream.
-        fees_by_ord_id[ord_id] = abs(raw)
+        # Keep the sign: it flows through as a signed P&L contribution
+        # (negative = cost, positive = maker rebate) and is ADDED to gross
+        # P&L downstream. VIP tiers with a maker rebate report positive
+        # values here, which must be credited rather than treated as cost.
+        fees_by_ord_id[ord_id] = raw
 
     # ──────────────────── Order placement ─────────────────────────
 

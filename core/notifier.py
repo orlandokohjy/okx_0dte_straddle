@@ -311,9 +311,14 @@ def _format_close_message(
     lines.append("")
 
     # ── P&L breakdown ──
+    # ``fees`` is signed: positive = maker rebate received (credit),
+    # negative = fee paid (cost). Label and sign accordingly.
     lines.append(f"<b>Gross P&amp;L:</b> {_fmt_signed_usd(gross)}  "
                  f"<i>(call + put)</i>")
-    lines.append(f"<b>Fees:</b>      -${fees:,.2f}")
+    if fees >= 0:
+        lines.append(f"<b>Rebate:</b>    +${fees:,.2f}")
+    else:
+        lines.append(f"<b>Fees:</b>      -${abs(fees):,.2f}")
     lines.append(f"<b>Net P&amp;L:</b>   {_fmt_signed_usd(net)}")
 
     if equity_before is not None and equity_after is not None:
