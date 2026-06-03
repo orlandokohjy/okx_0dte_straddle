@@ -107,7 +107,7 @@ NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))
 # WEEKDAY (Mon-Fri) — pct_equity sized — six trading days/wk (Tue-Sat)
 # ───────────────────────────────────────────────────────────────────
 #   utc_0900  →  09:00–09:30 UTC  Mon-Fri  ~23h to expiry   10% pct_equity
-#   utc_1330  →  13:30–15:30 UTC  Mon-Fri  ~18.5h to expiry 25% pct_equity
+#   utc_1330  →  14:30–15:30 UTC  Mon-Fri  ~17.5h to expiry 25% pct_equity
 #   utc_2330  →  23:30–24:00 UTC  Mon-Fri  ~8.5h to expiry  10% pct_equity
 #   utc_0100  →  01:00–02:00 UTC  Tue-Sat  ~7h to expiry    50% pct_equity
 #                                          ↑ LAST close → daily report
@@ -364,10 +364,13 @@ SESSIONS: list[Session] = [
         default_pct_equity=0.10, default_qty_per_leg=0.5,
         weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
     ),
-    # 2nd of each weekday trading day. Entry Mon-Fri 13:30 UTC.
+    # 2nd of each weekday trading day. Entry Mon-Fri 14:30 UTC.
+    # NOTE: the session key stays "utc_1330" for continuity (env
+    # overrides UTC_1330_*, the "afternoon" report alias, and existing
+    # state/trade-log rows) even though the entry shifted to 14:30 UTC.
     _build_session(
         "utc_1330",
-        entry_utc=time(13, 30), close_utc=time(15, 30),
+        entry_utc=time(14, 30), close_utc=time(15, 30),
         default_pct_equity=0.25, default_qty_per_leg=0.5,
         weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
     ),
