@@ -992,6 +992,102 @@ def _format_volume_block(m: DailyMetrics) -> list[str]:
     ]
 
 
+def _session_short_label(name: str) -> str:
+    """Short column header from the session's ENTRY time, e.g. '1430'.
+
+    Derived from config (not the session key) so a renamed-but-shifted
+    session like utc_1330 (now 14:30 entry) shows its real time.
+    """
+    try:
+        canonical = config.canonical_session_name(name)
+    except Exception:
+        canonical = name
+    for s in config.SESSIONS:
+        if s.name in (canonical, name):
+            return s.entry_utc.strftime("%H%M")
+    return (name or "?").replace("utc_", "").replace("UTC_", "")[:4] or "?"
+
+
+def _format_session_matrix(m: DailyMetrics) -> list[str]:
+    """Compact session × metric table for the trading day.
+
+    Columns are the day's sessions (in chronological order) plus a
+    TOTAL; rows are PnL ($), Volume (BTC / USD / contracts) and average
+    slippage vs mark (in basis points). Rendered as a monospace <pre>
+    block so the columns line up in Telegram.
+    """
+    today = m.today_trades or []
+    if not today:
+        return []
+
+    contract_sz = getattr(config, "OKX_CONTRACT_SIZE_BTC", 0.01) or 0.01
+
+    cols: list[dict] = []
+    for t in today:
+        open_leg = (t.qty_per_leg or 0.0) * (t.num_straddles or 1)
+        traded_btc = 4 * open_leg  # 2 legs × (open + close)
+        entry_spot = t.entry_spot or 0.0
+        exit_spot = t.exit_spot or entry_spot
+        traded_usd = (2 * open_leg * entry_spot) + (2 * open_leg * exit_spot)
+        contracts = traded_btc / contract_sz if contract_sz else 0.0
+        legs = _legs_for_trade(t)
+        slip_bps = (
+            (sum(e.slippage_vs_mark_pct for _, e, _, _ in legs) / len(legs))
+            * 100.0
+        ) if legs else 0.0
+        cols.append({
+            "hdr": _session_short_label(t.session),
+            "pnl": t.net_pnl,
+            "btc": traded_btc,
+            "usd": traded_usd,
+            "contracts": contracts,
+            "slip_bps": slip_bps,
+            "has_slip": bool(legs),
+        })
+
+    pnl_t = sum(c["pnl"] for c in cols)
+    btc_t = sum(c["btc"] for c in cols)
+    usd_t = sum(c["usd"] for c in cols)
+    contr_t = sum(c["contracts"] for c in cols)
+    slip_cols = [c for c in cols if c["has_slip"]]
+    slip_w = sum(c["btc"] for c in slip_cols)
+    slip_t = (
+        sum(c["slip_bps"] * c["btc"] for c in slip_cols) / slip_w
+        if slip_cols and slip_w > 0 else 0.0
+    )
+
+    def _usd_k(v: float) -> str:
+        return f"{v / 1000:.0f}k" if abs(v) >= 1000 else f"{v:.0f}"
+
+    headers = [c["hdr"] for c in cols] + ["TOT"]
+    rows = [
+        ("PnL $",   [f"{c['pnl']:+.1f}" for c in cols] + [f"{pnl_t:+.1f}"]),
+        ("Vol BTC", [f"{c['btc']:.2f}" for c in cols] + [f"{btc_t:.2f}"]),
+        ("Vol $",   [_usd_k(c["usd"]) for c in cols] + [_usd_k(usd_t)]),
+        ("Contr",   [f"{c['contracts']:.0f}" for c in cols] + [f"{contr_t:.0f}"]),
+        ("Slip bp", [(f"{c['slip_bps']:+.0f}" if c["has_slip"] else "-")
+                     for c in cols] + [f"{slip_t:+.0f}"]),
+    ]
+
+    label_w = max(len(r[0]) for r in rows)
+    col_w = [
+        max(len(headers[i]), *(len(vals[i]) for _, vals in rows))
+        for i in range(len(headers))
+    ]
+
+    def _line(label: str, vals: list[str]) -> str:
+        cells = " ".join(v.rjust(col_w[i]) for i, v in enumerate(vals))
+        return f"{label.ljust(label_w)}  {cells}"
+
+    return [
+        "<b>Session matrix</b>",
+        "<pre>",
+        _line("", headers),
+        *[_line(lbl, vals) for lbl, vals in rows],
+        "</pre>",
+    ]
+
+
 def format_telegram_report(m: DailyMetrics) -> str:
     """Full daily report as HTML Telegram message."""
     streak_txt = ""
@@ -1012,6 +1108,8 @@ def format_telegram_report(m: DailyMetrics) -> str:
         f"<i>[{option_family.label()} family]</i>",
         "",
         *_format_today_block(m),
+        "",
+        *_format_session_matrix(m),
         "",
         *_format_volume_block(m),
         "",

@@ -115,7 +115,7 @@ NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))
 # WEEKEND (Sat-Sun) — fixed_btc 0.5 BTC sized — Sun + Mon trading days
 # ───────────────────────────────────────────────────────────────────
 #   utc_1430  →  14:30–15:30 UTC  Sat,Sun  ~17.5h to expiry 0.5 BTC fixed
-#   utc_2230  →  22:30–24:00 UTC  Sat,Sun  ~9.5h to expiry  0.5 BTC fixed
+#   utc_2230  →  23:00–24:00 UTC  Sat,Sun  ~9h to expiry    0.5 BTC fixed
 #                                          ↑ LAST close on weekend
 #                                            trading day → daily report
 #                                          ↑ Sun→Mon close also triggers
@@ -406,14 +406,17 @@ SESSIONS: list[Session] = [
         default_qty_per_leg=0.5,    # default fixed_btc qty
         weekdays=frozenset({5, 6}), # Sat,Sun UTC entry
     ),
-    # 2nd = LAST close of each WEEKEND trading day. Entry Sat,Sun 22:30
+    # 2nd = LAST close of each WEEKEND trading day. Entry Sat,Sun 23:00
     # UTC, close at 00:00 UTC the next calendar day. Sat→Sun close
     # fires the daily report for the Sun trading_day. Sun→Mon close
     # fires the daily report for Mon trading_day AND the WEEKEND RECAP
     # (Sat+Sun trades summary).
+    # NOTE: the session key stays "utc_2230" for continuity (env
+    # overrides UTC_2230_*, WEEKEND_SESSION_NAMES, and existing
+    # state/trade-log rows) even though the entry shifted to 23:00 UTC.
     _build_session(
         "utc_2230",
-        entry_utc=time(22, 30), close_utc=time(0, 0),
+        entry_utc=time(23, 0), close_utc=time(0, 0),
         default_pct_equity=0.25,    # honoured iff operator flips SIZING=pct_equity
         default_qty_per_leg=0.5,    # default fixed_btc qty
         weekdays=frozenset({5, 6}), # Sat,Sun UTC entry
