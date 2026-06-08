@@ -180,10 +180,66 @@ def compute_qty_per_leg(
     }
 
     # Fast path: fixed_btc mode short-circuits all the dynamic logic.
-    if session.sizing_mode != "pct_equity":
+    if session.sizing_mode == "fixed_btc":
         qty = _apply_max_cap(_round_down_to_contract(session.qty_per_leg))
         audit.update({
             "decision": "fixed_btc",
+            "final_qty_btc": qty,
+        })
+        return qty, audit
+
+    # ── fixed_usd mode: constant USD premium budget per entry ──
+    # Targets ``session.fixed_usd`` premium every entry (qty solved from
+    # live prices), so the dollar allocation stays constant while the
+    # implied %-of-equity floats. Shares the premium-estimate, rounding,
+    # cap and min-qty guards with pct_equity below.
+    if session.sizing_mode == "fixed_usd":
+        per_btc_premium_usd = _estimate_per_btc_premium_usd(pair, spot_usd)
+        audit["est_premium_per_btc_usd"] = round(per_btc_premium_usd, 2)
+        audit["fixed_usd_config"] = session.fixed_usd
+        if session.fixed_usd <= 0 or per_btc_premium_usd <= 0:
+            fallback = _apply_max_cap(_round_down_to_contract(session.qty_per_leg))
+            audit.update({
+                "decision": "fallback_no_premium_estimate",
+                "final_qty_btc": fallback,
+                "warning": (
+                    "fixed_usd ≤ 0 or premium estimate ≤ 0; "
+                    "falling back to session.qty_per_leg"
+                ),
+            })
+            log.warning("sizing_no_premium_fallback", **audit)
+            return fallback, audit
+
+        target_premium_usd = session.fixed_usd
+        raw_qty = target_premium_usd / per_btc_premium_usd
+        audit["target_premium_usd"] = round(target_premium_usd, 2)
+        audit["raw_qty_btc"] = round(raw_qty, 6)
+        rounded_raw = _round_down_to_contract(raw_qty)
+        qty = _apply_max_cap(rounded_raw)
+        if qty < rounded_raw:
+            audit["capped_to_max"] = True
+            log.info(
+                "sizing_capped_to_max",
+                session=session.name,
+                raw_qty_btc=rounded_raw,
+                capped_qty_btc=qty,
+                max_qty_btc=config.MAX_QTY_PER_LEG_BTC,
+                target_premium_usd=target_premium_usd,
+            )
+        if qty < config.MIN_QTY_PER_LEG_BTC:
+            audit.update({
+                "decision": "skip_below_min_qty",
+                "final_qty_btc": 0.0,
+                "skip_reason": (
+                    f"target_premium=${target_premium_usd:,.2f}, "
+                    f"per_btc=${per_btc_premium_usd:,.2f}, "
+                    f"raw_qty={raw_qty:.4f} BTC → rounded to {qty} BTC "
+                    f"(below MIN_QTY_PER_LEG_BTC={config.MIN_QTY_PER_LEG_BTC} BTC)"
+                ),
+            })
+            return 0.0, audit
+        audit.update({
+            "decision": "fixed_usd",
             "final_qty_btc": qty,
         })
         return qty, audit
@@ -283,6 +339,16 @@ def telegram_summary_line(audit: dict, qty: float, num_straddles: int) -> str:
             f"${audit['equity_usd']:,.0f} = "
             f"${audit['target_premium_usd']:,.0f} target → "
             f"{qty_str})"
+        )
+
+    if decision == "fixed_usd":
+        equity_usd = audit.get("equity_usd", 0.0) or 0.0
+        target = audit.get("target_premium_usd", 0.0)
+        implied = (target / equity_usd) if equity_usd > 0 else 0.0
+        return (
+            f"Sized fixed_usd (${target:,.0f} target"
+            f"{f' = {implied:.0%} of ${equity_usd:,.0f}' if equity_usd > 0 else ''}"
+            f" → {qty_str})"
         )
 
     if decision.startswith("fallback"):

@@ -439,10 +439,15 @@ class Algo:
                 f"{_days_str(s.weekdays)}  @ {s.describe_sizing()}"
                 f"{'  (close +1d)' if s.crosses_midnight else ''}"
             )
-            if s.sizing_mode != "pct_equity" or equity_now <= 0 \
+            if s.sizing_mode not in ("pct_equity", "fixed_usd") \
                     or per_btc_premium_est <= 0:
                 return base
-            target_premium_usd = equity_now * s.pct_equity
+            if s.sizing_mode == "fixed_usd":
+                target_premium_usd = s.fixed_usd
+            elif equity_now <= 0:
+                return base
+            else:
+                target_premium_usd = equity_now * s.pct_equity
             est_qty = target_premium_usd / per_btc_premium_est
             est_qty = min(est_qty, config.MAX_QTY_PER_LEG_BTC)
             preview = (
@@ -1113,7 +1118,7 @@ class Algo:
         #                      by num_straddles>1 would overshoot.
         #   fixed_btc mode   → respect NUM_STRADDLES_OVERRIDE (legacy),
         #                      so existing test runs still work.
-        if session.sizing_mode == "pct_equity":
+        if session.sizing_mode in ("pct_equity", "fixed_usd"):
             forced_n = 1
         elif config.NUM_STRADDLES_OVERRIDE > 0:
             forced_n = config.NUM_STRADDLES_OVERRIDE
@@ -1133,7 +1138,8 @@ class Algo:
             )
             log.info("straddles_override",
                      forced=forced_n,
-                     reason=("pct_equity_always_1" if session.sizing_mode == "pct_equity"
+                     reason=(f"{session.sizing_mode}_always_1"
+                             if session.sizing_mode in ("pct_equity", "fixed_usd")
                              else "NUM_STRADDLES_OVERRIDE"))
 
         if sizing.num_straddles == 0:

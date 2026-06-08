@@ -208,8 +208,14 @@ class Session:
                             # ALSO the fallback qty if pct_equity sizing
                             # cannot resolve (e.g. zero equity, missing
                             # marks, or both bid/ask are 0).
-    sizing_mode: str = "fixed_btc"   # "fixed_btc" or "pct_equity"
+    sizing_mode: str = "fixed_btc"   # "fixed_btc", "pct_equity" or "fixed_usd"
     pct_equity: float = 0.0          # used iff sizing_mode == "pct_equity"
+    fixed_usd: float = 0.0           # target premium USD/entry iff
+                                     # sizing_mode == "fixed_usd". The qty is
+                                     # solved from live prices each entry so
+                                     # the dollar allocation stays constant
+                                     # regardless of equity; the implied
+                                     # %-of-equity floats (= fixed_usd/equity).
     weekdays: frozenset[int] = field(  # UTC weekdays (0=Mon..6=Sun) for
         default_factory=lambda: frozenset({0, 1, 2, 3, 4}),  # ENTRY firing
     )
@@ -316,13 +322,15 @@ def _build_session(
     default_pct_equity: float,
     default_qty_per_leg: float,
     weekdays: frozenset[int],
+    default_fixed_usd: float = 5500.0,
 ) -> Session:
     """Construct a Session with per-session env-var overrides.
 
-    Each session reads four env vars (case-insensitive name prefix):
-        <NAME>_SIZING        — "fixed_btc" or "pct_equity"  (default: pct_equity)
+    Each session reads five env vars (case-insensitive name prefix):
+        <NAME>_SIZING        — "fixed_btc"|"pct_equity"|"fixed_usd" (default: pct_equity)
         <NAME>_PCT_EQUITY    — float, e.g. 0.25 for 25%      (default: arg)
         <NAME>_QTY_PER_LEG   — float, BTC                    (default: arg)
+        <NAME>_FIXED_USD     — float, target premium USD     (default: arg)
         <NAME>_ENABLED       — bool ("true"/"false"/"1"/"0") (default: true)
 
     ``<NAME>_ENABLED=false`` is the operator panic-button: it removes
@@ -336,10 +344,11 @@ def _build_session(
     sizing_mode = _session_env_str(
         name, "SIZING", "pct_equity",
     ).lower()
-    if sizing_mode not in ("fixed_btc", "pct_equity"):
+    if sizing_mode not in ("fixed_btc", "pct_equity", "fixed_usd"):
         sizing_mode = "pct_equity"
     pct_equity = _session_env_float(name, "PCT_EQUITY", default_pct_equity)
     qty_per_leg = _session_env_float(name, "QTY_PER_LEG", default_qty_per_leg)
+    fixed_usd = _session_env_float(name, "FIXED_USD", default_fixed_usd)
     enabled_raw = _session_env_str(name, "ENABLED", "true").lower()
     enabled = enabled_raw not in ("false", "0", "no", "off", "")
     return Session(
@@ -349,6 +358,7 @@ def _build_session(
         qty_per_leg=qty_per_leg,
         sizing_mode=sizing_mode,
         pct_equity=pct_equity,
+        fixed_usd=fixed_usd,
         weekdays=weekdays,
         enabled=enabled,
     )
