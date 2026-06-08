@@ -309,6 +309,8 @@ class Session:
             base = "DISABLED"
         elif self.sizing_mode == "pct_equity":
             base = f"pct_equity={self.pct_equity:.0%}"
+        elif self.sizing_mode == "fixed_usd":
+            base = f"fixed_usd=${self.fixed_usd:,.0f}/entry"
         else:
             base = f"fixed_btc={self.qty_per_leg} BTC"
         return base
@@ -447,7 +449,7 @@ def _force_default_sizing_mode(name: str, default_mode: str) -> None:
     ``Session.sizing_mode = "fixed_btc"``.
     """
     raw = os.getenv(f"{name.upper()}_SIZING", "").strip().lower()
-    if raw in ("fixed_btc", "pct_equity"):
+    if raw in ("fixed_btc", "pct_equity", "fixed_usd"):
         return  # operator override — respect it
     for idx, s in enumerate(SESSIONS):
         if s.name != name:
