@@ -1462,7 +1462,10 @@ def format_weekly_report(m: DailyMetrics) -> str:
 # Sessions that belong to the weekend recap window. Keep this list in
 # sync with config.SESSIONS' Sat/Sun-entry sessions. Used by the
 # weekend recap loader and by main.py to decide when to fire the recap.
-WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({"utc_1430", "utc_2230"})
+WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({
+    "we_1100", "we_1200", "we_1230", "we_1330", "we_1430",
+    "we_1500", "we_1700", "we_1900", "we_2200",
+})
 
 
 def _weekend_window(today_utc: datetime) -> tuple[str, str]:
@@ -1702,7 +1705,17 @@ def format_weekend_recap(m: DailyMetrics) -> str:
         by_session.setdefault(t.session, []).append(t)
     if by_session:
         lines.extend(["", "<b>By session</b>"])
-        for sname in sorted(by_session.keys(), key=lambda s: _LEG_ORDINAL.get(s, "")):
+
+        def _session_sort_key(s: str):
+            # Chronological within the trading day. Prefer the live
+            # Session's close-minutes ordering; fall back to the legacy
+            # _LEG_ORDINAL hint for historical names no longer in config.
+            sess = config.get_session(s)
+            if sess is not None:
+                return (0, sess.close_minutes_in_trading_day)
+            return (1, _LEG_ORDINAL.get(s, ""))
+
+        for sname in sorted(by_session.keys(), key=_session_sort_key):
             rows = by_session[sname]
             sub_pnl = sum(t.net_pnl for t in rows)
             sub_sign = "+" if sub_pnl >= 0 else ""
@@ -1710,8 +1723,9 @@ def format_weekend_recap(m: DailyMetrics) -> str:
             sub_losses = len(rows) - sub_wins
             ordinal = _LEG_ORDINAL.get(sname, "")
             label = _session_time_label(sname) or sname
+            _ord_suffix = f" ({ordinal})" if ordinal else ""
             lines.append(
-                f"  • {label} ({ordinal})  "
+                f"  • {label}{_ord_suffix}  "
                 f"{sub_sign}${sub_pnl:,.2f}  "
                 f"({sub_wins}W/{sub_losses}L over {len(rows)} entries)"
             )

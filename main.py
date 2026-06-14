@@ -37,7 +37,7 @@ import os
 import re
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import structlog
 
@@ -65,15 +65,19 @@ log = structlog.get_logger(__name__)
 # loader (reporting.daily_report.WEEKEND_SESSION_NAMES) too — keep both
 # in sync. Used in main._on_close to (a) exclude weekend sessions from
 # the weekly-report anchor and (b) gate the WEEKEND RECAP firing.
-_WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({"utc_1430", "utc_2230"})
+_WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({
+    "we_1100", "we_1200", "we_1230", "we_1330", "we_1430",
+    "we_1500", "we_1700", "we_1900", "we_2200",
+})
 
 # WEEKEND RECAP trigger: session name + trading_day weekday that
-# together identify "we just finished the last weekend session of the
-# weekend". Default trigger is utc_2230 close on Mon trading_day (= the
-# Sun-evening entry whose close fires at Mon 00:00 UTC). The Sat
-# utc_2230 close (Sun trading_day, weekday=6) intentionally does NOT
-# fire the recap — that close gets only the Sun daily report.
-_WEEKEND_RECAP_TRIGGER_SESSION: str = "utc_2230"
+# together identify "we just finished the weekend". Under the 2026-06-14
+# schedule the weekday wd_0100 entry fires Mon-Fri, so the Monday wd_0100
+# close (Mon 01:30 UTC) is the LAST close of the Mon trading_day — which
+# also contains all of Sunday's weekend sessions (they target the Mon
+# 08:00 expiry). We therefore anchor the recap to that close: when
+# wd_0100 closes on a Mon trading_day, fire the Sat+Sun weekend recap.
+_WEEKEND_RECAP_TRIGGER_SESSION: str = "wd_0100"
 _WEEKEND_RECAP_TRIGGER_WEEKDAY: int = 0  # Mon
 
 
@@ -260,6 +264,12 @@ class Algo:
         self._entry_locked: bool = False
         self._lock_reason: str = ""
         self._consecutive_failures: int = 0
+        # >0 while a session-close handler is mid-flight (unwind + equity
+        # sync + reports + reset_daily). A deferred entry must wait until
+        # this is 0 AND the position is flat, else _on_close's trailing
+        # reset_daily() could wipe a freshly-opened straddle. See
+        # _wait_for_flat / _run_entry.
+        self._close_in_progress: int = 0
 
     async def start(self) -> None:
         setup_logging()
@@ -999,6 +1009,80 @@ class Algo:
 
     # ──────────────────── Entry ───────────────────────────────────
 
+    async def _wait_for_flat(
+        self, session: config.Session, label: str,
+    ) -> bool:
+        """Wait for any prior straddle to finish unwinding before a late
+        entry, bounded by a safe-margin cutoff.
+
+        Returns True if the position went flat (and no close is in
+        progress) with enough of THIS window left for a safe chase —
+        the caller should then enter (possibly late). Returns False if
+        the cutoff passed first — the caller should skip.
+
+        Cutoff: we must leave at least
+        ``OPTION_ENTRY_CHASE_DEADLINE_MIN + CLOSE_RACE_BUFFER_MIN`` minutes
+        before this session's own close, so a deferred entry never races
+        the close cron / violates the chase-deadline margin.
+        """
+        POLL_SEC = 5.0
+        CLOSE_RACE_BUFFER_MIN = 5.0
+        required_min = (
+            float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+            + CLOSE_RACE_BUFFER_MIN
+        )
+
+        def _is_flat() -> bool:
+            return (not self.portfolio.has_open) and \
+                self._close_in_progress == 0
+
+        if _is_flat():
+            return True
+
+        now = now_utc()
+        # Resolve this window's close as a wall-clock datetime (handles
+        # cross-midnight closes, e.g. entry 23:30 → close 00:00 next day).
+        close_dt = now.replace(
+            hour=session.close_utc.hour, minute=session.close_utc.minute,
+            second=0, microsecond=0,
+        )
+        if close_dt <= now:
+            close_dt += timedelta(days=1)
+        cutoff_dt = close_dt - timedelta(minutes=required_min)
+
+        log.warning(
+            "entry_deferred_waiting_for_flat",
+            session=session.name,
+            has_open=self.portfolio.has_open,
+            close_in_progress=self._close_in_progress,
+            cutoff_utc=cutoff_dt.isoformat(),
+            required_min=required_min,
+        )
+        await notifier.notify_skip(
+            f"[{label}] Prior straddle still closing — holding the entry "
+            f"until flat (will skip if &lt;{required_min:.0f} min remain).",
+        )
+
+        while True:
+            if _is_flat():
+                log.info(
+                    "entry_deferred_now_flat", session=session.name,
+                    late_by_sec=(now_utc() - now).total_seconds(),
+                )
+                return True
+            if now_utc() >= cutoff_dt:
+                log.warning(
+                    "entry_deferred_cutoff_skip", session=session.name,
+                    has_open=self.portfolio.has_open,
+                    close_in_progress=self._close_in_progress,
+                )
+                await notifier.notify_skip(
+                    f"[{label}] Prior straddle still not flat and the "
+                    f"safe-entry cutoff passed — skipping this entry.",
+                )
+                return False
+            await asyncio.sleep(POLL_SEC)
+
     async def _on_entry(self, session: config.Session) -> None:
         label = session.time_label
         try:
@@ -1046,13 +1130,16 @@ class Algo:
             )
             return
 
-        if self.portfolio.has_open:
-            log.warning("already_has_open_straddle", session=session.name)
-            await notifier.notify_skip(
-                f"[{label}] A straddle from a prior session is still "
-                f"open — skipping entry.",
-            )
-            return
+        if self.portfolio.has_open or self._close_in_progress > 0:
+            # A prior session's straddle is still unwinding (maker-only
+            # close hasn't filled yet) or its close handler is still
+            # finishing. Rather than skip outright, WAIT for the flat and
+            # then enter late — but only while enough of THIS window
+            # remains for a safe chase (see _wait_for_flat). If the cutoff
+            # passes first, skip.
+            flat = await self._wait_for_flat(session, label)
+            if not flat:
+                return
 
         total_options = await self.chain.refresh()
         if total_options == 0:
@@ -1328,6 +1415,7 @@ class Algo:
 
     async def _on_close(self, session: config.Session) -> None:
         label = session.time_label
+        self._close_in_progress += 1
         try:
             equity_before = self.portfolio.equity
             pnl = await self.exit_mgr.hard_close(
@@ -1476,6 +1564,11 @@ class Algo:
                 f"Close [{label}]",
                 "Unhandled exception — check logs",
             )
+        finally:
+            # Cleared only after reset_daily() has run, so a deferred
+            # entry waiting on _wait_for_flat never races the position
+            # wipe at the tail of this handler.
+            self._close_in_progress = max(0, self._close_in_progress - 1)
 
     @staticmethod
     def _is_last_close_for_weekday(

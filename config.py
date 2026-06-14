@@ -321,9 +321,10 @@ def _build_session(
     entry_utc: time,
     close_utc: time,
     *,
-    default_pct_equity: float,
-    default_qty_per_leg: float,
     weekdays: frozenset[int],
+    default_sizing_mode: str = "pct_equity",
+    default_pct_equity: float = 0.0,
+    default_qty_per_leg: float = 0.5,
     default_fixed_usd: float = 5500.0,
 ) -> Session:
     """Construct a Session with per-session env-var overrides.
@@ -344,10 +345,10 @@ def _build_session(
     pct_equity mode at the operator-chosen percentages.
     """
     sizing_mode = _session_env_str(
-        name, "SIZING", "pct_equity",
+        name, "SIZING", default_sizing_mode,
     ).lower()
     if sizing_mode not in ("fixed_btc", "pct_equity", "fixed_usd"):
-        sizing_mode = "pct_equity"
+        sizing_mode = default_sizing_mode
     pct_equity = _session_env_float(name, "PCT_EQUITY", default_pct_equity)
     qty_per_leg = _session_env_float(name, "QTY_PER_LEG", default_qty_per_leg)
     fixed_usd = _session_env_float(name, "FIXED_USD", default_fixed_usd)
@@ -366,101 +367,110 @@ def _build_session(
     )
 
 
-SESSIONS: list[Session] = [
-    # ═══════════════════════ WEEKDAY SESSIONS ══════════════════════
-    # 1st of each weekday trading day. Entry Mon-Fri 09:00 UTC.
-    # ~23h to next 08:00 UTC expiry — longest-DTE of the four.
-    _build_session(
-        "utc_0900",
-        entry_utc=time(9, 0), close_utc=time(9, 30),
-        default_pct_equity=0.10, default_qty_per_leg=0.5,
-        weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
-    ),
-    # 2nd of each weekday trading day. Entry Mon-Fri 14:30 UTC.
-    # NOTE: the session key stays "utc_1330" for continuity (env
-    # overrides UTC_1330_*, the "afternoon" report alias, and existing
-    # state/trade-log rows) even though the entry shifted to 14:30 UTC.
-    _build_session(
-        "utc_1330",
-        entry_utc=time(14, 30), close_utc=time(15, 30),
-        default_pct_equity=0.25, default_qty_per_leg=0.5,
-        weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC
-    ),
-    # 3rd of each weekday trading day. Entry Mon-Fri 23:30 UTC, close
-    # 00:00 UTC the next calendar day (close_weekdays auto-shifts to
-    # Tue-Sat).
-    _build_session(
-        "utc_2330",
-        entry_utc=time(23, 30), close_utc=time(0, 0),
-        default_pct_equity=0.10, default_qty_per_leg=0.5,
-        weekdays=frozenset({0, 1, 2, 3, 4}),  # Mon-Fri UTC entry
-    ),
-    # 4th = LAST close of each WEEKDAY trading day. Entry Tue-Sat 01:00
-    # UTC, close Tue-Sat 02:00 UTC. Its close triggers the daily report
-    # for Tue-Sat trading_days AND the weekly report on Sat.
-    _build_session(
-        "utc_0100",
-        entry_utc=time(1, 0), close_utc=time(2, 0),
-        default_pct_equity=0.50, default_qty_per_leg=0.25,
-        weekdays=frozenset({1, 2, 3, 4, 5}),  # Tue-Sat UTC
-    ),
-    # ═══════════════════════ WEEKEND SESSIONS ══════════════════════
-    # Default: ENABLED, fixed_btc 0.5 BTC. Operator can disable per
-    # session via UTC_1430_ENABLED=false / UTC_2230_ENABLED=false.
-    #
-    # 1st of each WEEKEND trading day. Entry Sat,Sun 14:30 UTC.
-    # ~17.5h to next 08:00 UTC expiry. Sat entry → Sun trading_day,
-    # Sun entry → Mon trading_day.
-    _build_session(
-        "utc_1430",
-        entry_utc=time(14, 30), close_utc=time(15, 30),
-        default_pct_equity=0.25,   # honoured iff operator flips SIZING=pct_equity
-        default_qty_per_leg=0.5,    # default fixed_btc qty
-        weekdays=frozenset({5, 6}), # Sat,Sun UTC entry
-    ),
-    # 2nd = LAST close of each WEEKEND trading day. Entry Sat,Sun 23:00
-    # UTC, close at 00:00 UTC the next calendar day. Sat→Sun close
-    # fires the daily report for the Sun trading_day. Sun→Mon close
-    # fires the daily report for Mon trading_day AND the WEEKEND RECAP
-    # (Sat+Sun trades summary).
-    # NOTE: the session key stays "utc_2230" for continuity (env
-    # overrides UTC_2230_*, WEEKEND_SESSION_NAMES, and existing
-    # state/trade-log rows) even though the entry shifted to 23:00 UTC.
-    _build_session(
-        "utc_2230",
-        entry_utc=time(23, 0), close_utc=time(0, 0),
-        default_pct_equity=0.25,    # honoured iff operator flips SIZING=pct_equity
-        default_qty_per_leg=0.5,    # default fixed_btc qty
-        weekdays=frozenset({5, 6}), # Sat,Sun UTC entry
-    ),
+# ─────────────────── Session schedule (2026-06-14) ────────────────
+# High-frequency 30-minute straddle windows. Each entry opens a long
+# straddle; the close fires 30 min later (full hold) OR 5 min before the
+# next contiguous entry (a "chained" roll) so the next entry fires on
+# time after the maker-only unwind has flattened. See _SESSION_ROLL_
+# BUFFER_MIN below.
+#
+# Naming: wd_HHMM = weekday (Mon-Fri entry), we_HHMM = weekend (Sat-Sun
+# entry). HHMM is the UTC entry time. Names are unique across the day-
+# types even when the HHMM collides (e.g. wd_1430 vs we_1430). Legacy
+# utc_*/morning/afternoon names remain resolvable for historical reports
+# via LEGACY_SESSION_NAMES + get_session().
+#
+# All sessions: fixed_btc 0.5 BTC/leg (operator-overridable per session
+# via <NAME>_SIZING / <NAME>_QTY_PER_LEG in .env). Only ONE straddle is
+# ever open at a time — windows never overlap within a day-type.
+
+# Minutes before the next contiguous entry that a "chained" window
+# closes, leaving a maker-only unwind buffer so the next entry isn't
+# blocked by an still-open prior straddle.
+_SESSION_ROLL_BUFFER_MIN: int = 5
+
+# (name, entry HH:MM) — closes are derived below. Entries within a list
+# that are exactly 30 min apart form a contiguous roll-chain; the close
+# of every chained window is set to next_entry − _SESSION_ROLL_BUFFER_MIN.
+# The last window of a chain (and every standalone window) holds the full
+# 30 min.
+_WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
+    ("wd_0900", 9, 0),
+    ("wd_1100", 11, 0),
+    ("wd_1130", 11, 30),
+    ("wd_1200", 12, 0),
+    ("wd_1230", 12, 30),
+    ("wd_1300", 13, 0),
+    ("wd_1330", 13, 30),
+    ("wd_1400", 14, 0),
+    ("wd_1430", 14, 30),
+    ("wd_1500", 15, 0),
+    ("wd_1530", 15, 30),
+    ("wd_2330", 23, 30),
+    ("wd_0100", 1, 0),
 ]
+_WEEKDAY_DAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon-Fri entry
+
+_WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
+    ("we_1100", 11, 0),
+    ("we_1200", 12, 0),
+    ("we_1230", 12, 30),
+    ("we_1330", 13, 30),
+    ("we_1430", 14, 30),
+    ("we_1500", 15, 0),
+    ("we_1700", 17, 0),
+    ("we_1900", 19, 0),
+    ("we_2200", 22, 0),
+]
+_WEEKEND_DAYS: frozenset[int] = frozenset({5, 6})  # Sat,Sun entry
 
 
-# Operator default for weekend sessions: fixed_btc 0.5 BTC. _build_session
-# would otherwise default to pct_equity (the weekday convention). We
-# resolve it here so the operator gets the documented behaviour without
-# having to set UTC_1430_SIZING / UTC_2230_SIZING in their .env.
-def _force_default_sizing_mode(name: str, default_mode: str) -> None:
-    """Mutate SESSIONS[name].sizing_mode unless the operator overrode it.
+def _derive_close(
+    entry_h: int, entry_m: int, next_entry_min: int | None,
+) -> time:
+    """Close = entry+30 (full hold) unless the next entry is exactly 30
+    min away (a chained roll), in which case close = next_entry − buffer.
 
-    Cannot be expressed cleanly inside ``_build_session`` because the
-    weekday default is "pct_equity" — passing "fixed_btc" via a per-
-    session helper here keeps the canonical default centralised on
-    ``Session.sizing_mode = "fixed_btc"``.
+    ``next_entry_min`` is the next window's entry as minutes-since-midnight
+    on the SAME day, or None if there is no contiguous follow-on.
     """
-    raw = os.getenv(f"{name.upper()}_SIZING", "").strip().lower()
-    if raw in ("fixed_btc", "pct_equity", "fixed_usd"):
-        return  # operator override — respect it
-    for idx, s in enumerate(SESSIONS):
-        if s.name != name:
-            continue
-        from dataclasses import replace
-        SESSIONS[idx] = replace(s, sizing_mode=default_mode)
-        break
+    entry_min = entry_h * 60 + entry_m
+    full_close_min = entry_min + 30
+    if next_entry_min is not None and next_entry_min == full_close_min:
+        # chained roll — leave the unwind buffer before the next entry
+        close_min = next_entry_min - _SESSION_ROLL_BUFFER_MIN
+    else:
+        close_min = full_close_min
+    close_min %= (24 * 60)  # wrap past midnight (e.g. 23:30 + 30 = 00:00)
+    return time(close_min // 60, close_min % 60)
 
 
-_force_default_sizing_mode("utc_1430", "fixed_btc")
-_force_default_sizing_mode("utc_2230", "fixed_btc")
+def _build_schedule(
+    entries: list[tuple[str, int, int]], weekdays: frozenset[int],
+) -> list[Session]:
+    """Build a list of fixed_btc 0.5-BTC sessions from (name, h, m) specs,
+    deriving each close from the next contiguous entry (chained roll) or
+    a full 30-min hold (standalone / chain tail)."""
+    entry_mins = {h * 60 + m for (_, h, m) in entries}
+    out: list[Session] = []
+    for (name, h, m) in entries:
+        nxt = h * 60 + m + 30
+        next_entry_min = nxt if nxt in entry_mins else None
+        out.append(_build_session(
+            name,
+            entry_utc=time(h, m),
+            close_utc=_derive_close(h, m, next_entry_min),
+            weekdays=weekdays,
+            default_sizing_mode="fixed_btc",
+            default_qty_per_leg=0.5,
+        ))
+    return out
+
+
+SESSIONS: list[Session] = (
+    _build_schedule(_WEEKDAY_ENTRIES, _WEEKDAY_DAYS)
+    + _build_schedule(_WEEKEND_ENTRIES, _WEEKEND_DAYS)
+)
 
 
 # Legacy session names. trade_log.csv rows from before 2026-05-20 use
