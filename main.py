@@ -478,16 +478,18 @@ class Algo:
         )
         report_lines = [
             "  Reports:",
-            "    • Daily — chained after each trading day's last close "
-            "(Tue-Sat after utc_0100; Sun/Mon after utc_2230)"
+            "    • Daily — after each trading day's last close "
+            "(Tue-Fri after wd_0100; Sat after wd_2330 Fri; "
+            "Sun after we_2200 Sat; Mon after wd_0100)"
             if weekend_enabled
-            else "    • Daily — chained after utc_0100 close (Tue-Sat)",
-            "    • Weekly (Mon-Fri) — Sat 02:00 UTC after utc_0100 Sat close",
+            else "    • Daily — after wd_0100 close (Tue-Fri), "
+            "wd_2330 close (Sat)",
+            "    • Weekly (Mon-Fri) — Sat ~00:00 UTC after wd_2330 Fri close",
         ]
         if weekend_enabled:
             report_lines.append(
-                "    • Weekend recap (Sat-Sun) — Mon 00:00 UTC after "
-                "utc_2230 Sun close"
+                "    • Weekend recap (Sat-Sun) — Mon ~01:30 UTC after "
+                "wd_0100 Mon close"
             )
         await notifier.send(
             f"<b>OKX STRADDLE ALGO STARTED</b>\n"
