@@ -30,7 +30,7 @@ import structlog
 
 import config
 from core import family, notifier
-from core.exchange import OKXExchange
+from core.exchange import OKXExchange, _TRANSIENT_HTTP_EXCEPTIONS
 from core.portfolio import Portfolio, Straddle, StraddleLeg
 from data.market_data import MarketData
 from strategy.option_selector import StraddlePair
@@ -518,7 +518,34 @@ async def unwind_straddle(
         async def _sell_leg(symbol: str, qty: float, ref_ask: float):
             if ref_ask <= 0:
                 return None
-            return await exchange.chase_sell(symbol, qty, ref_ask)
+            try:
+                return await exchange.chase_sell(symbol, qty, ref_ask)
+            except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+                # A transient disconnect (e.g. httpx.RemoteProtocolError —
+                # OKX's HTTP/2 frontend dropping the socket mid-chase)
+                # aborts the WHOLE chase and re-raises. chase_sell already
+                # cancelled its resting order before re-raising, so a retry
+                # starts from a clean book. Without this, a single network
+                # blip on close leaves the leg unsold and falls back to the
+                # entry price → phantom close + orphan (2026-06-18 wd_1400
+                # incident). One fresh re-attempt with a refreshed ask.
+                log.warning("sell_leg_transient_retry",
+                            instrument=symbol,
+                            exc_type=type(exc).__name__)
+                await asyncio.sleep(2.0)
+                try:
+                    _, fresh_ask = await market.get_option_bid_ask(symbol)
+                except Exception:
+                    fresh_ask = 0.0
+                use_ask = fresh_ask if fresh_ask > 0 else ref_ask
+                try:
+                    return await exchange.chase_sell(symbol, qty, use_ask)
+                except _TRANSIENT_HTTP_EXCEPTIONS:
+                    # Second transient failure — give up; the caller's
+                    # leg-failure path + post-close orphan lock take over.
+                    log.error("sell_leg_transient_retry_failed",
+                              instrument=symbol, exc_info=True)
+                    return None
 
         call_task = asyncio.create_task(_sell_leg(
             straddle.call_leg.instrument,

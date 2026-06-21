@@ -1143,6 +1143,43 @@ class Algo:
             if not flat:
                 return
 
+        # ── Pre-entry exchange-flat guard (defence-in-depth) ──
+        # Local state can be WRONG: a phantom close (both sell legs failing
+        # on a transient disconnect) marks the straddle closed + resets
+        # local state while the exchange still holds the legs. The local
+        # `has_open` guard above then waves a new entry through, stacking a
+        # fresh straddle on top of the orphan (2026-06-18 incident). So
+        # before opening, query the EXCHANGE directly; if it is not flat,
+        # refuse and lock rather than trusting local state alone.
+        if config.HAS_OKX_CREDS:
+            try:
+                live_positions = await self.exchange.list_open_positions()
+            except Exception:
+                log.warning("preentry_position_check_failed",
+                            session=session.name, exc_info=True)
+                live_positions = []
+            if live_positions:
+                detail = ", ".join(
+                    f"{p['instrument_name']} {p['amount']:+.4f}"
+                    for p in live_positions
+                )
+                self._entry_locked = True
+                self._lock_reason = (
+                    f"Pre-entry exchange not flat: {len(live_positions)} "
+                    f"open position(s) — possible orphan, refusing to stack"
+                )
+                log.error("entry_blocked_exchange_not_flat",
+                          session=session.name, positions=detail)
+                await notifier.send(
+                    f"<b>⚠️ ENTRY BLOCKED — EXCHANGE NOT FLAT</b> [{label}]\n"
+                    f"Refusing to open a new straddle on top of an existing "
+                    f"position (stacking guard).\n\n"
+                    f"Live position(s): {detail}\n\n"
+                    f"<b>ENTRIES ARE NOW LOCKED.</b> Flatten with "
+                    f"tools/force_liquidate.py, then restart to clear."
+                )
+                return
+
         total_options = await self.chain.refresh()
         if total_options == 0:
             log.error("no_0dte_options", session=session.name)
@@ -1404,13 +1441,27 @@ class Algo:
             for p in positions
         )
         log.warning("post_close_orphan_detected", positions=len(positions))
+        # Lock entries IMMEDIATELY. Previously this only warned and relied
+        # on the next *restart's* reconciliation to block entries — but a
+        # running algo would keep firing, opening new straddles on top of
+        # the orphan (the 2026-06-18 wd_1400→wd_1430 stacking incident).
+        # Setting the lock here stops every subsequent entry until an
+        # operator flattens and restarts.
+        self._entry_locked = True
+        self._lock_reason = (
+            f"Post-close orphan: exchange still has {len(positions)} "
+            f"open position(s) after unwind — flatten & restart to clear"
+        )
         await notifier.send(
             f"<b>⚠️ POST-CLOSE ORPHAN DETECTED</b>\n"
             f"Unwind ran but exchange still has {len(positions)} "
             f"position(s):\n\n"
             f"{details}\n\n"
-            f"<b>ACTION</b>: investigate & close manually. Next entry "
-            f"will be blocked at startup reconciliation."
+            f"<b>ENTRIES ARE NOW LOCKED</b> — the algo will NOT open new "
+            f"straddles until this is resolved.\n"
+            f"<b>ACTION</b>: flatten the position(s) with "
+            f"tools/force_liquidate.py, then restart the algo to clear "
+            f"the lock."
         )
 
     # ──────────────────── Close ───────────────────────────────────
