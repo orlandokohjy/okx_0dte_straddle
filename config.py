@@ -701,6 +701,16 @@ TRADE_GATE_FAIL_OPEN: bool = os.getenv(
     "TRADE_GATE_FAIL_OPEN", "false",
 ).lower() in ("true", "1", "yes", "on")
 
+# The producer publishes a window's signal slightly AFTER the entry instant
+# (e.g. 13:00:40 for a 13:00 entry). Rather than read once at the entry
+# cron and miss it, the gate POLLS the file until it carries this window's
+# signal, bounded by TRADE_GATE_WAIT_SEC. Keep this small relative to the
+# session window so it never eats into the entry chase (default 90s ≪ the
+# 25-30 min windows). On timeout with no matching signal, fail-open/closed
+# applies. TRADE_GATE_POLL_SEC is the re-read interval.
+TRADE_GATE_WAIT_SEC: float = float(os.getenv("TRADE_GATE_WAIT_SEC", "90"))
+TRADE_GATE_POLL_SEC: float = float(os.getenv("TRADE_GATE_POLL_SEC", "3"))
+
 # ──────────────────── Telegram ────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")

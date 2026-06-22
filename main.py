@@ -54,7 +54,7 @@ from strategy.option_selector import select_straddle_pair
 from strategy.position_sizer import size_position
 from strategy.sizing import compute_qty_per_leg, telegram_summary_line
 from strategy.straddle_builder import build_straddle, unwind_straddle
-from risk.trade_gate import evaluate_trade_gate
+from risk.trade_gate import GateDecision, evaluate_trade_gate
 from utils import volume_tracker
 from utils.logging_config import setup_logging
 from utils.time_utils import format_utc_sgt, now_utc
@@ -1086,6 +1086,54 @@ class Algo:
                 return False
             await asyncio.sleep(POLL_SEC)
 
+    async def _resolve_trade_gate(
+        self, session: config.Session, label: str,
+    ) -> GateDecision:
+        """Poll the trade-gate file until it carries a TERMINAL decision
+        for THIS window, bounded by ``TRADE_GATE_WAIT_SEC``.
+
+        The producer typically publishes a window's signal a little after
+        the entry instant (e.g. 13:00:40 for a 13:00 entry), so a single
+        read at the cron tick would see the previous window and wrongly
+        skip. We re-read every ``TRADE_GATE_POLL_SEC`` until:
+          • a terminal allow (should_trade=true for this window) → enter, or
+          • a terminal block (should_trade=false) → skip immediately, or
+          • the wait budget is exhausted while only retryable states were
+            seen → fall back to fail-open/closed.
+        """
+        wait_sec = max(0.0, config.TRADE_GATE_WAIT_SEC)
+        poll_sec = max(0.5, config.TRADE_GATE_POLL_SEC)
+        start = now_utc()
+        notified = False
+        decision = evaluate_trade_gate(session)
+
+        while decision.retryable:
+            elapsed = (now_utc() - start).total_seconds()
+            if elapsed >= wait_sec:
+                break
+            if not notified:
+                notified = True
+                log.info("trade_gate_waiting",
+                         session=session.name, reason=decision.reason,
+                         wait_sec=wait_sec)
+            await asyncio.sleep(poll_sec)
+            decision = evaluate_trade_gate(session)
+
+        if not decision.retryable:
+            return decision
+
+        # Timed out with only retryable states — apply fail-open/closed.
+        waited = (now_utc() - start).total_seconds()
+        if config.TRADE_GATE_FAIL_OPEN:
+            return GateDecision(
+                True,
+                f"{decision.reason}; waited {waited:.0f}s — fail-open",
+            )
+        return GateDecision(
+            False,
+            f"{decision.reason}; waited {waited:.0f}s — fail-safe block",
+        )
+
     async def _on_entry(self, session: config.Session) -> None:
         label = session.time_label
         try:
@@ -1135,11 +1183,13 @@ class Algo:
 
         # ── External trade-gate signal (optional, default OFF) ──
         # An external producer (e.g. the vol forecaster) gates this entry
-        # per-window. A stale file, a window mismatch, or should_trade=false
-        # all SKIP the entry — fail-safe, so a dead/frozen producer can
-        # never wave a trade through. See risk/trade_gate.py.
+        # per-window. The producer may publish THIS window's signal a few
+        # seconds AFTER the entry instant, so we POLL until it lands (or a
+        # bounded timeout). A no-trade signal, or a stale/absent file at
+        # timeout, SKIPS the entry — fail-safe, so a dead/frozen producer
+        # can never wave a trade through. See risk/trade_gate.py.
         if config.TRADE_GATE_ENABLED:
-            gate = evaluate_trade_gate(session)
+            gate = await self._resolve_trade_gate(session, label)
             if not gate.allowed:
                 log.info("entry_blocked_trade_gate",
                          session=session.name, reason=gate.reason)

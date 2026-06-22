@@ -49,6 +49,15 @@ log = structlog.get_logger(__name__)
 class GateDecision:
     allowed: bool
     reason: str
+    # True when the outcome could change if we simply wait and re-read —
+    # i.e. the producer may not have published THIS window's signal yet
+    # (file missing, stale, mid-write, or still pointing at the previous
+    # window). The caller polls these. False marks a TERMINAL decision:
+    #   • allowed=True  → should_trade=true for this window (enter now)
+    #   • allowed=False → should_trade=false for this window (skip now)
+    # Note: fail-open/closed for a persistently-retryable state is decided
+    # by the CALLER at timeout, not here.
+    retryable: bool = False
 
 
 def _parse_utc(ts: str) -> datetime | None:
@@ -62,66 +71,72 @@ def _parse_utc(ts: str) -> datetime | None:
 
 
 def evaluate_trade_gate(session: "config.Session") -> GateDecision:
-    """Decide whether ``session`` may enter, per the external signal file.
+    """Evaluate the signal file ONCE for ``session``. Never raises.
 
-    Returns a ``GateDecision``. Never raises.
+    Returns a ``GateDecision`` whose ``retryable`` flag tells the caller
+    whether the outcome might change by simply waiting and re-reading:
+
+      • Terminal allow  — matched, fresh window with should_trade=true.
+      • Terminal block  — matched, fresh window with should_trade=false.
+      • Retryable       — anything we cannot YET positively verify (file
+                          missing / mid-write / stale / still pointing at
+                          the previous window). The producer may publish
+                          THIS window's signal a little after the entry
+                          instant (e.g. 13:00:40 for a 13:00 entry), so
+                          the caller polls these up to a bounded timeout
+                          and applies fail-open/closed only if they persist.
     """
     path = config.TRADE_GATE_FILE
-    fail_open = config.TRADE_GATE_FAIL_OPEN
 
-    def _unverified(reason: str) -> GateDecision:
-        # Could not positively verify the signal — honour fail-open/closed.
-        if fail_open:
-            return GateDecision(
-                True, f"gate unverified ({reason}) — fail-open",
-            )
-        return GateDecision(
-            False, f"gate unverified ({reason}) — fail-safe block",
-        )
+    def _retry(reason: str) -> GateDecision:
+        return GateDecision(False, reason, retryable=True)
 
     if not os.path.exists(path):
-        return _unverified(f"file not found: {path}")
+        return _retry(f"file not found: {path}")
 
     try:
         with open(path) as f:
             data = json.load(f)
     except Exception as exc:
-        return _unverified(f"unreadable/invalid JSON: {type(exc).__name__}")
+        # Could be a partial read while the producer rewrites the file —
+        # retry on the next poll.
+        return _retry(f"unreadable/invalid JSON: {type(exc).__name__}")
 
     if not isinstance(data, dict):
-        return _unverified("top-level JSON is not an object")
+        return _retry("top-level JSON is not an object")
 
     # ── Freshness on generated_at_utc ──
     gen = _parse_utc(str(data.get("generated_at_utc", "")))
     if gen is None:
-        return _unverified("missing/invalid generated_at_utc")
+        return _retry("missing/invalid generated_at_utc")
     age_sec = (now_utc() - gen).total_seconds()
     max_age = config.TRADE_GATE_MAX_AGE_SEC
     if age_sec > max_age:
-        return _unverified(
+        return _retry(
             f"stale: generated {age_sec / 60:.1f} min ago "
             f"(max {max_age / 60:.0f} min)"
         )
     if age_sec < -max_age:
         # Future timestamp beyond tolerance → clock skew / bad producer.
-        return _unverified(
+        return _retry(
             f"generated_at_utc is {(-age_sec) / 60:.1f} min in the future"
         )
 
     # ── Active-window block ──
     aw = data.get("active_window")
     if not isinstance(aw, dict):
-        return _unverified("missing/invalid active_window")
+        return _retry("missing/invalid active_window")
 
     sig_entry = str(aw.get("entry_utc", "")).strip()
     if not sig_entry:
-        return _unverified("active_window.entry_utc missing")
+        return _retry("active_window.entry_utc missing")
     session_entry_hm = session.entry_utc.strftime("%H:%M")
     if sig_entry[:5] != session_entry_hm:
-        # Producer's current window is not this session's entry — it may
-        # not have rolled forward yet, or it covers a different window set.
-        return _unverified(
-            f"window mismatch: signal entry_utc={sig_entry} != "
+        # Producer's current window is not this session's entry — most
+        # likely it hasn't rolled forward to this window yet (the publish
+        # lands a few seconds after the entry instant). Retry until it does.
+        return _retry(
+            f"window not yet current: signal entry_utc={sig_entry} != "
             f"session {session.name} entry {session_entry_hm}"
         )
 
@@ -132,21 +147,22 @@ def evaluate_trade_gate(session: "config.Session") -> GateDecision:
             all(d <= 4 for d in session.weekdays) if session.weekdays else True
         )
         if sig_weekday != session_is_weekday:
-            return _unverified(
+            return _retry(
                 f"day-type mismatch: signal weekday={sig_weekday}, "
                 f"session {session.name} weekday={session_is_weekday}"
             )
 
-    # ── The actual go / no-go ──
-    # An explicit false ALWAYS blocks, even under fail-open.
+    # ── Terminal go / no-go for THIS window ──
     should = aw.get("should_trade")
     if should is True:
         return GateDecision(
             True,
             f"signal OK (window {sig_entry}, fresh {age_sec / 60:.1f} min)",
+            retryable=False,
         )
     if should is False:
-        return GateDecision(False, "signal should_trade=false (no-entry)")
-    return _unverified(
-        f"active_window.should_trade not boolean: {should!r}"
-    )
+        return GateDecision(
+            False, "signal should_trade=false (no-entry)", retryable=False,
+        )
+    # Malformed value — treat as not-yet-verified and retry.
+    return _retry(f"active_window.should_trade not boolean: {should!r}")
