@@ -124,8 +124,11 @@ _COIN_SPECS: dict[str, "_CoinSpec"] = {
     ),
     "ETH": _CoinSpec(
         contract_size=0.1,
-        cm_tier_table=((0.0, 0.0001), (0.005, 0.0005), (0.05, 0.005)),
-        tiers_desk_verified=False,
+        # Operator-verified on the OKX ETH options UI 2026-06-22: TWO tiers
+        # only — 0.0001 below 0.005 ETH, 0.0005 at/above. ETH does NOT have
+        # BTC's deep-ITM 0.05→0.005 tier.
+        cm_tier_table=((0.0, 0.0001), (0.005, 0.0005)),
+        tiers_desk_verified=True,
     ),
 }
 
