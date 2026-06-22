@@ -405,33 +405,41 @@ _SESSION_ROLL_BUFFER_MIN: int = 5
 # of every chained window is set to next_entry − _SESSION_ROLL_BUFFER_MIN.
 # The last window of a chain (and every standalone window) holds the full
 # 30 min.
+# ── ETH schedule (operator-defined 2026-06-22, all UTC) ──
+# 30-min windows. Back-to-back windows (entries 30 min apart) chain-roll:
+# the earlier one closes 5 min early (_SESSION_ROLL_BUFFER_MIN) so the
+# next entry fires on time after the maker-only unwind.
 _WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
-    ("wd_0900", 9, 0),
-    ("wd_1100", 11, 0),
-    ("wd_1130", 11, 30),
-    ("wd_1200", 12, 0),
-    ("wd_1230", 12, 30),
-    ("wd_1300", 13, 0),
-    ("wd_1330", 13, 30),
-    ("wd_1400", 14, 0),
-    ("wd_1430", 14, 30),
-    ("wd_1500", 15, 0),
-    ("wd_1530", 15, 30),
-    ("wd_2330", 23, 30),
-    ("wd_0100", 1, 0),
+    ("wd_1100", 11, 0),    # 1100-1130 (chains → 1130)
+    ("wd_1130", 11, 30),   # 1130-1200 (chains → 1200)
+    ("wd_1200", 12, 0),    # 1200-1230 (standalone)
+    ("wd_1300", 13, 0),    # 1300-1330 (chains → 1330)
+    ("wd_1330", 13, 30),   # 1330-1400 (standalone)
+    ("wd_1530", 15, 30),   # 1530-1600 (standalone)
+    ("wd_1700", 17, 0),    # 1700-1730 (standalone)
+    ("wd_2330", 23, 30),   # 2330-2400 (close at next-day 00:00 UTC)
 ]
 _WEEKDAY_DAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon-Fri entry
 
 _WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
-    ("we_1100", 11, 0),
-    ("we_1200", 12, 0),
-    ("we_1230", 12, 30),
-    ("we_1330", 13, 30),
-    ("we_1430", 14, 30),
-    ("we_1500", 15, 0),
-    ("we_1700", 17, 0),
-    ("we_1900", 19, 0),
-    ("we_2200", 22, 0),
+    ("we_0930", 9, 30),    # 0930-1000 (standalone)
+    ("we_1130", 11, 30),   # 1130-1200 (standalone)
+    ("we_1200", 12, 0),    # 1200-1230 (standalone)
+    ("we_1300", 13, 0),    # 1300-1330 (chains → 1330)
+    ("we_1330", 13, 30),   # 1330-1400 (chains → 1400)
+    ("we_1400", 14, 0),    # 1400-1430 (chains → 1430)
+    ("we_1430", 14, 30),   # 1430-1500 (standalone)
+    ("we_1530", 15, 30),   # 1530-1600 (standalone)
+    ("we_1600", 16, 0),    # 1600-1630 (standalone)
+    ("we_1700", 17, 0),    # 1700-1730 (standalone)
+    ("we_1830", 18, 30),   # 1830-1900 (standalone)
+    ("we_1900", 19, 0),    # 1900-1930 (standalone)
+    ("we_2000", 20, 0),    # 2000-2030 (chains → 2030)
+    ("we_2030", 20, 30),   # 2030-2100 (standalone)
+    ("we_2130", 21, 30),   # 2130-2200 (chains → 2200)
+    ("we_2200", 22, 0),    # 2200-2230 (chains → 2230)
+    ("we_2230", 22, 30),   # 2230-2300 (standalone)
+    ("we_2330", 23, 30),   # 2330-2400 (close at next-day 00:00 UTC)
 ]
 _WEEKEND_DAYS: frozenset[int] = frozenset({5, 6})  # Sat,Sun entry
 
