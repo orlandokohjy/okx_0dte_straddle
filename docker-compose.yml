@@ -12,3 +12,8 @@ services:
       - ./state:/app/state
       - ./logs:/app/logs
       - ./.env:/app/.env
+      # External trade-gate signal (read-only). The vsn-vol-forecaster
+      # writes here on the host; the algo only reads it. Path inside the
+      # container is /app/signals → config.TRADE_GATE_FILE defaults to
+      # signals/trade_gate.json. Only consulted when TRADE_GATE_ENABLED=true.
+      - /opt/tft/vsn-vol-forecaster/signals:/app/signals:ro

@@ -54,6 +54,7 @@ from strategy.option_selector import select_straddle_pair
 from strategy.position_sizer import size_position
 from strategy.sizing import compute_qty_per_leg, telegram_summary_line
 from strategy.straddle_builder import build_straddle, unwind_straddle
+from risk.trade_gate import evaluate_trade_gate
 from utils import volume_tracker
 from utils.logging_config import setup_logging
 from utils.time_utils import format_utc_sgt, now_utc
@@ -1131,6 +1132,23 @@ class Algo:
                 f"[{label}] {loss_check.reason}",
             )
             return
+
+        # ── External trade-gate signal (optional, default OFF) ──
+        # An external producer (e.g. the vol forecaster) gates this entry
+        # per-window. A stale file, a window mismatch, or should_trade=false
+        # all SKIP the entry — fail-safe, so a dead/frozen producer can
+        # never wave a trade through. See risk/trade_gate.py.
+        if config.TRADE_GATE_ENABLED:
+            gate = evaluate_trade_gate(session)
+            if not gate.allowed:
+                log.info("entry_blocked_trade_gate",
+                         session=session.name, reason=gate.reason)
+                await notifier.notify_skip(
+                    f"[{label}] Trade gate — entry skipped: {gate.reason}",
+                )
+                return
+            log.info("trade_gate_ok",
+                     session=session.name, reason=gate.reason)
 
         if self.portfolio.has_open or self._close_in_progress > 0:
             # A prior session's straddle is still unwinding (maker-only

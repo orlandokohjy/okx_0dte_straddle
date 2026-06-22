@@ -660,6 +660,47 @@ CONSECUTIVE_FAILURE_LIMIT: int = int(
     os.getenv("CONSECUTIVE_FAILURE_LIMIT", "3")
 )
 
+# ──────────────────── External Trade-Gate Signal ─────────────────
+# Optional per-window entry gate driven by an external JSON signal file
+# (e.g. the vsn-vol-forecaster). When enabled, each scheduled entry is
+# allowed ONLY if the signal file positively says so for that window.
+# Default OFF — unset leaves entry behaviour completely unchanged.
+#
+# The producer writes its output dir on the host; mount it READ-ONLY into
+# the container (see docker-compose.yml) so the path resolves to
+# TRADE_GATE_FILE inside /app. See risk/trade_gate.py for the schema and
+# the fail-safe semantics.
+TRADE_GATE_ENABLED: bool = os.getenv(
+    "TRADE_GATE_ENABLED", "false",
+).lower() in ("true", "1", "yes", "on")
+
+# Path to the JSON signal file, relative to the app working dir (/app).
+TRADE_GATE_FILE: str = os.getenv(
+    "TRADE_GATE_FILE", "signals/trade_gate.json",
+)
+
+# Max age of the file's ``generated_at_utc`` before the signal is treated
+# as stale and entries are blocked (fail-safe against a frozen producer).
+# Default 900s (15 min) comfortably clears a 5-min producer cadence.
+TRADE_GATE_MAX_AGE_SEC: float = float(
+    os.getenv("TRADE_GATE_MAX_AGE_SEC", "900")
+)
+
+# Also require the file's ``weekday`` flag to match the firing session's
+# day-type. Guards the 13:30 / 14:30 / 15:00 entry-time collisions between
+# the weekday and weekend schedules.
+TRADE_GATE_MATCH_WEEKDAY: bool = os.getenv(
+    "TRADE_GATE_MATCH_WEEKDAY", "true",
+).lower() in ("true", "1", "yes", "on")
+
+# When True, a missing / unreadable / stale signal file ALLOWS the entry
+# (fail-open). Default False = fail-safe: anything we cannot positively
+# verify blocks the entry. An explicit should_trade=false ALWAYS blocks
+# regardless of this flag.
+TRADE_GATE_FAIL_OPEN: bool = os.getenv(
+    "TRADE_GATE_FAIL_OPEN", "false",
+).lower() in ("true", "1", "yes", "on")
+
 # ──────────────────── Telegram ────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
