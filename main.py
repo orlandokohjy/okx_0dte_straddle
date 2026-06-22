@@ -337,6 +337,32 @@ class Algo:
                 "API value, then restart."
             )
 
+        # Non-BTC CM coins (e.g. ETH): the SILENT premium-tier tick table
+        # is a starting assumption until verified on the OKX UI. Trading
+        # live with a wrong tier table caused the 137-attempt chase thrash
+        # on BTC (2026-05-21). Block LIVE entries until the operator
+        # acknowledges the tiers (COIN_TIERS_VERIFIED in .env); DRY_RUN is
+        # allowed so they can observe chase behaviour first.
+        if (family.is_cm() and not family.tiers_verified()
+                and not config.DRY_RUN and not self._entry_locked):
+            self._entry_locked = True
+            self._lock_reason = (
+                f"{family.base_coin()} CM tick-tier table unverified. "
+                "Verify the silent premium-tier ticks on the OKX UI, then "
+                f"set COIN_TIERS_VERIFIED={family.base_coin()} in .env and "
+                "restart."
+            )
+            await notifier.send(
+                f"<b>STARTUP: {family.base_coin()} TICK-TIERS UNVERIFIED</b>\n"
+                "The silent CM premium-tier tick table for this coin has "
+                "not been verified against the OKX UI. Maker chases could "
+                "thrash against OKX's hidden rounding.\n\n"
+                "<b>Entries are LOCKED</b> until acknowledged.\n"
+                f"Action: verify tiers, then set "
+                f"<code>COIN_TIERS_VERIFIED={family.base_coin()}</code> in "
+                ".env and restart."
+            )
+
         # Validate that OPTION_ENTRY_CHASE_DEADLINE_MIN fits inside every
         # session's entry-window (entry_utc → close_utc). The chase MUST
         # complete before the session-close cron fires; otherwise close

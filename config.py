@@ -43,7 +43,17 @@ RESET_STATE_ON_BOOT: bool = os.getenv(
 HAS_OKX_CREDS: bool = bool(OKX_API_KEY and OKX_API_SECRET and OKX_PASSPHRASE)
 
 # ──────────────────── Strategy Constants ──────────────────────────
-BASE_COIN: str = "BTC"
+# Underlying coin. Default BTC (production). Set BASE_COIN=ETH in .env to
+# trade ETH-USD options — same OKX structure (inverse, daily 08:00 UTC
+# expiry, instId ETH-USD-{YYMMDD}-{STRIKE}-{C|P}). All symbol/tick/
+# contract-size derivation lives in ``core.family``; this is the single
+# OPS-facing toggle for the underlying.
+BASE_COIN: str = os.getenv("BASE_COIN", "BTC").upper()
+
+# Default underlying-coin per OKX contract, by coin. = ctVal × ctMult
+# from /api/v5/public/instruments (BTC 1×0.01; ETH 1×0.1). Overridable
+# via env below; the startup auto-verify re-checks against the live API.
+_DEFAULT_CONTRACT_SIZE: dict[str, float] = {"BTC": 0.01, "ETH": 0.1}
 
 # Option family selector.
 #   OPTION_FAMILY=CM (default) → BTC-USD inverse / coin-margined
@@ -77,8 +87,9 @@ QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "0.5"))
 # OKX_CONTRACT_SIZE_BTC_UM (UM) if your account behaves differently.
 OKX_CONTRACT_SIZE_BTC: float = float(os.getenv(
     "OKX_CONTRACT_SIZE_BTC_UM" if OPTION_FAMILY == "UM"
-    else "OKX_CONTRACT_SIZE_BTC",
-    "0.01",
+    else ("OKX_CONTRACT_SIZE_BTC" if BASE_COIN == "BTC"
+          else f"OKX_CONTRACT_SIZE_{BASE_COIN}"),
+    str(_DEFAULT_CONTRACT_SIZE.get(BASE_COIN, 0.01)),
 ))
 
 # Trading mode for OKX OPTION orders.
