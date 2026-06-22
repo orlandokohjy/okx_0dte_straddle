@@ -492,6 +492,16 @@ SESSIONS: list[Session] = (
 )
 
 
+# Weekend-strategy session names — SINGLE SOURCE OF TRUTH, derived from the
+# weekend schedule so report code can never drift out of sync when the
+# schedule changes. Both main.py (weekly-report anchor + weekend-recap
+# gating) and reporting/daily_report.py (weekend-recap trade filter)
+# import this instead of maintaining their own hardcoded copies.
+WEEKEND_SESSION_NAMES: frozenset[str] = frozenset(
+    name for (name, _h, _m) in _WEEKEND_ENTRIES
+)
+
+
 # Legacy session names. trade_log.csv rows from before 2026-05-20 use
 # "morning"/"afternoon" as session_name; new code uses "utc_HHMM". This
 # table maps legacy → canonical so reports can reconcile historical

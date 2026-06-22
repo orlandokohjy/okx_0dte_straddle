@@ -1459,13 +1459,12 @@ def format_weekly_report(m: DailyMetrics) -> str:
 #   • Operationally simpler: when the operator adds a third weekend
 #     session in the future, they just add it to WEEKEND_SESSION_NAMES.
 
-# Sessions that belong to the weekend recap window. Keep this list in
-# sync with config.SESSIONS' Sat/Sun-entry sessions. Used by the
-# weekend recap loader and by main.py to decide when to fire the recap.
-WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({
-    "we_1100", "we_1200", "we_1230", "we_1330", "we_1430",
-    "we_1500", "we_1700", "we_1900", "we_2200",
-})
+# Sessions that belong to the weekend recap window. SINGLE SOURCE OF
+# TRUTH is ``config.WEEKEND_SESSION_NAMES`` (derived from the weekend
+# schedule); re-exported here so existing importers of
+# ``daily_report.WEEKEND_SESSION_NAMES`` keep working and can never drift
+# from the live schedule.
+WEEKEND_SESSION_NAMES: frozenset[str] = config.WEEKEND_SESSION_NAMES
 
 
 def _weekend_window(today_utc: datetime) -> tuple[str, str]:

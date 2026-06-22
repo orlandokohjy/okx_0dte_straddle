@@ -61,14 +61,12 @@ from utils.time_utils import format_utc_sgt, now_utc
 log = structlog.get_logger(__name__)
 
 
-# Weekend-strategy session names. Imported lazily by the daily-report
-# loader (reporting.daily_report.WEEKEND_SESSION_NAMES) too — keep both
-# in sync. Used in main._on_close to (a) exclude weekend sessions from
-# the weekly-report anchor and (b) gate the WEEKEND RECAP firing.
-_WEEKEND_SESSION_NAMES: frozenset[str] = frozenset({
-    "we_1100", "we_1200", "we_1230", "we_1330", "we_1430",
-    "we_1500", "we_1700", "we_1900", "we_2200",
-})
+# Weekend-strategy session names. Single source of truth lives in
+# ``config.WEEKEND_SESSION_NAMES`` (derived from the weekend schedule), so
+# this can never drift when the schedule changes. Re-exported under the
+# legacy private name for existing call sites: (a) exclude weekend
+# sessions from the weekly-report anchor and (b) gate the WEEKEND RECAP.
+_WEEKEND_SESSION_NAMES: frozenset[str] = config.WEEKEND_SESSION_NAMES
 
 # WEEKEND RECAP trigger: session name + trading_day weekday that
 # together identify "we just finished the weekend". Under the 2026-06-14
