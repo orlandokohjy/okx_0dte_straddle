@@ -1,112 +1,62 @@
 # Running two algos side-by-side (two accounts, one VPS)
 
-This guide runs **two fully isolated stacks** on the same host:
+Run **two fully isolated stacks** on the VPS (`jiayi@188.166.214.51`):
 
-| Stack | Account | Branch | Trade gate | Container |
-|-------|---------|--------|-----------|-----------|
-| **plain**  | account 1 | `main`             | OFF (`TRADE_GATE_ENABLED` unset) | `okx_0dte_straddle` (default) |
-| **signal** | account 2 | `feat/trade-gate`  | ON  (`TRADE_GATE_ENABLED=true`)  | `okx_signal` |
+| Stack | Account | Dir on VPS | Branch | Trade gate | Container |
+|-------|---------|-----------|--------|-----------|-----------|
+| **plain** (existing live) | account 1 | `~/okx_0dte_straddle` | `main`            | OFF | `okx_0dte_straddle` (default) |
+| **signal** (new)          | account 2 (`AITradingAccount2`) | `~/okx-signal` | `feat/trade-gate` | ON | `okx_signal` |
 
-Each stack has its own `.env`, `state/`, `logs/`, container name, and compose
-project, so you can build/restart/force-liquidate one account without touching
-the other. They only ever interact with their own account via their own keys.
+> **Compose is v1 (`docker-compose`, hyphenated) on this VPS — `docker compose`
+> (v2, space) is NOT installed.** All commands below use the hyphenated form,
+> per `AGENTS.md`.
 
-> **The single biggest risk is pointing both `.env` files at the same account.**
-> If two stacks share an account, the PID singleton lock and the position
-> reconciler will fight each other and you'll get orphaned positions. Verify the
-> account on each `.env` *before* launching (see step 4).
+The plain stack already runs at `~/okx_0dte_straddle`; **leave it untouched.**
+We only add a second worktree for the signal stack. Each stack has its own
+`.env`, `state/`, `logs/`, container name, and compose project — so you can
+build/restart/force-liquidate one account without touching the other.
+
+> **Biggest risk: pointing both `.env` files at the same account.** Two stacks
+> on one account make the PID singleton lock and the position reconciler fight
+> → orphaned positions. Verify the account on each `.env` BEFORE launching
+> (step 4). Account 2's key is whitelisted to the VPS IP `188.166.214.51`.
 
 ---
 
-## 1. Create two worktrees (one shared repo)
+## 1. Add a worktree for the signal stack
 
-From the existing clone on the VPS:
+The existing live clone stays as-is. From it, add a second working dir on the
+gate branch:
 
 ```bash
-cd /opt/okx_0dte_straddle           # your existing clone
+cd ~/okx_0dte_straddle
 git fetch origin
-
-# Stack A — plain algo (account 1), tracks main
-git worktree add /opt/okx-plain  main
-
-# Stack B — signal-gated algo (account 2), tracks feat/trade-gate
-git worktree add /opt/okx-signal feat/trade-gate
+git worktree add ~/okx-signal feat/trade-gate
 ```
 
-Worktrees share one object store, so `git pull` in each dir updates only that
-branch — you can ship a fix to one algo without disturbing the other.
+One shared object store; `git -C ~/okx-signal pull` updates only the signal
+stack, `git -C ~/okx_0dte_straddle pull` only the plain stack.
 
 ---
 
-## 2. Configure the PLAIN stack (account 1)
+## 2. Drop in the signal stack's .env
+
+Copy the prepared `.env.signal` (account-2 creds, gate ON, `CONTAINER_NAME=okx_signal`)
+to the signal worktree as its `.env`:
 
 ```bash
-cd /opt/okx-plain
-cp .env.example .env        # or copy your current live .env
+# from your laptop, or scp the file up first
+scp .env.signal jiayi@188.166.214.51:~/okx-signal/.env
 ```
 
-Edit `/opt/okx-plain/.env`:
-
-```dotenv
-# OKX — ACCOUNT 1 keys
-OKX_API_KEY=...acct1...
-OKX_API_SECRET=...acct1...
-OKX_PASSPHRASE=...acct1...
-OKX_FLAG=0                  # 0 = LIVE, 1 = demo
-OKX_DOMAIN=https://www.okx.com
-
-# Telegram — keep these distinct from the signal stack so you can tell
-# which algo sent an alert (separate bot token OR at least a chat).
-TELEGRAM_BOT_TOKEN=...botA...
-TELEGRAM_CHAT_ID=...chatA...
-TELEGRAM_REPORT_BOT_TOKEN=...reportA...   # optional daily-report channel
-TELEGRAM_REPORT_CHAT_ID=...reportChatA...
-
-# Trade gate stays OFF on this stack (default). Do NOT set TRADE_GATE_ENABLED.
-
-# Container name: default is okx_0dte_straddle on main — leave as is.
-
-# First boot on a fresh account: wipe demo state so equity starts clean.
-# RESET_STATE_ON_BOOT=true   # set once, auto-disables after first run
-```
-
----
-
-## 3. Configure the SIGNAL stack (account 2)
+Then on the VPS, fill the two blanks I could not set:
 
 ```bash
-cd /opt/okx-signal
-cp .env.example .env
-```
-
-Edit `/opt/okx-signal/.env`:
-
-```dotenv
-# OKX — ACCOUNT 2 keys (MUST be a different account from the plain stack)
-OKX_API_KEY=...acct2...
-OKX_API_SECRET=...acct2...
-OKX_PASSPHRASE=...acct2...
-OKX_FLAG=0                  # 0 = LIVE, 1 = demo
-OKX_DOMAIN=https://www.okx.com
-
-# Telegram — distinct from the plain stack
-TELEGRAM_BOT_TOKEN=...botB...
-TELEGRAM_CHAT_ID=...chatB...
-TELEGRAM_REPORT_BOT_TOKEN=...reportB...   # optional daily-report channel
-TELEGRAM_REPORT_CHAT_ID=...reportChatB...
-
-# Distinct container name so it never collides with the plain stack
-CONTAINER_NAME=okx_signal
-
-# --- Trade gate ---
-TRADE_GATE_ENABLED=true
-# Defaults are usually fine; override only if needed:
-# TRADE_GATE_FILE=signals/trade_gate.json   # path INSIDE the container
-# TRADE_GATE_MAX_AGE_SEC=900                 # signal freshness budget (15 min)
-# TRADE_GATE_MATCH_WEEKDAY=true              # match wd/we day-type
-# TRADE_GATE_FAIL_OPEN=false                 # default: skip if unverifiable
-# TRADE_GATE_WAIT_SEC=90                     # poll budget for a late publish
-# TRADE_GATE_POLL_SEC=3                      # re-read interval
+nano ~/okx-signal/.env
+#   OKX_PASSPHRASE=...        # the passphrase set when the key was created
+#   TELEGRAM_*=...            # optional; use a DIFFERENT bot/chat from plain
+#   INITIAL_CAPITAL_USD=...   # account 2's actual starting capital
+#   DRY_RUN=true → false      # only after step 4 confirms wiring
 ```
 
 The signal mount (`/opt/tft/vsn-vol-forecaster/signals:/app/signals:ro`) is
@@ -118,29 +68,45 @@ ls -l /opt/tft/vsn-vol-forecaster/signals/trade_gate.json
 
 ---
 
-## 4. VERIFY each .env hits the intended account (do this before launching)
+## 3. (Plain stack — no change needed)
 
-Run a read-only balance check in each dir; confirm the equity/account matches
-what you expect for that account:
-
-```bash
-cd /opt/okx-plain  && docker compose -p okx_plain  run --rm algo python diagnose_okx.py
-cd /opt/okx-signal && docker compose -p okx_signal run --rm algo python diagnose_okx.py
-```
-
-If both print the same account/equity, STOP — your keys are crossed.
+It keeps running at `~/okx_0dte_straddle` on `main` with container
+`okx_0dte_straddle` and the default compose project. Don't move it.
 
 ---
 
-## 5. Launch both stacks
+## 4. VERIFY the signal .env hits account 2 (before any live fill)
+
+The Dockerfile entrypoint is `python main.py`, so a bare
+`docker-compose run --rm algo python diagnose_okx.py` would just boot the algo.
+You MUST clear the entrypoint:
 
 ```bash
-cd /opt/okx-plain  && docker compose -p okx_plain  up -d --build
-cd /opt/okx-signal && docker compose -p okx_signal up -d --build
+cd ~/okx-signal
+docker-compose -p okx_signal run --rm --entrypoint "" algo \
+    python diagnose_okx.py
 ```
 
-The `-p` project flag namespaces networks/volumes per stack. Combined with the
-distinct `container_name`, the two are fully isolated.
+Confirm it authenticates and shows **account 2's** balance/positions (not
+account 1's). `diagnose_okx.py` is read-only — balance + position list, no
+orders. If it shows the same account as the plain stack, STOP: your keys are
+crossed.
+
+---
+
+## 5. Launch the signal stack
+
+```bash
+cd ~/okx-signal
+docker-compose -p okx_signal up -d --build
+docker-compose -p okx_signal logs -f --tail=200 algo
+```
+
+The `-p okx_signal` project flag namespaces networks/volumes; combined with
+`CONTAINER_NAME=okx_signal` the two stacks are fully isolated.
+
+> `RESET_STATE_ON_BOOT=true` is set in `.env.signal` so the new account starts
+> with clean equity/state. It auto-disables after the first boot.
 
 ---
 
@@ -148,27 +114,36 @@ distinct `container_name`, the two are fully isolated.
 
 ```bash
 # Logs
-docker logs -f okx_0dte_straddle      # plain
-docker logs -f okx_signal             # signal
+docker-compose logs -f --tail=200 algo                       # plain (run from ~/okx_0dte_straddle)
+docker-compose -p okx_signal logs -f --tail=200 algo         # signal (run from ~/okx-signal)
 
-# Restart just one
-cd /opt/okx-signal && docker compose -p okx_signal restart
+# Apply an .env change (v1 footgun: `restart` does NOT re-read .env)
+cd ~/okx-signal && docker-compose -p okx_signal up -d --force-recreate algo
 
-# Stop just one
-cd /opt/okx-plain  && docker compose -p okx_plain down
+# Ship a code update to just the signal algo
+cd ~/okx-signal && git pull && docker-compose -p okx_signal up -d --build algo
 
-# Ship an update to just the signal algo
-cd /opt/okx-signal && git pull && docker compose -p okx_signal up -d --build
+# Force-liquidate account 2 (clears entrypoint; stop algo first to release lock)
+cd ~/okx-signal
+docker-compose -p okx_signal stop algo
+docker-compose -p okx_signal run --rm --entrypoint "" algo python tools/force_liquidate.py
+docker-compose -p okx_signal start algo
 ```
+
+Never use `--no-cache` on routine code-only deploys (only when
+`requirements.txt`/`Dockerfile` change).
 
 ---
 
 ## Pre-flight checklist
 
-- [ ] `/opt/okx-plain/.env` → account 1 keys; `/opt/okx-signal/.env` → account 2 keys (verified in step 4)
-- [ ] Telegram bot/chat differs between stacks (or distinct prefix)
+- [ ] `~/okx-signal/.env` → account 2 keys; passphrase filled (verified in step 4)
+- [ ] `diagnose_okx.py` showed account 2 (NOT account 1)
 - [ ] `CONTAINER_NAME=okx_signal` set in the signal `.env`
 - [ ] Signal file present: `/opt/tft/vsn-vol-forecaster/signals/trade_gate.json`
 - [ ] `TRADE_GATE_ENABLED=true` ONLY on the signal stack
-- [ ] Host clock synced (chrony / systemd-timesyncd) — cron + gate freshness depend on accurate UTC
-- [ ] Each stack has its own `state/` and `logs/` (guaranteed by separate worktree dirs)
+- [ ] Telegram bot/chat differs from the plain stack (or left blank)
+- [ ] `INITIAL_CAPITAL_USD` set to account 2's real capital
+- [ ] Started with `DRY_RUN=true`, flipped to `false` only after verifying wiring
+- [ ] Host clock synced (chrony / systemd-timesyncd) — cron + gate freshness need accurate UTC
+- [ ] Plain stack at `~/okx_0dte_straddle` left untouched
