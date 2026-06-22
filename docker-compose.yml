@@ -1,7 +1,10 @@
 services:
   algo:
     build: .
-    container_name: okx_0dte_straddle
+    # Per-stack name so two accounts can run side-by-side on one host
+    # (e.g. CONTAINER_NAME=okx_signal in this stack's .env, while the
+    # plain stack keeps the default). Defaults preserve single-stack setups.
+    container_name: ${CONTAINER_NAME:-okx_0dte_straddle}
     restart: always
     env_file: .env
     environment:
