@@ -448,7 +448,7 @@ def _derive_close(
 def _build_schedule(
     entries: list[tuple[str, int, int]], weekdays: frozenset[int],
 ) -> list[Session]:
-    """Build a list of fixed_btc 0.5-BTC sessions from (name, h, m) specs,
+    """Build a list of fixed_btc 0.25-BTC sessions from (name, h, m) specs,
     deriving each close from the next contiguous entry (chained roll) or
     a full 30-min hold (standalone / chain tail)."""
     entry_mins = {h * 60 + m for (_, h, m) in entries}
@@ -462,7 +462,7 @@ def _build_schedule(
             close_utc=_derive_close(h, m, next_entry_min),
             weekdays=weekdays,
             default_sizing_mode="fixed_btc",
-            default_qty_per_leg=0.5,
+            default_qty_per_leg=0.25,
         ))
     return out
 
