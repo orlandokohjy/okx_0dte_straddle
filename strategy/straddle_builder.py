@@ -134,6 +134,7 @@ async def build_straddle(
     qty_per_leg: float,
     session_name: str,
     entry_spot: float = 0.0,
+    chase_deadline_min: Optional[float] = None,
 ) -> Optional[Straddle]:
     """
     Execute the entry for N identical straddle units.
@@ -214,11 +215,13 @@ async def build_straddle(
                  call_ref=call_ref, put_ref=put_ref, qty=total_qty)
 
         put_task = asyncio.create_task(
-            exchange.chase_buy(pair.put.symbol, total_qty, put_ref),
+            exchange.chase_buy(pair.put.symbol, total_qty, put_ref,
+                               deadline_min=chase_deadline_min),
             name=f"chase_buy_put_{straddle_id}",
         )
         call_task = asyncio.create_task(
-            exchange.chase_buy(pair.call.symbol, total_qty, call_ref),
+            exchange.chase_buy(pair.call.symbol, total_qty, call_ref,
+                               deadline_min=chase_deadline_min),
             name=f"chase_buy_call_{straddle_id}",
         )
         # gather will return both results (or propagate the first exception

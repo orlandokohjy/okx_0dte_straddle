@@ -1256,6 +1256,7 @@ class OKXExchange:
 
     async def chase_buy(
         self, instrument: str, qty_btc: float, initial_bid: float,
+        deadline_min: Optional[float] = None,
     ) -> Optional[dict]:
         """
         Maker-only buy chase with partial-fill tracking and queue-priority
@@ -1294,7 +1295,11 @@ class OKXExchange:
         The caller checks `fully_filled` to decide whether the leg is
         usable as-is or needs to be flattened (partial-fill failure).
         """
-        deadline = time.time() + config.OPTION_ENTRY_CHASE_DEADLINE_MIN * 60
+        eff_deadline_min = (
+            deadline_min if deadline_min is not None
+            else config.OPTION_ENTRY_CHASE_DEADLINE_MIN
+        )
+        deadline = time.time() + eff_deadline_min * 60
         ct_val = config.OKX_CONTRACT_SIZE_BTC
         target_contracts = int(round(qty_btc / ct_val))
         if target_contracts <= 0:

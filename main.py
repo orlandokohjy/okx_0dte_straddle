@@ -1086,6 +1086,34 @@ class Algo:
                 return False
             await asyncio.sleep(POLL_SEC)
 
+    def _entry_chase_deadline_min(self, session: config.Session) -> float:
+        """Cap the entry-chase deadline to the time actually left in this
+        session's window (close − now − safety buffer).
+
+        With the trade gate the producer often publishes a window's signal
+        several minutes AFTER the entry instant (it's computed on the entry
+        bar, which closes 5 min later), so a gated entry can land well into
+        the window. A *fixed* deadline would then let the maker chase run
+        past the session-close cron. Capping to the remaining window keeps
+        the chase finishing ≥ CLOSE_RACE_BUFFER_MIN before the close.
+
+        Returns the effective deadline in minutes (may be ≤ 0 when almost
+        no window remains — the caller skips in that case).
+        """
+        CLOSE_RACE_BUFFER_MIN = 5.0
+        now = now_utc()
+        close_dt = now.replace(
+            hour=session.close_utc.hour, minute=session.close_utc.minute,
+            second=0, microsecond=0,
+        )
+        if close_dt <= now:
+            close_dt += timedelta(days=1)
+        remaining_min = (close_dt - now).total_seconds() / 60.0
+        return min(
+            float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN),
+            remaining_min - CLOSE_RACE_BUFFER_MIN,
+        )
+
     async def _resolve_trade_gate(
         self, session: config.Session, label: str,
     ) -> GateDecision:
@@ -1412,12 +1440,35 @@ class Algo:
             f"${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
         )
 
+        # Cap the entry chase to the time left in this window. A gated entry
+        # can land minutes late (signal publishes after the entry bar), so a
+        # static deadline could race the close cron. If too little remains
+        # for a safe chase, skip fail-safe rather than open a position we
+        # can't unwind in time.
+        MIN_ENTRY_CHASE_MIN = 3.0
+        chase_deadline_min = self._entry_chase_deadline_min(session)
+        if chase_deadline_min < MIN_ENTRY_CHASE_MIN:
+            log.warning("entry_skipped_insufficient_window",
+                        session=session.name,
+                        chase_deadline_min=round(chase_deadline_min, 2))
+            await notifier.notify_skip(
+                f"[{label}] Too little of the window remains for a safe "
+                f"entry chase ({chase_deadline_min:.1f} min &lt; "
+                f"{MIN_ENTRY_CHASE_MIN:.0f} min) — skipping."
+            )
+            return
+        log.info("entry_chase_deadline_resolved",
+                 session=session.name,
+                 chase_deadline_min=round(chase_deadline_min, 2),
+                 static_max=config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+
         straddle = await build_straddle(
             self.exchange, self.market, self.portfolio,
             pair, sizing.num_straddles,
             qty_per_leg=resolved_qty,
             session_name=session.name,
             entry_spot=spot,
+            chase_deadline_min=chase_deadline_min,
         )
         if straddle:
             self._consecutive_failures = 0
