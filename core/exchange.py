@@ -1256,10 +1256,15 @@ class OKXExchange:
 
     async def chase_buy(
         self, instrument: str, qty_btc: float, initial_bid: float,
+        deadline_min: Optional[float] = None,
     ) -> Optional[dict]:
         """
         Maker-only buy chase with partial-fill tracking and queue-priority
         preservation.
+
+        ``deadline_min`` overrides the default entry-chase budget — used by
+        the persistent post-close re-flatten loop to bound the short-cover
+        leg per round.
 
         Walks the bid toward the ask by OPTION_CHASE_GAP_NARROW_PCT each
         retry, never above mark × OPTION_CHASE_MAX_SLIPPAGE_FACTOR. Bails
@@ -1294,7 +1299,11 @@ class OKXExchange:
         The caller checks `fully_filled` to decide whether the leg is
         usable as-is or needs to be flattened (partial-fill failure).
         """
-        deadline = time.time() + config.OPTION_ENTRY_CHASE_DEADLINE_MIN * 60
+        eff_deadline_min = (
+            deadline_min if deadline_min is not None
+            else config.OPTION_ENTRY_CHASE_DEADLINE_MIN
+        )
+        deadline = time.time() + eff_deadline_min * 60
         ct_val = config.OKX_CONTRACT_SIZE_BTC
         target_contracts = int(round(qty_btc / ct_val))
         if target_contracts <= 0:
@@ -1727,6 +1736,7 @@ class OKXExchange:
 
     async def chase_sell(
         self, instrument: str, qty_btc: float, initial_ask: float,
+        deadline_min: Optional[float] = None,
     ) -> Optional[dict]:
         """
         Maker-only sell chase with partial-fill tracking and queue-priority
@@ -1735,8 +1745,16 @@ class OKXExchange:
         Returns a dict with {average_price, order_id, filled_qty_btc,
         fully_filled, metrics} on any fill, else None on zero fill.
         Caller checks fully_filled to detect under-unwound positions.
+
+        ``deadline_min`` overrides the default exit-chase budget — used by the
+        persistent post-close re-flatten loop to bound each round so it can
+        re-read the live position between attempts.
         """
-        deadline = time.time() + config.OPTION_EXIT_CHASE_DEADLINE_MIN * 60
+        eff_deadline_min = (
+            deadline_min if deadline_min is not None
+            else config.OPTION_EXIT_CHASE_DEADLINE_MIN
+        )
+        deadline = time.time() + eff_deadline_min * 60
         ct_val = config.OKX_CONTRACT_SIZE_BTC
         target_contracts = int(round(qty_btc / ct_val))
         if target_contracts <= 0:

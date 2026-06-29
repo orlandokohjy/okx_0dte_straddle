@@ -630,6 +630,26 @@ OPTION_EXIT_CHASE_DEADLINE_MIN: float = float(
 # OPTION_ENTRY_CHASE_DEADLINE_MIN or OPTION_EXIT_CHASE_DEADLINE_MIN.
 OPTION_CHASE_DEADLINE_MIN: float = OPTION_EXIT_CHASE_DEADLINE_MIN
 
+# ── Persistent post-close re-flatten ──────────────────────────────────
+# After the close unwind, _post_close_reconcile verifies the exchange is
+# actually flat. If a residual leg remains (transient abort, partial fill,
+# or a deadline-capped chase), DON'T immediately lock — keep trying to
+# close it, maker-only. Each round re-reads the live position and chases
+# only the *remaining* qty (never a blind re-send → can't oversell into a
+# short). Entries stay blocked the whole time (_close_in_progress > 0), so
+# nothing stacks on top of the residual. Only lock if still not flat after
+# the total budget — a genuine stuck state (e.g. no bid on a dying 0DTE
+# leg, which the 08:00 UTC expiry settles anyway).
+CLOSE_FLATTEN_BUDGET_MIN: float = float(
+    os.getenv("CLOSE_FLATTEN_BUDGET_MIN", "90.0")
+)
+# Per-round maker chase deadline inside the re-flatten loop. Bounded so the
+# loop re-reads the position between rounds rather than resting one order
+# for the whole budget.
+CLOSE_FLATTEN_ROUND_MIN: float = float(
+    os.getenv("CLOSE_FLATTEN_ROUND_MIN", "15.0")
+)
+
 # Pre-entry spread gate: skip session if put or call (ask − bid) / mid > this
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(
     os.getenv("OPTION_MAX_ENTRY_SPREAD_PCT", "0.30")
