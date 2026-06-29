@@ -531,21 +531,50 @@ async def unwind_straddle(
                 # starts from a clean book. Without this, a single network
                 # blip on close leaves the leg unsold and falls back to the
                 # entry price → phantom close + orphan (2026-06-18 wd_1400
-                # incident). One fresh re-attempt with a refreshed ask.
+                # incident).
+                #
+                # CRITICAL: re-query the LIVE position before retrying. The
+                # disconnect can happen *after* OKX accepted/filled some or
+                # all of the original chase — a blind re-send of the full
+                # `qty` would then oversell into a SHORT (the 2026-06-2x
+                # post-close orphan: -50 contracts on both legs). Only resell
+                # whatever long remains; if already flat/short, do nothing.
                 log.warning("sell_leg_transient_retry",
                             instrument=symbol,
                             exc_type=type(exc).__name__)
                 await asyncio.sleep(2.0)
+                try:
+                    positions = await exchange.list_open_positions()
+                except Exception:
+                    log.error("sell_leg_requery_failed",
+                              instrument=symbol, exc_info=True)
+                    return None
+                remaining_contracts = 0.0
+                for p in positions:
+                    if p.get("instrument_name") == symbol:
+                        remaining_contracts = float(p.get("amount", 0.0))
+                        break
+                if remaining_contracts <= 0:
+                    # Original chase already flattened (or even shorted) the
+                    # leg before the disconnect — nothing left to sell.
+                    log.info("sell_leg_already_flat_after_transient",
+                             instrument=symbol,
+                             remaining_contracts=remaining_contracts)
+                    return None
+                remaining_qty = remaining_contracts * config.OKX_CONTRACT_SIZE_BTC
                 try:
                     _, fresh_ask = await market.get_option_bid_ask(symbol)
                 except Exception:
                     fresh_ask = 0.0
                 use_ask = fresh_ask if fresh_ask > 0 else ref_ask
                 try:
-                    return await exchange.chase_sell(symbol, qty, use_ask)
+                    return await exchange.chase_sell(
+                        symbol, remaining_qty, use_ask,
+                    )
                 except _TRANSIENT_HTTP_EXCEPTIONS:
                     # Second transient failure — give up; the caller's
-                    # leg-failure path + post-close orphan lock take over.
+                    # leg-failure path + post-close persistent re-flatten
+                    # (then orphan lock) take over.
                     log.error("sell_leg_transient_retry_failed",
                               instrument=symbol, exc_info=True)
                     return None
