@@ -47,6 +47,11 @@ TRADE_LOG_FIELDS = [
     "put_exit_ref_mark", "put_exit_ref_bid",
     "put_exit_slippage_vs_mark_pct",
     "put_exit_saved_vs_taker_usd",
+    # Implied volatility (OKX mark IV, decimal — 0.58 = 58%) captured
+    # best-effort at entry and exit. Blank when the snapshot was
+    # unavailable; never affects execution.
+    "call_entry_iv", "put_entry_iv",
+    "call_exit_iv", "put_exit_iv",
 ]
 
 
@@ -99,6 +104,14 @@ class Straddle:
     # context). Optional — older state files may not have them.
     entry_spot_price: float = 0.0
     exit_spot_price: float = 0.0
+
+    # OKX mark implied vol (decimal, 0.58 = 58%) captured best-effort at
+    # entry and exit for analytics. 0.0 means "not captured" (snapshot
+    # unavailable) — purely informational, never used in P&L or execution.
+    entry_call_iv: float = 0.0
+    entry_put_iv: float = 0.0
+    exit_call_iv: float = 0.0
+    exit_put_iv: float = 0.0
 
     status: str = "open"
     exit_time: Optional[str] = None
@@ -207,6 +220,10 @@ class Straddle:
             "family": self.family,
             "entry_spot_price": self.entry_spot_price,
             "exit_spot_price": self.exit_spot_price,
+            "entry_call_iv": self.entry_call_iv,
+            "entry_put_iv": self.entry_put_iv,
+            "exit_call_iv": self.exit_call_iv,
+            "exit_put_iv": self.exit_put_iv,
             "status": self.status,
             "exit_time": self.exit_time,
             "exit_call_price": self.exit_call_price,
@@ -461,6 +478,12 @@ class Portfolio:
             "put_exit_ref_bid": px.get("ref_bid", ""),
             "put_exit_slippage_vs_mark_pct": px.get("slippage_vs_mark_pct", ""),
             "put_exit_saved_vs_taker_usd": px.get("saved_vs_taker_total_usd", ""),
+            # Implied vol (OKX mark IV, decimal) — best-effort; blank if the
+            # snapshot was unavailable at entry/exit.
+            "call_entry_iv": s.entry_call_iv or "",
+            "put_entry_iv": s.entry_put_iv or "",
+            "call_exit_iv": s.exit_call_iv or "",
+            "put_exit_iv": s.exit_put_iv or "",
         }
 
         needs_header = not os.path.exists(config.TRADE_LOG_FILE)

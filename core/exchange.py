@@ -105,7 +105,7 @@ except ImportError:  # pragma: no cover — httpx/httpcore are pulled in by pyth
 _RETRY_SAFE_FNS: frozenset = frozenset({
     # Reads
     "get_index_tickers", "get_ticker", "get_tickers",
-    "get_mark_price", "get_instruments",
+    "get_mark_price", "get_instruments", "get_opt_summary",
     "get_account_balance", "get_positions",
     "get_order_list", "get_order",
     "get_quotes",
@@ -605,6 +605,60 @@ class OKXExchange:
         if not rows:
             return 0.0
         return self._f(rows[0], "markPx")
+
+    async def get_option_iv_batch(
+        self, instruments: list[str],
+    ) -> dict[str, dict]:
+        """Best-effort implied-vol snapshot for several options in ONE call.
+
+        Reads OKX's option-summary/greeks endpoint (``get_opt_summary``) for
+        the active underlying — which returns EVERY listed option — and picks
+        out the rows matching ``instruments``. One request covers both
+        straddle legs. Values are OKX-native decimals (e.g. 0.5876 = 58.76%).
+
+        ANALYTICS ONLY — NEVER raises and never touches order flow. Returns a
+        ``{instId: {...}}`` map (missing/failed instruments simply absent), so
+        callers can log it opportunistically without risking an entry or exit.
+        Per-instrument keys: ``mark_vol``, ``bid_vol``, ``ask_vol``,
+        ``delta``, ``vega`` (any value may be 0.0 if OKX omits it).
+        """
+        want = set(instruments)
+        out: dict[str, dict] = {}
+        try:
+            # Hard time-bound so a hung summary request can never stall the
+            # entry/exit path this runs alongside. If it times out, the
+            # underlying thread is abandoned and we simply return what we have.
+            resp = await asyncio.wait_for(
+                self._call(
+                    self._public.get_opt_summary, uly=family.underlying(),
+                ),
+                timeout=8.0,
+            )
+            for r in self._data_or_empty(resp):
+                iid = r.get("instId")
+                if iid in want:
+                    out[iid] = {
+                        "mark_vol": self._f(r, "markVol"),
+                        "bid_vol": self._f(r, "bidVol"),
+                        "ask_vol": self._f(r, "askVol"),
+                        "delta": self._f(r, "delta"),
+                        "vega": self._f(r, "vega"),
+                    }
+        except Exception:
+            # Swallow EVERYTHING — this is a logging nicety, not a trade
+            # dependency. A failure here must never abort an entry/exit.
+            log.warning("get_option_iv_batch_failed",
+                        instruments=instruments, exc_info=True)
+        return out
+
+    async def get_option_iv(self, instrument: str) -> dict:
+        """Single-instrument convenience wrapper around ``get_option_iv_batch``.
+
+        ANALYTICS ONLY — never raises. Returns ``{}`` when unavailable.
+        """
+        return (await self.get_option_iv_batch([instrument])).get(
+            instrument, {}
+        )
 
     # ──────────────────── Instrument metadata ─────────────────────
 
