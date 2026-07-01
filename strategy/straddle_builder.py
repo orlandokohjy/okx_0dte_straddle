@@ -440,6 +440,26 @@ async def build_straddle(
     )
     portfolio.set_straddle(straddle)
 
+    # Best-effort implied-vol capture (analytics only). The entry is ALREADY
+    # filled and persisted above, so nothing here can affect execution — a
+    # failure/timeout just leaves IV at 0.0. Re-persist only if we got a
+    # value so positions.json reflects it.
+    try:
+        ivs = await exchange.get_option_iv_batch([
+            straddle.call_leg.instrument, straddle.put_leg.instrument,
+        ])
+        straddle.entry_call_iv = ivs.get(
+            straddle.call_leg.instrument, {}).get("mark_vol", 0.0)
+        straddle.entry_put_iv = ivs.get(
+            straddle.put_leg.instrument, {}).get("mark_vol", 0.0)
+        if straddle.entry_call_iv or straddle.entry_put_iv:
+            portfolio.set_straddle(straddle)
+            log.info("entry_iv_captured", id=straddle_id,
+                     call_iv=straddle.entry_call_iv,
+                     put_iv=straddle.entry_put_iv)
+    except Exception:
+        log.warning("entry_iv_capture_failed", id=straddle_id, exc_info=True)
+
     # Total premium paid across all N straddles, converted to USD for the
     # log line. CM: native is BTC → USD via spot. UM: native is already
     # USD → spot is a no-op. If spot is unavailable on a CM run we fall
@@ -683,6 +703,20 @@ async def unwind_straddle(
                 f"Symbol: {straddle.put_leg.instrument}\n"
                 f"Could not sell within deadline. Manual action may be needed."
             )
+
+    # Best-effort exit IV (analytics only). Runs AFTER the legs are unwound,
+    # so a slow/failed snapshot can never delay or abort the close; on any
+    # error IV stays 0.0. Set before close_straddle so _log_trade records it.
+    try:
+        ivs = await exchange.get_option_iv_batch([
+            straddle.call_leg.instrument, straddle.put_leg.instrument,
+        ])
+        straddle.exit_call_iv = ivs.get(
+            straddle.call_leg.instrument, {}).get("mark_vol", 0.0)
+        straddle.exit_put_iv = ivs.get(
+            straddle.put_leg.instrument, {}).get("mark_vol", 0.0)
+    except Exception:
+        log.warning("exit_iv_capture_failed", id=straddle.id, exc_info=True)
 
     pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
     log.info("straddle_unwound", id=straddle.id, reason=reason,
