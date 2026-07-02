@@ -326,6 +326,7 @@ def _build_session(
     default_pct_equity: float = 0.0,
     default_qty_per_leg: float = 0.5,
     default_fixed_usd: float = 5500.0,
+    default_enabled: bool = True,
 ) -> Session:
     """Construct a Session with per-session env-var overrides.
 
@@ -352,7 +353,12 @@ def _build_session(
     pct_equity = _session_env_float(name, "PCT_EQUITY", default_pct_equity)
     qty_per_leg = _session_env_float(name, "QTY_PER_LEG", default_qty_per_leg)
     fixed_usd = _session_env_float(name, "FIXED_USD", default_fixed_usd)
-    enabled_raw = _session_env_str(name, "ENABLED", "true").lower()
+    # ``default_enabled`` lets a whole schedule (e.g. all weekend windows)
+    # default OFF while a per-session <NAME>_ENABLED still wins, so an
+    # operator can force a single window back on even under a group toggle.
+    enabled_raw = _session_env_str(
+        name, "ENABLED", "true" if default_enabled else "false",
+    ).lower()
     enabled = enabled_raw not in ("false", "0", "no", "off", "")
     return Session(
         name=name,
@@ -468,6 +474,7 @@ def _derive_close(
 
 def _build_schedule(
     entries: list[tuple[str, int, int]], weekdays: frozenset[int],
+    enabled_default: bool = True,
 ) -> list[Session]:
     """Build a list of fixed_btc 0.25-BTC sessions from (name, h, m) specs,
     deriving each close from the next contiguous entry (chained roll) or
@@ -484,13 +491,26 @@ def _build_schedule(
             weekdays=weekdays,
             default_sizing_mode="fixed_btc",
             default_qty_per_leg=0.25,
+            default_enabled=enabled_default,
         ))
     return out
 
 
+# Global weekend kill-switch. When false, every we_* (Sat/Sun) session is
+# built disabled by default so the algo trades weekdays only. Weekday
+# sessions are untouched. A specific weekend window can still be forced
+# back on with its own we_HHMM_ENABLED=true. Default true preserves the
+# full 7-day schedule for stacks that don't set it.
+WEEKEND_TRADING_ENABLED: bool = os.getenv(
+    "WEEKEND_TRADING_ENABLED", "true",
+).lower() in ("true", "1", "yes", "on")
+
 SESSIONS: list[Session] = (
     _build_schedule(_WEEKDAY_ENTRIES, _WEEKDAY_DAYS)
-    + _build_schedule(_WEEKEND_ENTRIES, _WEEKEND_DAYS)
+    + _build_schedule(
+        _WEEKEND_ENTRIES, _WEEKEND_DAYS,
+        enabled_default=WEEKEND_TRADING_ENABLED,
+    )
 )
 
 
