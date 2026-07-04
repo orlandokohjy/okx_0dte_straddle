@@ -2043,6 +2043,37 @@ class OKXExchange:
                     log.error("chase_sell_fatal_reject",
                               instrument=instrument, sCode=sCode, sMsg=sMsg,
                               attempt=attempt, filled_so_far=filled_contracts)
+                    # 51008 = "available balance insufficient". A resting
+                    # maker sell reserves BTC margin (options can't be
+                    # reduceOnly), so when BTC availBal is depleted the
+                    # maker sell is rejected even though we only want to
+                    # REDUCE a long. Cross the spread as a TAKER to reduce
+                    # the long immediately — proven to fill at 0 BTC
+                    # (tools/force_liquidate). Position-aware & never
+                    # oversells, so it can't flip us into a short. NOTE:
+                    # the taker fee is not tracked in fees_by_ord_id, so
+                    # this leg's fee_usd metric may understate on this rare
+                    # emergency path — flatten correctness > fee precision.
+                    if sCode == "51008":
+                        remaining_now = max(
+                            0, target_contracts - filled_contracts)
+                        taker = await self._taker_flatten_long(
+                            instrument, remaining_now * ct_val,
+                        )
+                        tk_btc = float(taker.get("filled_qty_btc", 0.0))
+                        tk_px = float(taker.get("average_price", 0.0))
+                        if tk_btc > 0 and tk_px > 0:
+                            tk_contracts = int(round(tk_btc / ct_val))
+                            filled_contracts += tk_contracts
+                            weighted_value += tk_contracts * tk_px
+                            if taker.get("order_id"):
+                                last_ord_id = str(taker["order_id"])
+                            log.warning(
+                                "chase_sell_taker_fallback_filled",
+                                instrument=instrument, qty_btc=tk_btc,
+                                avg_px=tk_px,
+                                total_filled=filled_contracts)
+                            break  # recovered → skip the FATAL alert
                     await _notify_chase_failure(
                         side="sell", instrument=instrument,
                         qty_btc=qty_btc, reason="fatal_reject",
@@ -2198,6 +2229,105 @@ class OKXExchange:
             "fully_filled": fully_filled,
             "metrics": metrics,
         }
+
+    async def _taker_flatten_long(
+        self, instrument: str, max_qty_btc: float,
+    ) -> dict:
+        """PROVEN taker-cross flatten for a residual LONG option leg.
+
+        WHY THIS EXISTS
+        ---------------
+        A maker (``post_only``) sell can be rejected with ``51008``
+        ("available balance insufficient") even when we only want to
+        REDUCE an existing long. OKX cannot flag an OPTION sell as
+        ``reduceOnly`` (per API docs, reduceOnly is MARGIN/FUTURES/SWAP
+        only), so a RESTING sell is treated as a potential new short and
+        OKX reserves BTC margin for it. Right after buying both legs the
+        account's BTC availBal is at its lowest, so that reservation
+        fails → ``51008`` → the leg cannot be flattened by the maker
+        chase and we orphan a position.
+
+        A TAKER sell that crosses the current bid reduces the long
+        IMMEDIATELY, so OKX evaluates it as a reducing fill and needs no
+        margin reservation. This is exactly what ``tools/force_liquidate``
+        does and is confirmed to fill at 0 BTC balance.
+
+        POSITION-SAFE: re-reads the live position and sells only the long
+        actually held (capped at ``max_qty_btc``), so it can NEVER flip
+        us into a short. Returns ``{filled_qty_btc, average_price,
+        order_id}`` — ``filled_qty_btc == 0.0`` when nothing was (or
+        needed to be) flattened. NEVER raises.
+        """
+        empty = {"filled_qty_btc": 0.0, "average_price": 0.0, "order_id": ""}
+        ct_val = config.OKX_CONTRACT_SIZE_BTC
+        try:
+            positions = await self.list_open_positions()
+            target = next(
+                (p for p in positions
+                 if p["instrument_name"] == instrument), None,
+            )
+            amt = 0.0 if target is None else float(target.get("amount", 0.0))
+            long_contracts = amt if amt > 0 else 0.0
+            if long_contracts < 1.0:
+                log.info("taker_flatten_long_noop", instrument=instrument,
+                         live_amount=amt)
+                return empty
+            cap_contracts = int(round(max(0.0, max_qty_btc) / ct_val))
+            want_contracts = int(min(long_contracts, cap_contracts)) \
+                if cap_contracts > 0 else int(long_contracts)
+            if want_contracts <= 0:
+                return empty
+            ticker = await self.get_ticker(instrument)
+            bid = float(getattr(ticker, "bid", 0.0) or 0.0)
+            if bid <= 0:
+                log.error("taker_flatten_long_no_bid",
+                          instrument=instrument, bid=bid)
+                return empty
+            qty_btc = want_contracts * ct_val
+            log.warning("taker_flatten_long_placing", instrument=instrument,
+                        qty_btc=qty_btc, contracts=want_contracts, px=bid)
+            order = await self._place_limit_order(
+                instrument, "sell", qty_btc, bid, post_only=False,
+            )
+            sCode = str(order.get("sCode") or "")
+            sMsg = str(order.get("sMsg") or "")
+            ord_id = str(order.get("ordId") or "")
+            if sCode not in ("0", ""):
+                log.error("taker_flatten_long_rejected",
+                          instrument=instrument, sCode=sCode, sMsg=sMsg,
+                          qty_btc=qty_btc, px=bid)
+                return {**empty, "order_id": ord_id}
+            avg_px = bid
+            residual_target = long_contracts - want_contracts
+            for _ in range(12):  # up to ~60s
+                await asyncio.sleep(5)
+                try:
+                    status = await self.get_order_status(instrument, ord_id)
+                    px = self._f(status, "avgPx", default=0.0)
+                    if px > 0:
+                        avg_px = px
+                except Exception:
+                    pass
+                try:
+                    pos_now = await self.list_open_positions()
+                    live = next(
+                        (p for p in pos_now
+                         if p["instrument_name"] == instrument), None,
+                    )
+                    remaining = 0.0 if live is None else float(
+                        live.get("amount", 0.0))
+                    if remaining <= residual_target + 1e-9:
+                        break
+                except Exception:
+                    pass
+            log.warning("taker_flatten_long_done", instrument=instrument,
+                        qty_btc=qty_btc, avg_px=avg_px, ord_id=ord_id)
+            return {"filled_qty_btc": qty_btc, "average_price": avg_px,
+                    "order_id": ord_id}
+        except Exception:
+            log.error("taker_flatten_long_exception",
+                      instrument=instrument, exc_info=True)
+            return empty
 
     # ──────────────────── RFQ (Block Trading) ─────────────────────
     #
