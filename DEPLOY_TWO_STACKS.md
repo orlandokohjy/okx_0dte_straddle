@@ -164,10 +164,17 @@ project `okx_signal`) and later redeployed WITHOUT the flag from
 container name is pinned to `okx_signal` via `CONTAINER_NAME`, so the two
 different *projects* fight over the same *name*.
 
-**Immediate fix** (safe when flat / pre-market):
+**Immediate fix — prefer a GRACEFUL stop** so the algo's SIGTERM handler runs
+(sends the Telegram "SHUTTING DOWN" notice, unwinds any open position, and
+releases the singleton lock — see `main.py::shutdown`). `docker rm -f` sends
+SIGKILL and skips all of that, so only use it as a last resort when the
+container is already dead/hung:
 ```bash
-docker rm -f okx_signal
+docker stop -t 60 okx_signal              # graceful SIGTERM by name (waits up to 60s)
+docker rm okx_signal                      # remove the stopped container
 docker-compose -p okx_signal up -d --build algo
+# last resort only (no Telegram, no unwind, no clean lock release):
+#   docker rm -f okx_signal && docker-compose -p okx_signal up -d --build algo
 ```
 
 **Permanent fix (do this once so the `-p` flag can never be forgotten):**
@@ -186,7 +193,8 @@ container still running under the OLD project → the same conflict):
 ```bash
 cd ~/okx-signal
 echo "COMPOSE_PROJECT_NAME=okx_signal" >> .env   # add the pin (any order)
-docker rm -f okx_signal                          # remove BY NAME (project-agnostic)
+docker stop -t 60 okx_signal                     # GRACEFUL SIGTERM by name (Telegram + lock release)
+docker rm okx_signal                             # remove the stopped container BY NAME (project-agnostic)
 docker-compose up -d --build algo                # recreates under project okx_signal
 ```
 
