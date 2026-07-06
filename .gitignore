@@ -1,6 +1,7 @@
 .env
 .env.signal
 .env.plain
+.env.eth
 .env.backup-*
 .venv/
 venv/
