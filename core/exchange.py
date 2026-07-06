@@ -149,7 +149,7 @@ async def _notify_chase_failure(
             f"<b>{title}</b>",
             f"Side: {side.upper()}",
             f"Instrument: {instrument}",
-            f"Qty (BTC): {qty_btc}",
+            f"Qty ({config.BASE_COIN}): {qty_btc}",
             f"Attempts: {attempt}",
         ]
         if sCode:
@@ -201,10 +201,10 @@ async def _notify_partial_fill(
             "<b>PARTIAL FILL DETECTED</b>",
             f"Side: {side.upper()}",
             f"Instrument: {instrument}",
-            f"Filled: {filled_contracts} contracts ({filled_btc:.4f} BTC)",
-            f"Target: {target_contracts} contracts ({target_btc:.4f} BTC)",
+            f"Filled: {filled_contracts} contracts ({filled_btc:.4f} {config.BASE_COIN})",
+            f"Target: {target_contracts} contracts ({target_btc:.4f} {config.BASE_COIN})",
             f"Pct filled: {filled_contracts / target_contracts:.1%}",
-            f"VWAP: {vwap:.4f} BTC",
+            f"VWAP: {vwap:.4f} {config.BASE_COIN}",
             "",
             "The chase terminated with less than full size on the exchange. "
             "The straddle builder will treat this as a leg failure and "

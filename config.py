@@ -323,7 +323,7 @@ class Session:
         elif self.sizing_mode == "fixed_usd":
             base = f"fixed_usd=${self.fixed_usd:,.0f}/entry"
         else:
-            base = f"fixed_btc={self.qty_per_leg} BTC"
+            base = f"fixed={self.qty_per_leg} {BASE_COIN}"
         return base
 
 

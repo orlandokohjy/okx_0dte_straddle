@@ -877,7 +877,7 @@ def _format_today_block(m: DailyMetrics) -> list[str]:
             strike_line += ")"
         header = (
             f"  <b>[{sess_label}] {ordinal}</b>{timing}  qty "
-            f"{t.qty_per_leg:.4f} BTC/leg"
+            f"{t.qty_per_leg:.4f} {config.BASE_COIN}/leg"
         )
         lines.extend([
             header,
@@ -964,30 +964,30 @@ def _format_volume_block(m: DailyMetrics) -> list[str]:
             )
             per_session_lines.append(
                 f"  [{label}] {ordinal}: {t.num_straddles} straddle × "
-                f"{t.qty_per_leg:.4f} BTC/leg → "
-                f"{session_traded:.4f} BTC traded"
+                f"{t.qty_per_leg:.4f} {config.BASE_COIN}/leg → "
+                f"{session_traded:.4f} {config.BASE_COIN} traded"
                 f"{_usd_bracket(session_traded_usd)}"
             )
         return [
             "<b>Volume</b>",
             *per_session_lines,
-            f"  Opened total: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
+            f"  Opened total: {open_total:.4f} {config.BASE_COIN}{_usd_bracket(opened_usd)} "
             f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-            f"  Closed total: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
+            f"  Closed total: {close_total:.4f} {config.BASE_COIN}{_usd_bracket(closed_usd)} "
             f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-            f"  <b>Total traded notional: {traded_total:.4f} BTC"
+            f"  <b>Total traded notional: {traded_total:.4f} {config.BASE_COIN}"
             f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
         ]
 
     qpl = m.qty_per_leg or config.QTY_PER_LEG
     return [
         "<b>Volume</b>",
-        f"  Position: {m.num_straddles} straddle × {qpl:.4f} BTC/leg",
-        f"  Opened: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
+        f"  Position: {m.num_straddles} straddle × {qpl:.4f} {config.BASE_COIN}/leg",
+        f"  Opened: {open_total:.4f} {config.BASE_COIN}{_usd_bracket(opened_usd)} "
         f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-        f"  Closed: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
+        f"  Closed: {close_total:.4f} {config.BASE_COIN}{_usd_bracket(closed_usd)} "
         f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-        f"  <b>Total traded notional: {traded_total:.4f} BTC"
+        f"  <b>Total traded notional: {traded_total:.4f} {config.BASE_COIN}"
         f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
     ]
 
@@ -1062,7 +1062,7 @@ def _format_session_matrix(m: DailyMetrics) -> list[str]:
     headers = [c["hdr"] for c in cols] + ["TOT"]
     rows = [
         ("PnL $",   [f"{c['pnl']:+.1f}" for c in cols] + [f"{pnl_t:+.1f}"]),
-        ("Vol BTC", [f"{c['btc']:.2f}" for c in cols] + [f"{btc_t:.2f}"]),
+        (f"Vol {config.BASE_COIN}", [f"{c['btc']:.2f}" for c in cols] + [f"{btc_t:.2f}"]),
         ("Vol $",   [_usd_k(c["usd"]) for c in cols] + [_usd_k(usd_t)]),
         ("Contr",   [f"{c['contracts']:.0f}" for c in cols] + [f"{contr_t:.0f}"]),
         ("Slip bp", [(f"{c['slip_bps']:+.0f}" if c["has_slip"] else "-")
@@ -1420,11 +1420,11 @@ def format_weekly_report(m: DailyMetrics) -> str:
         "",
         "<b>Volume (this week)</b>",
         f"  Straddles: {m.num_straddles}",
-        f"  Opened: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
+        f"  Opened: {open_total:.4f} {config.BASE_COIN}{_usd_bracket(opened_usd)} "
         f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-        f"  Closed: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
+        f"  Closed: {close_total:.4f} {config.BASE_COIN}{_usd_bracket(closed_usd)} "
         f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-        f"  <b>Total traded notional: {traded_total:.4f} BTC"
+        f"  <b>Total traded notional: {traded_total:.4f} {config.BASE_COIN}"
         f"{_usd_bracket(traded_usd)}</b>  (opens + closes)",
     ]
 
@@ -1689,11 +1689,11 @@ def format_weekend_recap(m: DailyMetrics) -> str:
         "",
         "<b>Volume (this weekend)</b>",
         f"  Straddles: {m.num_straddles}",
-        f"  Opened: {open_total:.4f} BTC{_usd_bracket(opened_usd)} "
+        f"  Opened: {open_total:.4f} {config.BASE_COIN}{_usd_bracket(opened_usd)} "
         f"(calls {opened_calls:.4f} + puts {opened_puts:.4f})",
-        f"  Closed: {close_total:.4f} BTC{_usd_bracket(closed_usd)} "
+        f"  Closed: {close_total:.4f} {config.BASE_COIN}{_usd_bracket(closed_usd)} "
         f"(calls {closed_calls:.4f} + puts {closed_puts:.4f})",
-        f"  <b>Total traded notional: {traded_total:.4f} BTC"
+        f"  <b>Total traded notional: {traded_total:.4f} {config.BASE_COIN}"
         f"{_usd_bracket(traded_usd)}</b>",
     ]
 

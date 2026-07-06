@@ -494,8 +494,8 @@ class Algo:
             est_qty = min(est_qty, config.MAX_QTY_PER_LEG_BTC)
             preview = (
                 f"\n      preview @ ${equity_now:,.0f} equity, "
-                f"${per_btc_premium_est:,.0f}/BTC indicative premium → "
-                f"~{est_qty:.2f} BTC/leg, ~${target_premium_usd:,.0f} premium"
+                f"${per_btc_premium_est:,.0f}/{config.BASE_COIN} indicative premium → "
+                f"~{est_qty:.2f} {config.BASE_COIN}/leg, ~${target_premium_usd:,.0f} premium"
             )
             return base + preview
 
@@ -1359,12 +1359,12 @@ class Algo:
             f"<b>PRE-FLIGHT CHECK [{label}]</b>\n"
             f"{sizing_summary}\n"
             f"Straddles: {sizing.num_straddles}\n"
-            f"BTC per leg: {resolved_qty:.4f}\n"
+            f"{config.BASE_COIN} per leg: {resolved_qty:.4f}\n"
             f"Spot: ${spot:,.0f} | Strike: ${pair.strike:,.0f}\n"
             f"\n<b>Per straddle:</b>\n"
-            f"  Call cost ({resolved_qty:.4f} BTC): "
+            f"  Call cost ({resolved_qty:.4f} {config.BASE_COIN}): "
             f"${sizing.call_cost_per:,.2f}\n"
-            f"  Put cost ({resolved_qty:.4f} BTC): "
+            f"  Put cost ({resolved_qty:.4f} {config.BASE_COIN}): "
             f"${sizing.put_cost_per:,.2f}\n"
             f"  Total: ${sizing.straddle_cost:,.2f}\n"
             f"\n<b>All {sizing.num_straddles} straddles:</b>\n"

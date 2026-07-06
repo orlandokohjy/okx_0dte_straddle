@@ -94,7 +94,7 @@ def _format_leg_fill_message(
         if chase_pnl_usd != 0
         else "Maker P&L (vs initial taker): $0.00"
     )
-    qty_line = f"Filled qty: {qty_btc:.4f} BTC"
+    qty_line = f"Filled qty: {qty_btc:.4f} {config.BASE_COIN}"
     fully_line = "" if fully else "  ⚠️ PARTIAL"
 
     return (
@@ -297,8 +297,8 @@ async def build_straddle(
             await notifier.send(
                 f"<b>SESSION SKIPPED</b> [{straddle_id}]\n"
                 f"Both legs failed to fill within deadline.\n"
-                f"Put partial residual: {put_partial_qty:.4f} BTC\n"
-                f"Call partial residual: {call_partial_qty:.4f} BTC\n"
+                f"Put partial residual: {put_partial_qty:.4f} {config.BASE_COIN}\n"
+                f"Call partial residual: {call_partial_qty:.4f} {config.BASE_COIN}\n"
                 f"Flattening any partial exposure now."
             )
             if put_partial_qty > 0:
@@ -326,8 +326,8 @@ async def build_straddle(
                       call_partial_qty=call_partial_qty)
             await notifier.send(
                 f"<b>⚠️ PARTIAL FILL — CALL FAILED</b> [{straddle_id}]\n"
-                f"Put filled {put_qty_for_emer:.4f} BTC @ {put_fill_for_emer:.4f}\n"
-                f"Call partial residual: {call_partial_qty:.4f} BTC\n"
+                f"Put filled {put_qty_for_emer:.4f} {config.BASE_COIN} @ {put_fill_for_emer:.4f}\n"
+                f"Call partial residual: {call_partial_qty:.4f} {config.BASE_COIN}\n"
                 f"Flattening both."
             )
             await _emergency_sell(
@@ -353,8 +353,8 @@ async def build_straddle(
                       put_partial_qty=put_partial_qty)
             await notifier.send(
                 f"<b>⚠️ PARTIAL FILL — PUT FAILED</b> [{straddle_id}]\n"
-                f"Call filled {call_qty_for_emer:.4f} BTC @ {call_fill_for_emer:.4f}\n"
-                f"Put partial residual: {put_partial_qty:.4f} BTC\n"
+                f"Call filled {call_qty_for_emer:.4f} {config.BASE_COIN} @ {call_fill_for_emer:.4f}\n"
+                f"Put partial residual: {put_partial_qty:.4f} {config.BASE_COIN}\n"
                 f"Flattening both."
             )
             await _emergency_sell(
@@ -646,8 +646,8 @@ async def unwind_straddle(
                 await notifier.send(
                     f"<b>⚠️ CALL UNWIND PARTIAL</b> [{straddle.id}]\n"
                     f"Symbol: {straddle.call_leg.instrument}\n"
-                    f"Sold {call_filled_btc:.4f} of {straddle.call_leg.qty:.4f} BTC\n"
-                    f"Residual: {straddle.call_leg.qty - call_filled_btc:.4f} BTC\n"
+                    f"Sold {call_filled_btc:.4f} of {straddle.call_leg.qty:.4f} {config.BASE_COIN}\n"
+                    f"Residual: {straddle.call_leg.qty - call_filled_btc:.4f} {config.BASE_COIN}\n"
                     f"post_close_reconcile will flag the orphan."
                 )
         else:
@@ -688,8 +688,8 @@ async def unwind_straddle(
                 await notifier.send(
                     f"<b>⚠️ PUT UNWIND PARTIAL</b> [{straddle.id}]\n"
                     f"Symbol: {straddle.put_leg.instrument}\n"
-                    f"Sold {put_filled_btc:.4f} of {straddle.put_leg.qty:.4f} BTC\n"
-                    f"Residual: {straddle.put_leg.qty - put_filled_btc:.4f} BTC\n"
+                    f"Sold {put_filled_btc:.4f} of {straddle.put_leg.qty:.4f} {config.BASE_COIN}\n"
+                    f"Residual: {straddle.put_leg.qty - put_filled_btc:.4f} {config.BASE_COIN}\n"
                     f"post_close_reconcile will flag the orphan."
                 )
         else:
@@ -761,14 +761,14 @@ async def _emergency_sell(
             if fully:
                 await notifier.send(
                     f"<b>ROLLBACK COMPLETE</b>\n"
-                    f"Sold {qty:.4f} BTC @ {avg_px:.4f}\n"
+                    f"Sold {qty:.4f} {config.BASE_COIN} @ {avg_px:.4f}\n"
                     f"Symbol: {instrument}"
                 )
             else:
                 await notifier.send(
                     f"<b>⚠️ ROLLBACK PARTIAL</b>\n"
-                    f"Sold {sold_btc:.4f} of {qty:.4f} BTC @ {avg_px:.4f}\n"
-                    f"Residual: {qty - sold_btc:.4f} BTC\n"
+                    f"Sold {sold_btc:.4f} of {qty:.4f} {config.BASE_COIN} @ {avg_px:.4f}\n"
+                    f"Residual: {qty - sold_btc:.4f} {config.BASE_COIN}\n"
                     f"Symbol: {instrument}\n"
                     f"<b>MANUAL ACTION REQUIRED for residual.</b>"
                 )
@@ -776,7 +776,7 @@ async def _emergency_sell(
             log.error("emergency_sell_chase_exhausted", instrument=instrument)
             await notifier.send(
                 f"<b>⚠️ ROLLBACK FAILED</b>\n"
-                f"Could not sell {qty:.4f} BTC of {instrument} within deadline.\n"
+                f"Could not sell {qty:.4f} {config.BASE_COIN} of {instrument} within deadline.\n"
                 f"<b>MANUAL ACTION REQUIRED.</b>"
             )
     except Exception:
