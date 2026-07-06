@@ -135,11 +135,109 @@ Never use `--no-cache` on routine code-only deploys (only when
 
 ---
 
+## Troubleshooting & recurring gotchas (READ THIS before redeploying)
+
+Every past redeploy failure traces back to ONE of the items below. Use the
+canonical commands and you will not hit them.
+
+### Canonical redeploy commands (copy these, don't improvise)
+
+```bash
+# SIGNAL stack (account 2, branch feat/trade-gate)
+cd ~/okx-signal
+git pull origin feat/trade-gate
+docker-compose -p okx_signal up -d --build algo      # ALWAYS -p okx_signal
+docker-compose -p okx_signal logs -f --tail=100 algo # service is "algo", NOT okx_signal
+
+# PLAIN stack (account 1, branch main)
+cd ~/okx_0dte_straddle
+git pull origin main
+docker-compose up -d --build algo
+docker-compose logs -f --tail=100 algo
+```
+
+### Gotcha A — "container name /okx_signal is already in use" (Conflict)
+
+**Cause:** the signal stack was started once WITH `-p okx_signal` (compose
+project `okx_signal`) and later redeployed WITHOUT the flag from
+`~/okx-signal` (compose project `okx-signal`, from the dir name). The
+container name is pinned to `okx_signal` via `CONTAINER_NAME`, so the two
+different *projects* fight over the same *name*.
+
+**Immediate fix** (safe when flat / pre-market):
+```bash
+docker rm -f okx_signal
+docker-compose -p okx_signal up -d --build algo
+```
+
+**Permanent fix (do this once so the `-p` flag can never be forgotten):**
+pin the project name in the signal stack's `.env` — docker-compose reads it
+from `.env`, so bare `docker-compose` and `docker-compose -p okx_signal`
+then resolve to the SAME project and can never collide:
+```bash
+# in ~/okx-signal/.env add:
+COMPOSE_PROJECT_NAME=okx_signal
+```
+Transition (one-time; briefly stops the algo — do it when flat):
+```bash
+cd ~/okx-signal
+docker-compose down                 # removes the container under the OLD project
+# ...add COMPOSE_PROJECT_NAME=okx_signal to .env...
+docker-compose up -d --build algo   # now permanently under project okx_signal
+```
+
+### Gotcha B — "no such service: okx_signal"
+
+`docker-compose <cmd> okx_signal` fails because compose wants the **service**
+name (`algo`), not the container name. Either use the service name, or bypass
+compose and use the container name directly:
+```bash
+docker-compose -p okx_signal logs -f --tail=100 algo   # service name
+docker logs -f --tail=100 okx_signal                   # container name (no compose)
+```
+
+### Gotcha C — v1 `restart` does NOT re-read `.env`
+
+After editing `.env`, use `up -d --force-recreate algo`, not `restart`.
+
+### Post-deploy verification (confirm the NEW code is actually live)
+
+Check the startup banner (`... logs --tail=100 algo`):
+- Every `we_*` session logs `session_skipped_disabled` (weekends OFF).
+- `wd_0000/0030/0130` `next_fire` is **Tue–Sat**, never Monday (08:00-roll fix).
+- Nothing fires before **09:00 UTC** on Monday.
+- Final line is `{"event": "algo_running"}`.
+
+### Flatten / 51008 notes
+
+- The algo now auto-recovers from `51008` on a sell: `chase_sell` falls back to
+  a **taker cross** (position-aware) to flatten a residual long — same mechanic
+  as `force_liquidate`. Root condition is ~0/negative BTC balance; keep a small
+  BTC buffer to avoid the taker fee.
+- Manual `force_liquidate` must run with the algo **stopped** (it holds a lock),
+  and with the entrypoint cleared:
+  ```bash
+  docker-compose -p okx_signal stop algo
+  docker-compose -p okx_signal run --rm --entrypoint "" algo python tools/force_liquidate.py
+  docker-compose -p okx_signal start algo
+  ```
+
+### Schedule model (why Monday early-morning was disabled)
+
+Daily options roll at **08:00 UTC**, so the "trading day" runs 08:00→08:00.
+Entries before 08:00 UTC belong to the PREVIOUS trading day and are cron'd one
+calendar day later: `wd_*` pre-08:00 fire Tue–Sat, `we_*` pre-08:00 fire
+Sun/Mon. Consequence with weekends OFF: **Mon 00:00–08:00 UTC is silent**
+(weekend tail) and **Sat 00:00–08:00 UTC trades as a weekday** (Friday's expiry).
+
+---
+
 ## Pre-flight checklist
 
 - [ ] `~/okx-signal/.env` → account 2 keys; passphrase filled (verified in step 4)
 - [ ] `diagnose_okx.py` showed account 2 (NOT account 1)
 - [ ] `CONTAINER_NAME=okx_signal` set in the signal `.env`
+- [ ] `COMPOSE_PROJECT_NAME=okx_signal` set in the signal `.env` (so the `-p` flag can't be forgotten — see Gotcha A)
 - [ ] Signal file present: `/opt/tft/vsn-vol-forecaster/signals/trade_gate.json`
 - [ ] `TRADE_GATE_ENABLED=true` ONLY on the signal stack
 - [ ] Telegram bot/chat differs from the plain stack (or left blank)
