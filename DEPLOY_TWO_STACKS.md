@@ -178,12 +178,16 @@ then resolve to the SAME project and can never collide:
 # in ~/okx-signal/.env add:
 COMPOSE_PROJECT_NAME=okx_signal
 ```
-Transition (one-time; briefly stops the algo — do it when flat):
+Transition (one-time; briefly stops the algo — do it when flat). Order does
+NOT matter here because we remove the container BY NAME, which is
+project-agnostic (do NOT use `docker-compose down` for the transition — once
+`.env` has the new project name, `down` targets the NEW project and misses a
+container still running under the OLD project → the same conflict):
 ```bash
 cd ~/okx-signal
-docker-compose down                 # removes the container under the OLD project
-# ...add COMPOSE_PROJECT_NAME=okx_signal to .env...
-docker-compose up -d --build algo   # now permanently under project okx_signal
+echo "COMPOSE_PROJECT_NAME=okx_signal" >> .env   # add the pin (any order)
+docker rm -f okx_signal                          # remove BY NAME (project-agnostic)
+docker-compose up -d --build algo                # recreates under project okx_signal
 ```
 
 ### Gotcha B — "no such service: okx_signal"
