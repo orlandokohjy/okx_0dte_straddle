@@ -391,7 +391,7 @@ def _build_session(
 # utc_*/morning/afternoon names remain resolvable for historical reports
 # via LEGACY_SESSION_NAMES + get_session().
 #
-# All sessions: fixed_btc 0.5 BTC/leg (operator-overridable per session
+# All sessions: fixed_btc 1.0 BTC/leg (operator-overridable per session
 # via <NAME>_SIZING / <NAME>_QTY_PER_LEG in .env). Only ONE straddle is
 # ever open at a time — windows never overlap within a day-type.
 
@@ -467,7 +467,7 @@ def _derive_close(
 def _build_schedule(
     entries: list[tuple[str, int, int]], weekdays: frozenset[int],
 ) -> list[Session]:
-    """Build a list of fixed_btc 0.5-BTC sessions from (name, h, m) specs,
+    """Build a list of fixed_btc 1.0-BTC sessions from (name, h, m) specs,
     deriving each close from the next contiguous entry (chained roll) or
     a full 30-min hold (standalone / chain tail)."""
     entry_mins = {h * 60 + m for (_, h, m) in entries}
@@ -481,7 +481,7 @@ def _build_schedule(
             close_utc=_derive_close(h, m, next_entry_min),
             weekdays=weekdays,
             default_sizing_mode="fixed_btc",
-            default_qty_per_leg=0.5,
+            default_qty_per_leg=1.0,
         ))
     return out
 
@@ -658,6 +658,26 @@ OPTION_EXIT_CHASE_DEADLINE_MIN: float = float(
 # Kept for backward-compatibility imports; new code should reference
 # OPTION_ENTRY_CHASE_DEADLINE_MIN or OPTION_EXIT_CHASE_DEADLINE_MIN.
 OPTION_CHASE_DEADLINE_MIN: float = OPTION_EXIT_CHASE_DEADLINE_MIN
+
+# ── Persistent post-close re-flatten ──────────────────────────────────
+# After the close unwind, _post_close_reconcile verifies the exchange is
+# actually flat. If a residual leg remains (transient abort, partial fill,
+# or a deadline-capped chase), DON'T immediately lock — keep trying to
+# close it, maker-only. Each round re-reads the live position and chases
+# only the *remaining* qty (never a blind re-send → can't oversell into a
+# short). Entries stay blocked the whole time (_close_in_progress > 0), so
+# nothing stacks on top of the residual. Only lock if still not flat after
+# the total budget — a genuine stuck state (e.g. no bid on a dying 0DTE
+# leg, which the 08:00 UTC expiry settles anyway).
+CLOSE_FLATTEN_BUDGET_MIN: float = float(
+    os.getenv("CLOSE_FLATTEN_BUDGET_MIN", "90.0")
+)
+# Per-round maker chase deadline inside the re-flatten loop. Bounded so the
+# loop re-reads the position between rounds rather than resting one order
+# for the whole budget.
+CLOSE_FLATTEN_ROUND_MIN: float = float(
+    os.getenv("CLOSE_FLATTEN_ROUND_MIN", "15.0")
+)
 
 # Pre-entry spread gate: skip session if put or call (ask − bid) / mid > this
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(

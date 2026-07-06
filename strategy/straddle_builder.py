@@ -437,6 +437,26 @@ async def build_straddle(
     )
     portfolio.set_straddle(straddle)
 
+    # Best-effort implied-vol capture (analytics only). The entry is ALREADY
+    # filled and persisted above, so nothing here can affect execution — a
+    # failure/timeout just leaves IV at 0.0. Re-persist only if we got a
+    # value so positions.json reflects it.
+    try:
+        ivs = await exchange.get_option_iv_batch([
+            straddle.call_leg.instrument, straddle.put_leg.instrument,
+        ])
+        straddle.entry_call_iv = ivs.get(
+            straddle.call_leg.instrument, {}).get("mark_vol", 0.0)
+        straddle.entry_put_iv = ivs.get(
+            straddle.put_leg.instrument, {}).get("mark_vol", 0.0)
+        if straddle.entry_call_iv or straddle.entry_put_iv:
+            portfolio.set_straddle(straddle)
+            log.info("entry_iv_captured", id=straddle_id,
+                     call_iv=straddle.entry_call_iv,
+                     put_iv=straddle.entry_put_iv)
+    except Exception:
+        log.warning("entry_iv_capture_failed", id=straddle_id, exc_info=True)
+
     # Total premium paid across all N straddles, converted to USD for the
     # log line. CM: native is BTC → USD via spot. UM: native is already
     # USD → spot is a no-op. If spot is unavailable on a CM run we fall
@@ -528,21 +548,50 @@ async def unwind_straddle(
                 # starts from a clean book. Without this, a single network
                 # blip on close leaves the leg unsold and falls back to the
                 # entry price → phantom close + orphan (2026-06-18 wd_1400
-                # incident). One fresh re-attempt with a refreshed ask.
+                # incident).
+                #
+                # CRITICAL: re-query the LIVE position before retrying. The
+                # disconnect can happen *after* OKX accepted/filled some or
+                # all of the original chase — a blind re-send of the full
+                # `qty` would then oversell into a SHORT (the 2026-06-2x
+                # post-close orphan: -50 contracts on both legs). Only resell
+                # whatever long remains; if already flat/short, do nothing.
                 log.warning("sell_leg_transient_retry",
                             instrument=symbol,
                             exc_type=type(exc).__name__)
                 await asyncio.sleep(2.0)
+                try:
+                    positions = await exchange.list_open_positions()
+                except Exception:
+                    log.error("sell_leg_requery_failed",
+                              instrument=symbol, exc_info=True)
+                    return None
+                remaining_contracts = 0.0
+                for p in positions:
+                    if p.get("instrument_name") == symbol:
+                        remaining_contracts = float(p.get("amount", 0.0))
+                        break
+                if remaining_contracts <= 0:
+                    # Original chase already flattened (or even shorted) the
+                    # leg before the disconnect — nothing left to sell.
+                    log.info("sell_leg_already_flat_after_transient",
+                             instrument=symbol,
+                             remaining_contracts=remaining_contracts)
+                    return None
+                remaining_qty = remaining_contracts * config.OKX_CONTRACT_SIZE_BTC
                 try:
                     _, fresh_ask = await market.get_option_bid_ask(symbol)
                 except Exception:
                     fresh_ask = 0.0
                 use_ask = fresh_ask if fresh_ask > 0 else ref_ask
                 try:
-                    return await exchange.chase_sell(symbol, qty, use_ask)
+                    return await exchange.chase_sell(
+                        symbol, remaining_qty, use_ask,
+                    )
                 except _TRANSIENT_HTTP_EXCEPTIONS:
                     # Second transient failure — give up; the caller's
-                    # leg-failure path + post-close orphan lock take over.
+                    # leg-failure path + post-close persistent re-flatten
+                    # (then orphan lock) take over.
                     log.error("sell_leg_transient_retry_failed",
                               instrument=symbol, exc_info=True)
                     return None
@@ -651,6 +700,20 @@ async def unwind_straddle(
                 f"Symbol: {straddle.put_leg.instrument}\n"
                 f"Could not sell within deadline. Manual action may be needed."
             )
+
+    # Best-effort exit IV (analytics only). Runs AFTER the legs are unwound,
+    # so a slow/failed snapshot can never delay or abort the close; on any
+    # error IV stays 0.0. Set before close_straddle so _log_trade records it.
+    try:
+        ivs = await exchange.get_option_iv_batch([
+            straddle.call_leg.instrument, straddle.put_leg.instrument,
+        ])
+        straddle.exit_call_iv = ivs.get(
+            straddle.call_leg.instrument, {}).get("mark_vol", 0.0)
+        straddle.exit_put_iv = ivs.get(
+            straddle.put_leg.instrument, {}).get("mark_vol", 0.0)
+    except Exception:
+        log.warning("exit_iv_capture_failed", id=straddle.id, exc_info=True)
 
     pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
     log.info("straddle_unwound", id=straddle.id, reason=reason,

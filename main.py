@@ -268,6 +268,14 @@ class Algo:
         # reset_daily() could wipe a freshly-opened straddle. See
         # _wait_for_flat / _run_entry.
         self._close_in_progress: int = 0
+        # Reentrancy guard for the persistent post-close re-flatten. Sessions
+        # each have their own close cron, so a later close can fire while an
+        # earlier re-flatten loop is still running (the budget can span the
+        # next 30-min window). Two concurrent loops would chase_sell the same
+        # residual instrument and oversell into a short. The running loop
+        # already re-reads the family-wide position set each round, so a
+        # second reconcile can safely skip.
+        self._reconcile_active: bool = False
 
     async def start(self) -> None:
         setup_logging()
@@ -1447,8 +1455,137 @@ class Algo:
 
     # ──────────────────── End-of-session reconciliation ──────────
 
+    @staticmethod
+    def _fmt_positions(positions: list[dict]) -> str:
+        return "\n".join(
+            f"  • {p['instrument_name']}  amt={p['amount']:+.4f}  "
+            f"mark=${p['mark_price']:,.2f}  uPnL=${p['unrealized_pnl']:+,.2f}"
+            for p in positions
+        )
+
+    async def _flatten_residual_until_flat(
+        self, positions: list[dict],
+    ) -> list[dict]:
+        """Persistently close any residual legs left after the unwind.
+
+        Maker-only. Each round re-reads the LIVE position and chases only
+        the *remaining* qty (long → sell, short → buy back), so it can never
+        oversell into a short. Loops until flat or CLOSE_FLATTEN_BUDGET_MIN
+        is exhausted. Entries stay blocked (_close_in_progress > 0) the whole
+        time, so nothing stacks on top of the residual. Returns the still-open
+        positions (empty list ⇒ now flat).
+        """
+        budget_min = config.CLOSE_FLATTEN_BUDGET_MIN
+        round_min = config.CLOSE_FLATTEN_ROUND_MIN
+        ct = config.OKX_CONTRACT_SIZE_BTC
+        deadline = now_utc() + timedelta(minutes=budget_min)
+
+        log.warning("post_close_residual_reflatten_start",
+                    positions=len(positions), budget_min=budget_min,
+                    round_min=round_min)
+        await notifier.send(
+            f"<b>♻️ POST-CLOSE RESIDUAL — RE-FLATTENING</b>\n"
+            f"Unwind left {len(positions)} open leg(s). Persistently "
+            f"closing (maker-only, up to {budget_min:.0f} min). Entries "
+            f"stay blocked until flat.\n\n"
+            f"{self._fmt_positions(positions)}"
+        )
+
+        round_no = 0
+        while now_utc() < deadline:
+            round_no += 1
+            remaining_min = (deadline - now_utc()).total_seconds() / 60.0
+            if remaining_min <= 0:
+                break
+            eff_round_min = min(round_min, remaining_min)
+
+            any_progress = False
+            for p in positions:
+                symbol = p.get("instrument_name", "")
+                amt = float(p.get("amount", 0.0))
+                if not symbol or amt == 0:
+                    continue
+                try:
+                    bid, ask = await self.market.get_option_bid_ask(symbol)
+                except Exception:
+                    bid = ask = 0.0
+                try:
+                    if amt > 0:
+                        # Long residual → maker sell the remaining qty.
+                        if ask <= 0:
+                            log.info("reflatten_skip_no_ask",
+                                     instrument=symbol, round=round_no)
+                            continue
+                        res = await self.exchange.chase_sell(
+                            symbol, amt * ct, ask,
+                            deadline_min=eff_round_min,
+                        )
+                    else:
+                        # Short residual (defensive — e.g. a prior oversell)
+                        # → maker buy back the remaining qty.
+                        if bid <= 0:
+                            log.info("reflatten_skip_no_bid",
+                                     instrument=symbol, round=round_no)
+                            continue
+                        res = await self.exchange.chase_buy(
+                            symbol, abs(amt) * ct, bid,
+                            deadline_min=eff_round_min,
+                        )
+                except Exception:
+                    log.warning("reflatten_chase_error", instrument=symbol,
+                                round=round_no, exc_info=True)
+                    res = None
+                if res:
+                    any_progress = True
+
+            try:
+                positions = await self.exchange.list_open_positions()
+            except Exception:
+                log.warning("reflatten_requery_failed", round=round_no,
+                            exc_info=True)
+                await asyncio.sleep(5.0)
+                continue
+
+            if not positions:
+                log.info("post_close_residual_cleared", rounds=round_no)
+                await notifier.send(
+                    f"<b>✅ POST-CLOSE RESIDUAL CLEARED</b>\n"
+                    f"Flat after {round_no} re-flatten round(s)."
+                )
+                return positions
+
+            if not any_progress:
+                # No fills this round (e.g. no bid/ask on a dying 0DTE leg).
+                # Wait for the book to move before the next round rather than
+                # busy-looping the budget away.
+                wait_sec = min(
+                    30.0, max(0.0,
+                              (deadline - now_utc()).total_seconds()),
+                )
+                if wait_sec > 0:
+                    await asyncio.sleep(wait_sec)
+
+        log.warning("post_close_residual_reflatten_exhausted",
+                    rounds=round_no, remaining=len(positions))
+        return positions
+
     async def _post_close_reconcile(self) -> None:
         """After unwind, verify exchange is actually flat. Alert on orphans."""
+        # A re-flatten loop from an earlier session's close may still be
+        # running (its budget can span the next window). It re-reads the
+        # family-wide position set each round and will absorb any residual,
+        # so a concurrent reconcile must skip — two loops chasing the same
+        # instrument would oversell into a short.
+        if self._reconcile_active:
+            log.info("post_close_reconcile_skip_already_active")
+            return
+        self._reconcile_active = True
+        try:
+            await self._post_close_reconcile_inner()
+        finally:
+            self._reconcile_active = False
+
+    async def _post_close_reconcile_inner(self) -> None:
         try:
             positions = await self.exchange.list_open_positions()
         except Exception:
@@ -1459,33 +1596,39 @@ class Algo:
             log.info("post_close_flat_ok")
             return
 
-        details = "\n".join(
-            f"  • {p['instrument_name']}  amt={p['amount']:+.4f}  "
-            f"mark=${p['mark_price']:,.2f}  uPnL=${p['unrealized_pnl']:+,.2f}"
-            for p in positions
-        )
+        # Residual after unwind — keep trying to close it (maker-only) before
+        # locking. The lock is a genuine last resort, not the first response.
+        positions = await self._flatten_residual_until_flat(positions)
+        if not positions:
+            return
+
+        details = self._fmt_positions(positions)
         log.warning("post_close_orphan_detected", positions=len(positions))
-        # Lock entries IMMEDIATELY. Previously this only warned and relied
-        # on the next *restart's* reconciliation to block entries — but a
-        # running algo would keep firing, opening new straddles on top of
-        # the orphan (the 2026-06-18 wd_1400→wd_1430 stacking incident).
-        # Setting the lock here stops every subsequent entry until an
-        # operator flattens and restarts.
+        # Lock entries. Reached only AFTER the persistent maker re-flatten
+        # loop (CLOSE_FLATTEN_BUDGET_MIN) failed to clear the residual — a
+        # genuine stuck state (e.g. no bid on a dying 0DTE leg). A running
+        # algo must not keep firing on top of this (the 2026-06-18
+        # wd_1400→wd_1430 stacking incident), so block every subsequent
+        # entry until an operator flattens and restarts. The 08:00 UTC
+        # expiry settles a worthless residual on its own.
         self._entry_locked = True
         self._lock_reason = (
             f"Post-close orphan: exchange still has {len(positions)} "
-            f"open position(s) after unwind — flatten & restart to clear"
+            f"open position(s) after {config.CLOSE_FLATTEN_BUDGET_MIN:.0f} "
+            f"min of maker re-flatten — flatten & restart to clear"
         )
         await notifier.send(
-            f"<b>⚠️ POST-CLOSE ORPHAN DETECTED</b>\n"
-            f"Unwind ran but exchange still has {len(positions)} "
-            f"position(s):\n\n"
+            f"<b>⚠️ POST-CLOSE ORPHAN — RE-FLATTEN EXHAUSTED</b>\n"
+            f"Kept trying to close (maker-only) for "
+            f"{config.CLOSE_FLATTEN_BUDGET_MIN:.0f} min but the exchange "
+            f"still has {len(positions)} position(s):\n\n"
             f"{details}\n\n"
             f"<b>ENTRIES ARE NOW LOCKED</b> — the algo will NOT open new "
             f"straddles until this is resolved.\n"
             f"<b>ACTION</b>: flatten the position(s) with "
             f"tools/force_liquidate.py, then restart the algo to clear "
-            f"the lock."
+            f"the lock. (A worthless 0DTE leg will also settle at 08:00 "
+            f"UTC expiry.)"
         )
 
     # ──────────────────── Close ───────────────────────────────────
