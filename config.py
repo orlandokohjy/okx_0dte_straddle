@@ -380,8 +380,12 @@ def _build_session(
 # time after the maker-only unwind has flattened. See _SESSION_ROLL_
 # BUFFER_MIN below.
 #
-# Naming: wd_HHMM = weekday (Mon-Fri entry), we_HHMM = weekend (Sat-Sun
-# entry). HHMM is the UTC entry time. Names are unique across the day-
+# Naming: wd_HHMM = weekday trading day (Mon-Fri), we_HHMM = weekend
+# trading day (Sat/Sun). HHMM is the UTC entry time. NOTE: because the
+# expiry rolls at 08:00 UTC (see EXPIRY_ROLL_HOUR_UTC), a pre-08:00 entry
+# is cron'd one calendar day later than its name's day-type implies — e.g.
+# wd_0130 fires Tue-Sat and we_0300 fires Sun/Mon. Names are unique across
+# the day-
 # types even when the HHMM collides (e.g. wd_1430 vs we_1430). Legacy
 # utc_*/morning/afternoon names remain resolvable for historical reports
 # via LEGACY_SESSION_NAMES + get_session().
@@ -394,6 +398,16 @@ def _build_session(
 # closes, leaving a maker-only unwind buffer so the next entry isn't
 # blocked by an still-open prior straddle.
 _SESSION_ROLL_BUFFER_MIN: int = 5
+
+# Daily option expiry roll (UTC). OKX daily options expire at 08:00 UTC,
+# so the real "trading day" runs 08:00 → 08:00, NOT calendar midnight →
+# midnight. An entry BEFORE this hour belongs to the PREVIOUS trading day
+# (e.g. Monday 01:30 UTC trades the Sunday/weekend expiry that settles
+# Monday 08:00). _build_schedule uses this to cron pre-roll entries one
+# calendar day later, so the weekday/weekend split follows the EXPIRY, not
+# the calendar day. Consequence: Mon 00:00-08:00 is weekend-controlled and
+# Sat 00:00-08:00 is weekday.
+EXPIRY_ROLL_HOUR_UTC: int = 8
 
 # (name, entry HH:MM) — closes are derived below. Entries within a list
 # that are exactly 30 min apart form a contiguous roll-chain; the close
@@ -418,7 +432,7 @@ _WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
     ("wd_0030", 0, 30),
     ("wd_0130", 1, 30),
 ]
-_WEEKDAY_DAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon-Fri entry
+_WEEKDAY_DAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon-Fri trading days
 
 _WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
     ("we_0900", 9, 0),
@@ -449,7 +463,7 @@ _WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
     ("we_0330", 3, 30),
     ("we_0400", 4, 0),
 ]
-_WEEKEND_DAYS: frozenset[int] = frozenset({5, 6})  # Sat,Sun entry
+_WEEKEND_DAYS: frozenset[int] = frozenset({5, 6})  # Sat,Sun trading days
 
 
 def _derive_close(
@@ -473,22 +487,41 @@ def _derive_close(
 
 
 def _build_schedule(
-    entries: list[tuple[str, int, int]], weekdays: frozenset[int],
+    entries: list[tuple[str, int, int]], trading_days: frozenset[int],
     enabled_default: bool = True,
 ) -> list[Session]:
-    """Build a list of fixed_btc 0.25-BTC sessions from (name, h, m) specs,
-    deriving each close from the next contiguous entry (chained roll) or
+    """Build a list of fixed_btc 0.25-BTC sessions from (name, h, m) specs.
+
+    ``trading_days`` is the set of *trading days* (0=Mon .. 6=Sun) this
+    schedule represents, where a trading day runs from the daily expiry
+    roll (``EXPIRY_ROLL_HOUR_UTC`` = 08:00 UTC) to the next roll — NOT the
+    calendar midnight. An entry whose UTC hour is < 08:00 belongs to the
+    PREVIOUS calendar day's trading day, so it is cron'd one calendar day
+    LATER than the trading day it represents:
+
+        weekday (trading days Mon-Fri) entry @ 01:30 → fires Tue-Sat
+        weekend (trading days Sat/Sun) entry @ 03:00 → fires Sun/Mon
+
+    Daytime entries (>= 08:00) fire on their own trading day (unchanged).
+
+    Each close is derived from the next contiguous entry (chained roll) or
     a full 30-min hold (standalone / chain tail)."""
     entry_mins = {h * 60 + m for (_, h, m) in entries}
     out: list[Session] = []
     for (name, h, m) in entries:
+        # Pre-roll (< 08:00 UTC) entries belong to the prior trading day →
+        # shift the cron day-of-week forward by one calendar day.
+        if h < EXPIRY_ROLL_HOUR_UTC:
+            cron_days = frozenset((d + 1) % 7 for d in trading_days)
+        else:
+            cron_days = trading_days
         nxt = h * 60 + m + 30
         next_entry_min = nxt if nxt in entry_mins else None
         out.append(_build_session(
             name,
             entry_utc=time(h, m),
             close_utc=_derive_close(h, m, next_entry_min),
-            weekdays=weekdays,
+            weekdays=cron_days,
             default_sizing_mode="fixed_btc",
             default_qty_per_leg=0.25,
             default_enabled=enabled_default,
