@@ -1,7 +1,7 @@
 services:
   algo:
     build: .
-    container_name: okx_0dte_straddle
+    container_name: ${CONTAINER_NAME:-okx_0dte_straddle}
     restart: always
     env_file: .env
     environment:
