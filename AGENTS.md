@@ -15,8 +15,30 @@ have already been resolved.
   uses the hyphenated form.
 - **Service name**: `algo` (the key under `services:` in
   `docker-compose.yml`). There is no `okx-straddle` service.
-- **Container name**: `okx_0dte_straddle` (used by `docker logs` /
-  `docker exec` if calling docker directly — but prefer `docker-compose`).
+- **Container name**: parametrized in `docker-compose.yml` as
+  `${CONTAINER_NAME:-okx_0dte_straddle}`. Each stack's `.env` sets its own
+  `CONTAINER_NAME` (see multi-stack section). The plain BTC stack has none set
+  and defaults to `okx_0dte_straddle`.
+
+## Multi-stack deployment (plain BTC / signal BTC / ETH) — SETTLED
+
+Three independent stacks run on the same VPS as separate git worktrees, each
+with its own `.env`. Isolation is via TWO env keys per stack:
+
+| Stack      | Dir (VPS)          | CONTAINER_NAME       | COMPOSE_PROJECT_NAME |
+|------------|--------------------|----------------------|----------------------|
+| plain BTC  | `~/okx_0dte_straddle` | `okx_0dte_straddle` (default) | (default)     |
+| signal BTC | `~/okx-signal`     | `okx_signal`         | `okx_signal`         |
+| ETH        | `~/okx-eth`        | `okx_eth`            | `okx_eth`            |
+
+- **NEVER `docker rm -f` / `docker-compose down` a container/name that belongs
+  to another stack — that kills a live algo.** Fix name collisions by correcting
+  the offending stack's OWN `CONTAINER_NAME`, never by removing the victim.
+- A "container name already in use" conflict means the stack's `.env` is missing
+  `CONTAINER_NAME` (it fell back to the default `okx_0dte_straddle` and collided
+  with the plain stack). Fix the `.env`, do not touch the other container.
+- `.env.eth` lives on the LAPTOP (gitignored). `scp` it FROM the laptop to
+  `~/okx-eth/.env` — never run that `scp` from inside the VPS ssh session.
 
 ### Canonical deploy & ops commands
 
@@ -152,7 +174,34 @@ for s in config.SESSIONS:
 - **Contract size**: 0.01 BTC per OKX contract (overridable via
   `OKX_CONTRACT_SIZE_BTC`). `qty_per_leg=0.5 BTC` = 50 contracts.
   This caused a critical bug in `tools/force_liquidate.py` previously —
-  see commit `f463f05`.
+  see commit `f463f05`. ETH contract size is 0.1 ETH per contract
+  (`OKX_CONTRACT_SIZE_ETH`).
+- **Collateral / funding (SETTLED — do NOT re-question)**: CM inverse options
+  **auto-borrow the base coin against USDT collateral**. You do NOT need to hold
+  BTC/ETH in the subaccount to trade the straddle — USDT is sufficient (same for
+  BTC and ETH). Never raise "fund the subaccount with ETH/BTC" as a blocker.
+
+## ETH support — SETTLED facts (BASE_COIN=ETH)
+
+- Same codebase trades ETH-USD CM options via `BASE_COIN=ETH` (identical OKX
+  structure, daily 08:00 UTC expiry). Config lives in `core/family.py`
+  `_COIN_SPECS["ETH"]`.
+- **ETH tick tiers are desk-verified in code** (`tiers_desk_verified=True`, two
+  tiers: 0.0001 below 0.005 ETH, 0.0005 at/above — ETH has no BTC deep-ITM tier).
+  `tiers_verified()` returns True ⇒ **no live-entry lock**. Do NOT tell the user
+  to set `COIN_TIERS_VERIFIED` or "verify on the UI" — already done.
+- ETH sizing = fixed 2.0/leg (operator's explicit choice; only flag if asked).
+
+## Going live (any stack) — SETTLED
+
+The only gate is the dry-run flag. `OKX_FLAG=0` = LIVE, `1` = demo. In the
+stack's worktree dir on the VPS:
+
+```bash
+sed -i 's/^DRY_RUN=true/DRY_RUN=false/' .env
+docker-compose up -d --force-recreate algo   # NOT `restart` — must re-read .env
+docker logs -f --tail=60 <CONTAINER_NAME>    # e.g. okx_eth
+```
 
 ---
 
@@ -191,6 +240,15 @@ hard safety net. The chase loop:
 If any future change removes `post_only=True` or the keep-alive guard,
 revert immediately.
 
+### `51008` on sell (residual flatten) — SETTLED
+
+Maker `chase_sell` on a residual long leg can be rejected with `51008`
+(insufficient balance) because OKX reserves coin margin for resting sell orders
+that lack `reduceOnly` (options don't support it). `chase_sell` handles this with
+a position-aware taker-cross fallback (`_taker_flatten_long` in `core/exchange.py`)
+that only triggers on `51008` and can never oversell. This is expected behaviour,
+not a bug to re-fix.
+
 ---
 
 ## Schedule architecture
@@ -211,6 +269,16 @@ and enabled flags. **Day-of-week is NEVER set in `.env`.**
 corresponds to the previous Mon-Fri trading day. Sessions whose
 `close_utc < entry_utc` automatically have `crosses_midnight=True`
 (close on the next calendar day, with `close_weekdays` shifted by 1).
+
+### 08:00 UTC expiry roll (SETTLED)
+
+Options expire daily at **08:00 UTC**, so a "trading day" runs 08:00→08:00 UTC.
+`_build_schedule` (config.py) cron-shifts any session entering **before 08:00 UTC
+one calendar day later**, so those sessions follow the correct trading day's
+rules. Concretely: Monday's pre-08:00 sessions belong to the **weekend** cycle
+(disabled when `WEEKEND_TRADING_ENABLED=false`), and Saturday's pre-08:00
+sessions behave as **weekday**. This is why the signal stack correctly does NOT
+fire weekend entries early Monday.
 
 ### Reporting cadence
 
