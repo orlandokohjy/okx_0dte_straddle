@@ -216,8 +216,11 @@ After editing `.env`, use `up -d --force-recreate algo`, not `restart`.
 
 Check the startup banner (`... logs --tail=100 algo`):
 - Every `we_*` session logs `session_skipped_disabled` (weekends OFF).
-- `wd_0000/0030/0130` `next_fire` is **Tue–Sat**, never Monday (08:00-roll fix).
-- Nothing fires before **09:00 UTC** on Monday.
+- Pre-roll windows `wd_0030/0100/0130/0200` `next_fire` is **Tue–Sat**, never
+  Monday (08:00-roll fix); daytime `wd_1100..wd_1430` are Mon–Fri.
+- `wd_1100` and `wd_1200` log `describe_sizing()=signal_scaled fixed_btc=0.5→1.0`
+  (floor+upsize); all other weekday windows are `fixed_btc=1.0`.
+- Nothing fires before **11:00 UTC** on Monday.
 - Final line is `{"event": "algo_running"}`.
 
 ### Flatten / 51008 notes

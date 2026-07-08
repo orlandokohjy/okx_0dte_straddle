@@ -160,12 +160,19 @@ def compute_qty_per_leg(
     equity_usd: float,
     pair: StraddlePair,
     spot_usd: float,
+    qty_per_leg_override: float | None = None,
 ) -> tuple[float, dict]:
     """Resolve the BTC qty/leg for THIS entry under the session's mode.
 
     Returns ``(qty_btc, audit_dict)``. ``qty_btc == 0.0`` means skip the
     session (insufficient equity for at least 1 contract). The audit
     dict is consumed by the ``sizing_decision`` log event in main.py.
+
+    ``qty_per_leg_override`` (fixed_btc only): when provided, this BTC
+    value is used in place of ``session.qty_per_leg``. It is how the
+    signal-SCALED windows inject their resolved size (0.5 floor vs 1.0
+    full) after the trade gate is evaluated in main.py. Ignored for
+    pct_equity / fixed_usd modes.
     """
     audit: dict = {
         "session": session.name,
@@ -181,11 +188,17 @@ def compute_qty_per_leg(
 
     # Fast path: fixed_btc mode short-circuits all the dynamic logic.
     if session.sizing_mode == "fixed_btc":
-        qty = _apply_max_cap(_round_down_to_contract(session.qty_per_leg))
+        base_qty = (
+            qty_per_leg_override if qty_per_leg_override is not None
+            else session.qty_per_leg
+        )
+        qty = _apply_max_cap(_round_down_to_contract(base_qty))
         audit.update({
             "decision": "fixed_btc",
             "final_qty_btc": qty,
         })
+        if qty_per_leg_override is not None:
+            audit["qty_override_btc"] = qty_per_leg_override
         return qty, audit
 
     # ── fixed_usd mode: constant USD premium budget per entry ──

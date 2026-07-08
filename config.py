@@ -227,6 +227,19 @@ class Session:
                                      # <NAME>_ENABLED=false in .env to surgically
                                      # take a session out of rotation without
                                      # a code change.
+    signal_scaled: bool = False      # if True, this window is signal-SCALED
+                                     # rather than signal-GATED: it NEVER skips.
+                                     # It enters ``signal_floor_qty`` by default
+                                     # and upsizes to the full ``qty_per_leg``
+                                     # only on an explicit should_trade=true from
+                                     # the trade gate. A false / missing / stale
+                                     # signal → the floor (fail-safe to the small
+                                     # size, never to a skip and never to full).
+                                     # Only meaningful under sizing_mode=fixed_btc
+                                     # with TRADE_GATE_ENABLED=true.
+    signal_floor_qty: float = 0.0    # BTC/leg floor used by a signal_scaled
+                                     # window when the gate is not a positive
+                                     # yes. Ignored when signal_scaled=False.
 
     @property
     def trading_day_offset_days(self) -> int:
@@ -311,6 +324,11 @@ class Session:
             base = f"pct_equity={self.pct_equity:.0%}"
         elif self.sizing_mode == "fixed_usd":
             base = f"fixed_usd=${self.fixed_usd:,.0f}/entry"
+        elif self.signal_scaled:
+            base = (
+                f"signal_scaled fixed_btc={self.signal_floor_qty}"
+                f"→{self.qty_per_leg} BTC"
+            )
         else:
             base = f"fixed_btc={self.qty_per_leg} BTC"
         return base
@@ -327,6 +345,8 @@ def _build_session(
     default_qty_per_leg: float = 0.5,
     default_fixed_usd: float = 5500.0,
     default_enabled: bool = True,
+    default_signal_scaled: bool = False,
+    default_signal_floor_qty: float = 0.0,
 ) -> Session:
     """Construct a Session with per-session env-var overrides.
 
@@ -336,6 +356,8 @@ def _build_session(
         <NAME>_QTY_PER_LEG   — float, BTC                    (default: arg)
         <NAME>_FIXED_USD     — float, target premium USD     (default: arg)
         <NAME>_ENABLED       — bool ("true"/"false"/"1"/"0") (default: true)
+        <NAME>_SIGNAL_SCALED — bool; floor+upsize vs gate    (default: arg)
+        <NAME>_SIGNAL_FLOOR_QTY — float, BTC floor qty/leg   (default: arg)
 
     ``<NAME>_ENABLED=false`` is the operator panic-button: it removes
     the session from the scheduler without a code change. All other
@@ -360,6 +382,13 @@ def _build_session(
         name, "ENABLED", "true" if default_enabled else "false",
     ).lower()
     enabled = enabled_raw not in ("false", "0", "no", "off", "")
+    scaled_raw = _session_env_str(
+        name, "SIGNAL_SCALED", "true" if default_signal_scaled else "false",
+    ).lower()
+    signal_scaled = scaled_raw in ("true", "1", "yes", "on")
+    signal_floor_qty = _session_env_float(
+        name, "SIGNAL_FLOOR_QTY", default_signal_floor_qty,
+    )
     return Session(
         name=name,
         entry_utc=entry_utc,
@@ -370,6 +399,8 @@ def _build_session(
         fixed_usd=fixed_usd,
         weekdays=weekdays,
         enabled=enabled,
+        signal_scaled=signal_scaled,
+        signal_floor_qty=signal_floor_qty,
     )
 
 
@@ -414,25 +445,36 @@ EXPIRY_ROLL_HOUR_UTC: int = 8
 # of every chained window is set to next_entry − _SESSION_ROLL_BUFFER_MIN.
 # The last window of a chain (and every standalone window) holds the full
 # 30 min.
+# Weekday windows (2026-07-08). Daytime entries (>= 08:00 UTC) fire on
+# their own Mon-Fri trading day; pre-roll entries (< 08:00 UTC) are cron'd
+# one calendar day later (Tue-Sat) since they belong to the prior trading
+# day (see EXPIRY_ROLL_HOUR_UTC / _build_schedule).
+#
+# Sizing (signal version): every window is 1.0 BTC/leg and signal-GATED
+# (skip when should_trade != true) EXCEPT the two SIGNAL-SCALED windows
+# below, which never skip — 0.5 BTC floor, upsized to 1.0 BTC only on an
+# explicit should_trade=true. See _WEEKDAY_SIGNAL_SCALED.
 _WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
-    ("wd_0900", 9, 0),
-    ("wd_0930", 9, 30),
-    ("wd_1030", 10, 30),
+    ("wd_1100", 11, 0),    # SIGNAL-SCALED (0.5 → 1.0)
     ("wd_1130", 11, 30),
-    ("wd_1200", 12, 0),
+    ("wd_1200", 12, 0),    # SIGNAL-SCALED (0.5 → 1.0)
     ("wd_1300", 13, 0),
     ("wd_1330", 13, 30),
     ("wd_1400", 14, 0),
     ("wd_1430", 14, 30),
-    ("wd_1500", 15, 0),
-    ("wd_1700", 17, 0),
-    ("wd_1930", 19, 30),
-    ("wd_2200", 22, 0),
-    ("wd_0000", 0, 0),    # 2400-0030
     ("wd_0030", 0, 30),
+    ("wd_0100", 1, 0),
     ("wd_0130", 1, 30),
+    ("wd_0200", 2, 0),
 ]
 _WEEKDAY_DAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon-Fri trading days
+
+# Weekday windows that are signal-SCALED (floor + upsize) rather than
+# signal-GATED. Listed twice in the operator's spec → 0.5 BTC floor, 1.0
+# BTC on an explicit should_trade=true, never skipped.
+_WEEKDAY_SIGNAL_SCALED: frozenset[str] = frozenset({"wd_1100", "wd_1200"})
+_WEEKDAY_FULL_QTY: float = 1.0     # BTC/leg full (gated & scaled-upsize) size
+_WEEKDAY_FLOOR_QTY: float = 0.5    # BTC/leg floor for signal-scaled windows
 
 _WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
     ("we_0900", 9, 0),
@@ -489,6 +531,10 @@ def _derive_close(
 def _build_schedule(
     entries: list[tuple[str, int, int]], trading_days: frozenset[int],
     enabled_default: bool = True,
+    *,
+    default_qty_per_leg: float = 0.25,
+    signal_scaled_names: frozenset[str] = frozenset(),
+    signal_floor_qty: float = 0.0,
 ) -> list[Session]:
     """Build a list of fixed_btc 0.25-BTC sessions from (name, h, m) specs.
 
@@ -517,14 +563,17 @@ def _build_schedule(
             cron_days = trading_days
         nxt = h * 60 + m + 30
         next_entry_min = nxt if nxt in entry_mins else None
+        is_scaled = name in signal_scaled_names
         out.append(_build_session(
             name,
             entry_utc=time(h, m),
             close_utc=_derive_close(h, m, next_entry_min),
             weekdays=cron_days,
             default_sizing_mode="fixed_btc",
-            default_qty_per_leg=0.25,
+            default_qty_per_leg=default_qty_per_leg,
             default_enabled=enabled_default,
+            default_signal_scaled=is_scaled,
+            default_signal_floor_qty=signal_floor_qty if is_scaled else 0.0,
         ))
     return out
 
@@ -539,7 +588,12 @@ WEEKEND_TRADING_ENABLED: bool = os.getenv(
 ).lower() in ("true", "1", "yes", "on")
 
 SESSIONS: list[Session] = (
-    _build_schedule(_WEEKDAY_ENTRIES, _WEEKDAY_DAYS)
+    _build_schedule(
+        _WEEKDAY_ENTRIES, _WEEKDAY_DAYS,
+        default_qty_per_leg=_WEEKDAY_FULL_QTY,
+        signal_scaled_names=_WEEKDAY_SIGNAL_SCALED,
+        signal_floor_qty=_WEEKDAY_FLOOR_QTY,
+    )
     + _build_schedule(
         _WEEKEND_ENTRIES, _WEEKEND_DAYS,
         enabled_default=WEEKEND_TRADING_ENABLED,

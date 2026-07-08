@@ -1224,17 +1224,43 @@ class Algo:
         # bounded timeout). A no-trade signal, or a stale/absent file at
         # timeout, SKIPS the entry — fail-safe, so a dead/frozen producer
         # can never wave a trade through. See risk/trade_gate.py.
+        # Signal-SCALED windows (session.signal_scaled) never skip: they
+        # enter the floor (session.signal_floor_qty) by default and upsize
+        # to the full session.qty_per_leg ONLY on an explicit
+        # should_trade=true. A false / missing / stale / fail-* gate → the
+        # floor. Signal-GATED windows keep the fail-safe skip below.
+        qty_override: float | None = None
         if config.TRADE_GATE_ENABLED:
             gate = await self._resolve_trade_gate(session, label)
-            if not gate.allowed:
+            if session.signal_scaled:
+                if gate.allowed:
+                    qty_override = session.qty_per_leg
+                    log.info("trade_gate_scaled_full",
+                             session=session.name, reason=gate.reason,
+                             qty_btc=qty_override)
+                    await notifier.send(
+                        f"<b>[{label}] Signal gate: FULL size</b>\n"
+                        f"{qty_override:.2f} BTC/leg\n{gate.reason}",
+                    )
+                else:
+                    qty_override = session.signal_floor_qty
+                    log.info("trade_gate_scaled_floor",
+                             session=session.name, reason=gate.reason,
+                             qty_btc=qty_override)
+                    await notifier.send(
+                        f"<b>[{label}] Signal gate: FLOOR size</b>\n"
+                        f"{qty_override:.2f} BTC/leg\n{gate.reason}",
+                    )
+            elif not gate.allowed:
                 log.info("entry_blocked_trade_gate",
                          session=session.name, reason=gate.reason)
                 await notifier.notify_skip(
                     f"[{label}] Trade gate — entry skipped: {gate.reason}",
                 )
                 return
-            log.info("trade_gate_ok",
-                     session=session.name, reason=gate.reason)
+            else:
+                log.info("trade_gate_ok",
+                         session=session.name, reason=gate.reason)
 
         if self.portfolio.has_open or self._close_in_progress > 0:
             # A prior session's straddle is still unwinding (maker-only
@@ -1319,6 +1345,7 @@ class Algo:
             equity_usd=equity,
             pair=pair,
             spot_usd=spot,
+            qty_per_leg_override=qty_override,
         )
         log.info("sizing_decision", **sizing_audit)
 
