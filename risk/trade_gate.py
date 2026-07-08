@@ -58,6 +58,11 @@ class GateDecision:
     # Note: fail-open/closed for a persistently-retryable state is decided
     # by the CALLER at timeout, not here.
     retryable: bool = False
+    # The raw ``active_window.should_trade`` value we positively read for
+    # THIS window: True / False on a terminal decision, or None when we
+    # never got a clean read (retryable, or a fail-open/closed at timeout).
+    # Surfaced in ops/Telegram so the signal outcome is explicit.
+    should_trade: bool | None = None
 
 
 def _parse_utc(ts: str) -> datetime | None:
@@ -159,10 +164,12 @@ def evaluate_trade_gate(session: "config.Session") -> GateDecision:
             True,
             f"signal OK (window {sig_entry}, fresh {age_sec / 60:.1f} min)",
             retryable=False,
+            should_trade=True,
         )
     if should is False:
         return GateDecision(
             False, "signal should_trade=false (no-entry)", retryable=False,
+            should_trade=False,
         )
     # Malformed value — treat as not-yet-verified and retry.
     return _retry(f"active_window.should_trade not boolean: {should!r}")

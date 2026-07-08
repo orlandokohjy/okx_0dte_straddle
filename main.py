@@ -62,6 +62,16 @@ from utils.time_utils import format_utc_sgt, now_utc
 log = structlog.get_logger(__name__)
 
 
+def _fmt_should_trade(gate: GateDecision) -> str:
+    """Render the raw signal ``should_trade`` for ops/Telegram. ``None``
+    means we never got a clean read (fail-open/closed at timeout)."""
+    if gate.should_trade is True:
+        return "should_trade=True"
+    if gate.should_trade is False:
+        return "should_trade=False"
+    return "should_trade=unknown (no clean signal read)"
+
+
 # Weekend-strategy session names. Imported lazily by the daily-report
 # loader (reporting.daily_report.WEEKEND_SESSION_NAMES) too — keep both
 # in sync. Used in main._on_close to (a) exclude weekend sessions from
@@ -1240,7 +1250,8 @@ class Algo:
                              qty_btc=qty_override)
                     await notifier.send(
                         f"<b>[{label}] Signal gate: FULL size</b>\n"
-                        f"{qty_override:.2f} BTC/leg\n{gate.reason}",
+                        f"{qty_override:.3f} BTC/leg\n"
+                        f"{_fmt_should_trade(gate)}\n{gate.reason}",
                     )
                 else:
                     qty_override = session.signal_floor_qty
@@ -1249,13 +1260,15 @@ class Algo:
                              qty_btc=qty_override)
                     await notifier.send(
                         f"<b>[{label}] Signal gate: FLOOR size</b>\n"
-                        f"{qty_override:.2f} BTC/leg\n{gate.reason}",
+                        f"{qty_override:.3f} BTC/leg\n"
+                        f"{_fmt_should_trade(gate)}\n{gate.reason}",
                     )
             elif not gate.allowed:
                 log.info("entry_blocked_trade_gate",
                          session=session.name, reason=gate.reason)
                 await notifier.notify_skip(
-                    f"[{label}] Trade gate — entry skipped: {gate.reason}",
+                    f"[{label}] Trade gate — entry skipped: "
+                    f"{_fmt_should_trade(gate)} — {gate.reason}",
                 )
                 return
             else:
