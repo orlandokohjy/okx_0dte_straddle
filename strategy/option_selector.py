@@ -24,6 +24,87 @@ class StraddlePair:
     strike: float
 
 
+@dataclass
+class WingLeg:
+    """A single short wing option (call above body, or put below body)."""
+    option: OptionInfo
+    strike: float
+
+
+@dataclass
+class WingPair:
+    """Short wings around a straddle body. Either side may be None when no
+    valid adjacent strike with a live bid exists — the caller sells only
+    what is present (the body always covers whatever fills)."""
+    call: Optional[WingLeg]  # short call, WING_CALL_STRIKE_OFFSET strikes ABOVE body
+    put: Optional[WingLeg]   # short put,  WING_PUT_STRIKE_OFFSET strikes BELOW body
+
+    @property
+    def any(self) -> bool:
+        return self.call is not None or self.put is not None
+
+
+def select_wings(
+    chain: OptionChain,
+    body_strike: float,
+    *,
+    call_offset: int,
+    put_offset: int,
+) -> WingPair:
+    """Pick the short wings by walking ADJACENT LISTED strikes from the body.
+
+    We are SELLING these, so a valid **bid** (bid > 0) is the relevant
+    liquidity check — a maker sell rests at/above the bid. A wing side with
+    no adjacent strike or no live bid is returned as None and simply not
+    sold; the body still stands, so the structure is never left naked.
+
+    ``call_offset`` / ``put_offset`` are counts of adjacent listed strikes
+    away from the body (1 = the very next strike).
+    """
+    call_strikes = sorted({c.strike for c in chain.calls})
+    put_strikes = sorted({p.strike for p in chain.puts})
+
+    call_wing: Optional[WingLeg] = None
+    above = [s for s in call_strikes if s > body_strike]
+    if call_offset >= 1 and len(above) >= call_offset:
+        target = above[call_offset - 1]
+        cand = next(
+            (c for c in chain.calls if c.strike == target and c.bid > 0), None,
+        )
+        if cand is not None:
+            call_wing = WingLeg(option=cand, strike=target)
+        else:
+            log.warning("call_wing_unavailable", target_strike=target,
+                        reason="no_live_bid_at_strike")
+    else:
+        log.warning("call_wing_no_strike", body=body_strike,
+                    strikes_above=len(above), offset=call_offset)
+
+    put_wing: Optional[WingLeg] = None
+    below_desc = sorted((s for s in put_strikes if s < body_strike), reverse=True)
+    if put_offset >= 1 and len(below_desc) >= put_offset:
+        target = below_desc[put_offset - 1]
+        cand = next(
+            (p for p in chain.puts if p.strike == target and p.bid > 0), None,
+        )
+        if cand is not None:
+            put_wing = WingLeg(option=cand, strike=target)
+        else:
+            log.warning("put_wing_unavailable", target_strike=target,
+                        reason="no_live_bid_at_strike")
+    else:
+        log.warning("put_wing_no_strike", body=body_strike,
+                    strikes_below=len(below_desc), offset=put_offset)
+
+    log.info("wings_selected",
+             body_strike=body_strike,
+             call_wing_strike=call_wing.strike if call_wing else None,
+             call_wing_bid=call_wing.option.bid if call_wing else None,
+             put_wing_strike=put_wing.strike if put_wing else None,
+             put_wing_bid=put_wing.option.bid if put_wing else None)
+    return WingPair(call=call_wing, put=put_wing)
+
+
 def _spread_pct(bid: float, ask: float, mark: float = 0.0) -> float:
     """
     Bid-ask spread as % of mid (or mark if bid is missing).

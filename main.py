@@ -50,10 +50,10 @@ from data.market_data import MarketData
 from data.option_chain import OptionChain
 from risk.risk_manager import RiskManager
 from strategy.exit_manager import ExitManager
-from strategy.option_selector import select_straddle_pair
+from strategy.option_selector import select_straddle_pair, select_wings
 from strategy.position_sizer import size_position
 from strategy.sizing import compute_qty_per_leg, telegram_summary_line
-from strategy.straddle_builder import build_straddle, unwind_straddle
+from strategy.straddle_builder import build_straddle, build_wings, unwind_straddle
 from risk.trade_gate import GateDecision, evaluate_trade_gate
 from utils import volume_tracker
 from utils.logging_config import setup_logging
@@ -1562,6 +1562,39 @@ class Algo:
                      put_fill_native=straddle.entry_put_price,
                      call_fill_usd=call_fill_usd,
                      put_fill_usd=put_fill_usd)
+
+            # ── Iron-fly wings: sell covered wings AFTER the body filled ──
+            # LONGS-FIRST — the body is fully filled here (build_straddle
+            # returns None on any partial), so every wing is covered. Wing
+            # failures are non-fatal: the plain straddle stands and is safe.
+            if config.ENABLE_WINGS:
+                try:
+                    wings = select_wings(
+                        self.chain, pair.strike,
+                        call_offset=config.WING_CALL_STRIKE_OFFSET,
+                        put_offset=config.WING_PUT_STRIKE_OFFSET,
+                    )
+                    if wings.any:
+                        await build_wings(
+                            self.exchange, self.market, self.portfolio,
+                            straddle, wings,
+                            chase_deadline_min=chase_deadline_min,
+                        )
+                    else:
+                        log.warning("no_valid_wings_body_only",
+                                    session=session.name, strike=pair.strike)
+                        await notifier.send(
+                            f"<b>NO WINGS AVAILABLE [{label}]</b>\n"
+                            f"No adjacent strike with a live bid — holding "
+                            f"the plain straddle (safe)."
+                        )
+                except Exception:
+                    log.error("wing_build_error", session=session.name,
+                              exc_info=True)
+                    await notifier.notify_error(
+                        "Wings",
+                        "Wing sell failed — body straddle is intact and "
+                        "covered; check logs.")
         else:
             log.error("straddle_build_failed", session=session.name)
             self._register_session_failure(
