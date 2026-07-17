@@ -52,6 +52,12 @@ TRADE_LOG_FIELDS = [
     # unavailable; never affects execution.
     "call_entry_iv", "put_entry_iv",
     "call_exit_iv", "put_exit_iv",
+    # Iron-fly wings (short overlay). Blank/0 when wings were not used.
+    # Premiums are USD-per-BTC-of-notional (same convention as body legs).
+    "call_wing_strike", "put_wing_strike",
+    "call_wing_premium_entry", "put_wing_premium_entry",
+    "call_wing_premium_exit", "put_wing_premium_exit",
+    "wings_pnl",
 ]
 
 
@@ -121,9 +127,93 @@ class Straddle:
     gross_pnl: Optional[float] = None  # Pre-fee P&L (call + put leg P&L)
     fees: Optional[float] = None  # Total maker fees across all 4 legs (USD)
 
+    # ── Iron-fly wings (short overlay) — all optional / default absent ──
+    # Present only when ENABLE_WINGS sold a covered wing after the body
+    # filled. A None leg means that wing was never sold (body-only on that
+    # side). Wing premiums are OKX-native (BTC for CM, USD for UM), same
+    # convention as the body legs. entry_* = credit received (we sold),
+    # exit_* = debit paid to buy back.
+    call_wing_leg: Optional[StraddleLeg] = None
+    put_wing_leg: Optional[StraddleLeg] = None
+    call_wing_strike: float = 0.0
+    put_wing_strike: float = 0.0
+    entry_call_wing_price: float = 0.0
+    entry_put_wing_price: float = 0.0
+    exit_call_wing_price: Optional[float] = None
+    exit_put_wing_price: Optional[float] = None
+
     def _is_um(self) -> bool:
         """Treat empty-string family as CM (legacy)."""
         return (self.family or "CM").upper() == "UM"
+
+    @property
+    def has_call_wing(self) -> bool:
+        return self.call_wing_leg is not None
+
+    @property
+    def has_put_wing(self) -> bool:
+        return self.put_wing_leg is not None
+
+    @property
+    def has_wings(self) -> bool:
+        return self.has_call_wing or self.has_put_wing
+
+    def _short_leg_usd_pnl(
+        self, entry_px: float, exit_px: float, exit_spot: float = 0.0,
+    ) -> float:
+        """USD P&L for a SHORT option leg (wing). We received ``entry_px``
+        (credit) and pay ``exit_px`` (debit) to buy it back, so profit rises
+        when the exit price is BELOW the entry price — the opposite sign of a
+        long leg. Family-aware, mirroring ``call_pnl``:
+
+          CM: USD = qty×num × (entry_px×entry_spot − exit_px×exit_spot)
+          UM: USD = qty×num × (entry_px − exit_px)
+        """
+        if self._is_um():
+            return (
+                self.qty_per_leg * self.num_straddles * (entry_px - exit_px)
+            )
+        entry_spot = self.entry_spot_price
+        spot_for_exit = exit_spot or self.exit_spot_price or entry_spot
+        if entry_spot <= 0 and spot_for_exit <= 0:
+            return (
+                self.qty_per_leg * self.num_straddles * (entry_px - exit_px)
+            )
+        if entry_spot <= 0:
+            entry_spot = spot_for_exit
+        if spot_for_exit <= 0:
+            spot_for_exit = entry_spot
+        return (
+            self.qty_per_leg
+            * self.num_straddles
+            * (entry_px * entry_spot - exit_px * spot_for_exit)
+        )
+
+    def wings_pnl(
+        self,
+        exit_call_wing: Optional[float] = None,
+        exit_put_wing: Optional[float] = None,
+        exit_spot: float = 0.0,
+    ) -> float:
+        """Combined USD P&L of whichever wings are present. Uses the passed
+        exit price, else the stored one, else the entry price (→ 0 P&L for a
+        wing that was never bought back)."""
+        total = 0.0
+        if self.has_call_wing:
+            xc = (exit_call_wing if exit_call_wing is not None
+                  else self.exit_call_wing_price)
+            xc = xc if xc is not None else self.entry_call_wing_price
+            total += self._short_leg_usd_pnl(
+                self.entry_call_wing_price, xc, exit_spot,
+            )
+        if self.has_put_wing:
+            xp = (exit_put_wing if exit_put_wing is not None
+                  else self.exit_put_wing_price)
+            xp = xp if xp is not None else self.entry_put_wing_price
+            total += self._short_leg_usd_pnl(
+                self.entry_put_wing_price, xp, exit_spot,
+            )
+        return total
 
     def call_pnl(self, call_now: float, exit_spot: float = 0.0) -> float:
         """USD P&L on the call leg.
@@ -229,6 +319,16 @@ class Straddle:
             "exit_call_price": self.exit_call_price,
             "exit_put_price": self.exit_put_price,
             "pnl": self.pnl,
+            # Wings — only meaningful when present; kept in state for
+            # forensics / post-close reconcile display.
+            "call_wing_leg": self.call_wing_leg.to_dict() if self.call_wing_leg else None,
+            "put_wing_leg": self.put_wing_leg.to_dict() if self.put_wing_leg else None,
+            "call_wing_strike": self.call_wing_strike,
+            "put_wing_strike": self.put_wing_strike,
+            "entry_call_wing_price": self.entry_call_wing_price,
+            "entry_put_wing_price": self.entry_put_wing_price,
+            "exit_call_wing_price": self.exit_call_wing_price,
+            "exit_put_wing_price": self.exit_put_wing_price,
         }
 
 
@@ -285,16 +385,30 @@ class Portfolio:
 
     def close_straddle(
         self, exit_call_price: float, exit_put_price: float, exit_reason: str,
+        *,
+        exit_call_wing_price: Optional[float] = None,
+        exit_put_wing_price: Optional[float] = None,
     ) -> float:
         s = self._straddle
         if s is None or s.status != "open":
             return 0.0
 
+        # Record wing exit prices (buy-to-close debits) before P&L so
+        # wings_pnl and the trade log pick them up.
+        if exit_call_wing_price is not None:
+            s.exit_call_wing_price = exit_call_wing_price
+        if exit_put_wing_price is not None:
+            s.exit_put_wing_price = exit_put_wing_price
+
         # USD P&L using entry_spot for the entry leg and exit_spot for the
         # exit leg (set on Straddle by unwind_straddle just before close).
-        gross_pnl = s.combined_pnl(
+        body_pnl = s.combined_pnl(
             exit_call_price, exit_put_price, exit_spot=s.exit_spot_price,
         )
+        # Add short-wing P&L when wings are present (credit received − debit
+        # paid to buy back), family-aware. Zero when no wings.
+        wings_pnl = s.wings_pnl(exit_spot=s.exit_spot_price) if s.has_wings else 0.0
+        gross_pnl = body_pnl + wings_pnl
         # Sum signed maker fees across all 4 legs (BTC fees converted to
         # USD at fill-time spot by the exchange layer). The sign follows
         # OKX: negative = fee paid (cost), positive = maker rebate
@@ -312,6 +426,11 @@ class Portfolio:
             + float(pe.get("fee_usd") or 0.0)
             + float(px.get("fee_usd") or 0.0)
         )
+        # Wing leg fees (entry sell-to-open + exit buy-to-close), when present.
+        for wing in (s.call_wing_leg, s.put_wing_leg):
+            if wing is not None:
+                total_fees_usd += float((wing.entry_metrics or {}).get("fee_usd") or 0.0)
+                total_fees_usd += float((wing.exit_metrics or {}).get("fee_usd") or 0.0)
         net_pnl = gross_pnl + total_fees_usd
 
         s.status = "closed"
@@ -484,6 +603,24 @@ class Portfolio:
             "put_entry_iv": s.entry_put_iv or "",
             "call_exit_iv": s.exit_call_iv or "",
             "put_exit_iv": s.exit_put_iv or "",
+            # Wings (USD-converted premiums; blank when the side had no wing)
+            "call_wing_strike": s.call_wing_strike or "",
+            "put_wing_strike": s.put_wing_strike or "",
+            "call_wing_premium_entry": (
+                round((s.entry_call_wing_price * (1 if is_um else entry_spot)), 4)
+                if s.has_call_wing else ""),
+            "put_wing_premium_entry": (
+                round((s.entry_put_wing_price * (1 if is_um else entry_spot)), 4)
+                if s.has_put_wing else ""),
+            "call_wing_premium_exit": (
+                round(((s.exit_call_wing_price or 0.0) * (1 if is_um else exit_spot)), 4)
+                if s.has_call_wing else ""),
+            "put_wing_premium_exit": (
+                round(((s.exit_put_wing_price or 0.0) * (1 if is_um else exit_spot)), 4)
+                if s.has_put_wing else ""),
+            "wings_pnl": (
+                round(s.wings_pnl(exit_spot=exit_spot), 2)
+                if s.has_wings else ""),
         }
 
         needs_header = not os.path.exists(config.TRADE_LOG_FILE)

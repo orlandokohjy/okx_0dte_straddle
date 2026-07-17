@@ -33,7 +33,7 @@ from core import family, notifier
 from core.exchange import OKXExchange, _TRANSIENT_HTTP_EXCEPTIONS
 from core.portfolio import Portfolio, Straddle, StraddleLeg
 from data.market_data import MarketData
-from strategy.option_selector import StraddlePair
+from strategy.option_selector import StraddlePair, WingLeg, WingPair
 from utils.time_utils import now_utc
 
 log = structlog.get_logger(__name__)
@@ -506,6 +506,17 @@ async def unwind_straddle(
     if exit_spot > 0:
         straddle.exit_spot_price = exit_spot
 
+    # ── SHORTS-FIRST: buy back the covered wings BEFORE selling the body ──
+    # If we sold the body first we would momentarily hold only the short
+    # wings = a naked short strangle. Closing the shorts first leaves us
+    # holding the long body (safe) until the body sells.
+    wing_exits: dict = {"call": None, "put": None}
+    if straddle.has_wings:
+        log.info("closing_wings_first", id=straddle.id,
+                 has_call_wing=straddle.has_call_wing,
+                 has_put_wing=straddle.has_put_wing)
+        wing_exits = await unwind_wings(exchange, market, portfolio, straddle)
+
     rfq_result = await exchange.send_rfq_sell(
         straddle.call_leg.instrument,
         straddle.put_leg.instrument,
@@ -715,11 +726,240 @@ async def unwind_straddle(
     except Exception:
         log.warning("exit_iv_capture_failed", id=straddle.id, exc_info=True)
 
-    pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
+    pnl = portfolio.close_straddle(
+        exit_call_price, exit_put_price, reason,
+        exit_call_wing_price=wing_exits.get("call"),
+        exit_put_wing_price=wing_exits.get("put"),
+    )
     log.info("straddle_unwound", id=straddle.id, reason=reason,
              pnl=f"${pnl:,.2f}",
-             exit_call=exit_call_price, exit_put=exit_put_price)
+             exit_call=exit_call_price, exit_put=exit_put_price,
+             wing_call_exit=wing_exits.get("call"),
+             wing_put_exit=wing_exits.get("put"))
     return pnl
+
+
+async def build_wings(
+    exchange: OKXExchange,
+    market: MarketData,
+    portfolio: Portfolio,
+    straddle: Straddle,
+    wings: WingPair,
+    *,
+    chase_deadline_min: Optional[float] = None,
+) -> None:
+    """Sell the covered wings AFTER the body is filled (LONGS-FIRST entry).
+
+    Best-effort and NON-FATAL: an unsold or partially-sold wing simply
+    leaves the position body-only (long straddle) on that side — always
+    covered, never naked-short. Sold wings are recorded onto ``straddle``
+    and persisted. Uses maker-only ``chase_sell(opening=True)`` so a 51008
+    margin reject aborts that wing instead of taker-opening a short.
+    """
+    if wings is None or not wings.any:
+        log.info("no_wings_to_sell", id=straddle.id)
+        return
+
+    # Wing qty matches the body leg qty (one wing per straddle unit).
+    total_qty = straddle.call_leg.qty
+    deadline = (
+        chase_deadline_min if chase_deadline_min is not None
+        else config.WING_CHASE_DEADLINE_MIN
+    )
+
+    async def _sell_wing(wing: Optional[WingLeg], label: str):
+        if wing is None:
+            return None
+        opt = wing.option
+        spr = _spread_pct(opt.bid, opt.ask, opt.mark)
+        if spr > config.WING_MAX_ENTRY_SPREAD_PCT:
+            log.warning("wing_spread_gate_skip", leg=label,
+                        symbol=opt.symbol, spread=spr,
+                        limit=config.WING_MAX_ENTRY_SPREAD_PCT)
+            await notifier.send(
+                f"<b>WING SKIPPED — wide spread</b> [{straddle.id}]\n"
+                f"{label} {opt.symbol} strike ${wing.strike:,.0f}\n"
+                f"spread={spr:.1%} &gt; {config.WING_MAX_ENTRY_SPREAD_PCT:.0%}"
+            )
+            return None
+        # Sell: start near the ask and walk DOWN toward the bid (maker).
+        ref_ask = opt.ask if opt.ask > 0 else opt.mark
+        if ref_ask <= 0:
+            log.warning("wing_no_ask", leg=label, symbol=opt.symbol)
+            return None
+        try:
+            return await exchange.chase_sell(
+                opt.symbol, total_qty, ref_ask,
+                deadline_min=deadline, opening=True,
+            )
+        except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+            log.warning("wing_sell_transient", leg=label, symbol=opt.symbol,
+                        exc_type=type(exc).__name__)
+            return None
+
+    call_task = asyncio.create_task(
+        _sell_wing(wings.call, "CALL_WING"), name=f"wing_call_{straddle.id}")
+    put_task = asyncio.create_task(
+        _sell_wing(wings.put, "PUT_WING"), name=f"wing_put_{straddle.id}")
+    call_res, put_res = await asyncio.gather(
+        call_task, put_task, return_exceptions=True,
+    )
+    if isinstance(call_res, BaseException):
+        log.error("wing_call_exception", exc_info=call_res)
+        call_res = None
+    if isinstance(put_res, BaseException):
+        log.error("wing_put_exception", exc_info=put_res)
+        put_res = None
+
+    if call_res and wings.call is not None:
+        # Even a partial wing fill is covered (long call K covers short
+        # call K+n). Record exactly what filled so the close buys back the
+        # right size.
+        px = float(call_res.get("average_price", 0.0))
+        filled_btc = float(call_res.get("filled_qty_btc", total_qty))
+        if filled_btc > 0 and px > 0:
+            straddle.call_wing_leg = StraddleLeg(
+                instrument=wings.call.option.symbol, side="Sell",
+                qty=filled_btc, entry_price=px,
+                order_id=call_res.get("order_id", ""), avg_fill_price=px,
+                entry_metrics=call_res.get("metrics", {}) or {},
+            )
+            straddle.call_wing_strike = wings.call.strike
+            straddle.entry_call_wing_price = px
+            await notifier.send(_format_leg_fill_message(
+                leg="CALL WING (short)", side="entry",
+                straddle_id=straddle.id,
+                symbol=wings.call.option.symbol, result=call_res))
+
+    if put_res and wings.put is not None:
+        px = float(put_res.get("average_price", 0.0))
+        filled_btc = float(put_res.get("filled_qty_btc", total_qty))
+        if filled_btc > 0 and px > 0:
+            straddle.put_wing_leg = StraddleLeg(
+                instrument=wings.put.option.symbol, side="Sell",
+                qty=filled_btc, entry_price=px,
+                order_id=put_res.get("order_id", ""), avg_fill_price=px,
+                entry_metrics=put_res.get("metrics", {}) or {},
+            )
+            straddle.put_wing_strike = wings.put.strike
+            straddle.entry_put_wing_price = px
+            await notifier.send(_format_leg_fill_message(
+                leg="PUT WING (short)", side="entry",
+                straddle_id=straddle.id,
+                symbol=wings.put.option.symbol, result=put_res))
+
+    portfolio.set_straddle(straddle)
+    log.info("wings_built", id=straddle.id,
+             call_wing=straddle.call_wing_strike if straddle.has_call_wing else None,
+             put_wing=straddle.put_wing_strike if straddle.has_put_wing else None,
+             call_credit=straddle.entry_call_wing_price,
+             put_credit=straddle.entry_put_wing_price)
+    if straddle.has_wings:
+        await notifier.send(
+            f"<b>WINGS SOLD</b> [{straddle.id}]\n"
+            f"Structure is now a covered iron fly.\n"
+            f"Call wing: "
+            f"{('$%.0f' % straddle.call_wing_strike) if straddle.has_call_wing else '—'}\n"
+            f"Put wing:  "
+            f"{('$%.0f' % straddle.put_wing_strike) if straddle.has_put_wing else '—'}"
+        )
+
+
+async def unwind_wings(
+    exchange: OKXExchange,
+    market: MarketData,
+    portfolio: Portfolio,
+    straddle: Straddle,
+) -> dict:
+    """Buy-to-close the short wings FIRST (SHORTS-FIRST close) so the body is
+    never left naked mid-unwind. Returns ``{'call': px|None, 'put': px|None}``
+    with the buy-back debit prices for close P&L. Best-effort: a wing that
+    fails to buy back is left for the position-aware post-close reconcile,
+    and is covered by the body in the meantime.
+    """
+    result: dict = {"call": None, "put": None}
+
+    async def _buy_close(leg, label: str):
+        if leg is None:
+            return None
+        bid, _ask = await market.get_option_bid_ask(leg.instrument)
+        ref_bid = bid if bid > 0 else leg.entry_price
+        if ref_bid <= 0:
+            return None
+        try:
+            return await exchange.chase_buy(
+                leg.instrument, leg.qty, ref_bid,
+                deadline_min=config.WING_CHASE_DEADLINE_MIN,
+            )
+        except _TRANSIENT_HTTP_EXCEPTIONS as exc:
+            log.warning("wing_buyback_transient", leg=label,
+                        instrument=leg.instrument,
+                        exc_type=type(exc).__name__)
+            return None
+
+    call_task = asyncio.create_task(
+        _buy_close(straddle.call_wing_leg, "CALL_WING"),
+        name=f"wing_close_call_{straddle.id}")
+    put_task = asyncio.create_task(
+        _buy_close(straddle.put_wing_leg, "PUT_WING"),
+        name=f"wing_close_put_{straddle.id}")
+    call_res, put_res = await asyncio.gather(
+        call_task, put_task, return_exceptions=True,
+    )
+    if isinstance(call_res, BaseException):
+        log.error("wing_close_call_exception", exc_info=call_res)
+        call_res = None
+    if isinstance(put_res, BaseException):
+        log.error("wing_close_put_exception", exc_info=put_res)
+        put_res = None
+
+    if call_res and straddle.call_wing_leg is not None:
+        px = float(call_res.get("average_price", 0.0))
+        if px > 0:
+            result["call"] = px
+            straddle.call_wing_leg.exit_metrics = call_res.get("metrics", {}) or {}
+            await notifier.send(_format_leg_fill_message(
+                leg="CALL WING (buy-to-close)", side="exit",
+                straddle_id=straddle.id,
+                symbol=straddle.call_wing_leg.instrument, result=call_res))
+        if not call_res.get("fully_filled", True):
+            await notifier.send(
+                f"<b>⚠️ CALL WING BUYBACK PARTIAL</b> [{straddle.id}]\n"
+                f"{straddle.call_wing_leg.instrument} — residual short may "
+                f"remain; post-close reconcile will buy it back."
+            )
+    elif straddle.call_wing_leg is not None:
+        await notifier.send(
+            f"<b>⚠️ CALL WING BUYBACK FAILED</b> [{straddle.id}]\n"
+            f"{straddle.call_wing_leg.instrument} — still short; body still "
+            f"covers it. Post-close reconcile will buy it back."
+        )
+
+    if put_res and straddle.put_wing_leg is not None:
+        px = float(put_res.get("average_price", 0.0))
+        if px > 0:
+            result["put"] = px
+            straddle.put_wing_leg.exit_metrics = put_res.get("metrics", {}) or {}
+            await notifier.send(_format_leg_fill_message(
+                leg="PUT WING (buy-to-close)", side="exit",
+                straddle_id=straddle.id,
+                symbol=straddle.put_wing_leg.instrument, result=put_res))
+        if not put_res.get("fully_filled", True):
+            await notifier.send(
+                f"<b>⚠️ PUT WING BUYBACK PARTIAL</b> [{straddle.id}]\n"
+                f"{straddle.put_wing_leg.instrument} — residual short may "
+                f"remain; post-close reconcile will buy it back."
+            )
+    elif straddle.put_wing_leg is not None:
+        await notifier.send(
+            f"<b>⚠️ PUT WING BUYBACK FAILED</b> [{straddle.id}]\n"
+            f"{straddle.put_wing_leg.instrument} — still short; body still "
+            f"covers it. Post-close reconcile will buy it back."
+        )
+
+    log.info("wings_unwound", id=straddle.id,
+             call_exit=result["call"], put_exit=result["put"])
+    return result
 
 
 async def _emergency_sell(

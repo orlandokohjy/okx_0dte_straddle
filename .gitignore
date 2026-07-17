@@ -1,4 +1,7 @@
 .env
+# Ignore every per-stack / secret env file, but keep the tracked template.
+.env.*
+!.env.example
 .venv/
 venv/
 __pycache__/

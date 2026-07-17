@@ -1791,6 +1791,7 @@ class OKXExchange:
     async def chase_sell(
         self, instrument: str, qty_btc: float, initial_ask: float,
         deadline_min: Optional[float] = None,
+        opening: bool = False,
     ) -> Optional[dict]:
         """
         Maker-only sell chase with partial-fill tracking and queue-priority
@@ -1803,6 +1804,14 @@ class OKXExchange:
         ``deadline_min`` overrides the default exit-chase budget — used by the
         persistent post-close re-flatten loop to bound each round so it can
         re-read the live position between attempts.
+
+        ``opening`` = True marks this as a SELL-TO-OPEN (writing a wing) rather
+        than reducing a long. It changes ONE thing: on a 51008 "insufficient
+        balance" reject we do NOT taker-flatten (there is no long to flatten —
+        crossing would *open* a short at a bad price). Instead we abort and let
+        the caller decide (the body still covers us, so an unsold wing is
+        simply body-only on that side — never naked). All other behaviour
+        (post_only walk, tick rounding, partial tracking) is identical.
         """
         eff_deadline_min = (
             deadline_min if deadline_min is not None
@@ -2058,7 +2067,15 @@ class OKXExchange:
                     # the taker fee is not tracked in fees_by_ord_id, so
                     # this leg's fee_usd metric may understate on this rare
                     # emergency path — flatten correctness > fee precision.
-                    if sCode == "51008":
+                    if sCode == "51008" and opening:
+                        # Sell-to-open a wing failed on margin. There is no
+                        # long to reduce — taker-crossing would OPEN a short
+                        # at a bad price. Abort this wing; the body still
+                        # covers us. Caller degrades to body-only on this side.
+                        log.warning("chase_sell_open_margin_abort",
+                                    instrument=instrument, sCode=sCode,
+                                    filled_so_far=filled_contracts)
+                    elif sCode == "51008":
                         remaining_now = max(
                             0, target_contracts - filled_contracts)
                         taker = await self._taker_flatten_long(

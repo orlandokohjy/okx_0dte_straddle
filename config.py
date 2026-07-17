@@ -679,6 +679,38 @@ USE_RFQ: bool = os.getenv("USE_RFQ", "false").lower() == "true"
 # giving up and falling back to leg-by-leg chase.
 RFQ_QUOTE_WAIT_SEC: int = int(os.getenv("RFQ_QUOTE_WAIT_SEC", "20"))
 
+# ──────────────────── Iron-fly wings (short overlay) ──────────────
+# When ENABLE_WINGS is true, AFTER the long straddle body is fully filled
+# the algo SELLS two covered wings — turning the plain long straddle into a
+# (broken-wing) long iron butterfly: capped upside, cheaper cost, defined
+# risk. Maker-only, sold LONGS-FIRST on entry and bought back SHORTS-FIRST
+# on close so we are never naked-short.
+#   • short PUT  = WING_PUT_STRIKE_OFFSET adjacent listed strikes BELOW body
+#   • short CALL = WING_CALL_STRIKE_OFFSET adjacent listed strikes ABOVE body
+# Each wing is always COVERED by the body (long call K / long put K), so a
+# partial or one-sided wing fill is a defined spread, never a naked short.
+# Default OFF — with the flag disabled the plain straddle is byte-for-byte
+# unchanged (no wing selection, no extra orders, no state/log changes).
+ENABLE_WINGS: bool = os.getenv("ENABLE_WINGS", "false").lower() == "true"
+WING_PUT_STRIKE_OFFSET: int = int(os.getenv("WING_PUT_STRIKE_OFFSET", "1"))
+WING_CALL_STRIKE_OFFSET: int = int(os.getenv("WING_CALL_STRIKE_OFFSET", "2"))
+# Wing sell-to-open maker-chase budget (minutes). Kept short: an unfilled
+# wing simply means we hold the plain straddle on that side (safe).
+WING_CHASE_DEADLINE_MIN: float = float(
+    os.getenv("WING_CHASE_DEADLINE_MIN", "10.0")
+)
+# Spread gate for a wing (fraction of mid). Wider default than the body
+# because far-OTM 0DTE wings are thinner; a wing exceeding this is skipped
+# (body still trades).
+WING_MAX_ENTRY_SPREAD_PCT: float = float(
+    os.getenv("WING_MAX_ENTRY_SPREAD_PCT", "0.60")
+)
+# Require the body to be FULLY filled before selling any wing. Safety
+# default true — never sell a wing we can't be sure is covered.
+WING_REQUIRE_FILLED_BODY: bool = os.getenv(
+    "WING_REQUIRE_FILLED_BODY", "true",
+).lower() == "true"
+
 # ──────────────────── Risk Management ─────────────────────────────
 MAX_DAILY_LOSS_PCT: float | None = None
 CIRCUIT_BREAKER_API_ERRORS: int = 5
