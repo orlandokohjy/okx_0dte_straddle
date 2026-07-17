@@ -310,11 +310,61 @@ def _format_close_message(
     lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(put_pnl)}")
     lines.append("")
 
+    # ── Wings (short overlay) — rendered only when present ──
+    # A short wing profits when we BUY it back below the credit received,
+    # so leg P&L = credit_in − debit_out (opposite sign of a long leg).
+    call_wing_leg = getattr(s, "call_wing_leg", None)
+    put_wing_leg = getattr(s, "put_wing_leg", None)
+    has_call_wing = call_wing_leg is not None
+    has_put_wing = put_wing_leg is not None
+    has_wings = has_call_wing or has_put_wing
+    if has_wings:
+        f_entry = 1.0 if is_um else entry_spot
+        f_exit = 1.0 if is_um else exit_spot
+        if has_call_wing:
+            e_cw = float(getattr(s, "entry_call_wing_price", 0.0) or 0.0)
+            x_cw = float(getattr(s, "exit_call_wing_price", 0.0) or 0.0)
+            cw_strike = float(getattr(s, "call_wing_strike", 0.0) or 0.0)
+            cw_credit = e_cw * f_entry * qty * num
+            cw_debit = x_cw * f_exit * qty * num
+            cw_pnl = cw_credit - cw_debit
+            lines.append(
+                f"<b>Call wing (short)</b> "
+                f"{getattr(call_wing_leg, 'instrument', '?')}  "
+                f"${cw_strike:,.0f}")
+            lines.append(
+                f"  Sold:   {_fmt_native(e_cw)} "
+                f"({_fmt_signed_usd(cw_credit).lstrip('+')})")
+            lines.append(
+                f"  Bought: {_fmt_native(x_cw)} "
+                f"({_fmt_signed_usd(cw_debit).lstrip('+')})")
+            lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(cw_pnl)}")
+        if has_put_wing:
+            e_pw = float(getattr(s, "entry_put_wing_price", 0.0) or 0.0)
+            x_pw = float(getattr(s, "exit_put_wing_price", 0.0) or 0.0)
+            pw_strike = float(getattr(s, "put_wing_strike", 0.0) or 0.0)
+            pw_credit = e_pw * f_entry * qty * num
+            pw_debit = x_pw * f_exit * qty * num
+            pw_pnl = pw_credit - pw_debit
+            lines.append(
+                f"<b>Put wing (short)</b> "
+                f"{getattr(put_wing_leg, 'instrument', '?')}  "
+                f"${pw_strike:,.0f}")
+            lines.append(
+                f"  Sold:   {_fmt_native(e_pw)} "
+                f"({_fmt_signed_usd(pw_credit).lstrip('+')})")
+            lines.append(
+                f"  Bought: {_fmt_native(x_pw)} "
+                f"({_fmt_signed_usd(pw_debit).lstrip('+')})")
+            lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(pw_pnl)}")
+        lines.append("")
+
     # ── P&L breakdown ──
     # ``fees`` is signed: positive = maker rebate received (credit),
     # negative = fee paid (cost). Label and sign accordingly.
+    gross_note = "(call + put + wings)" if has_wings else "(call + put)"
     lines.append(f"<b>Gross P&amp;L:</b> {_fmt_signed_usd(gross)}  "
-                 f"<i>(call + put)</i>")
+                 f"<i>{gross_note}</i>")
     if fees >= 0:
         lines.append(f"<b>Rebate:</b>    +${fees:,.2f}")
     else:

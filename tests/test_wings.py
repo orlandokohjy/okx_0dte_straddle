@@ -231,6 +231,41 @@ def test_close_is_shorts_first():
         f"SHORTS-FIRST violated: {ex.ops}")
 
 
+# ─────────────── 5. SESSION CLOSE message renders wings ───────────
+
+def test_close_message_renders_wings():
+    from core.notifier import _format_close_message
+    s = _straddle_with_wings(family="UM", qty=0.5, num=1)
+    # simulate a completed close with wing buy-backs recorded
+    s.exit_call_price = 350.0
+    s.exit_put_price = 250.0
+    s.exit_call_wing_price = 60.0
+    s.exit_put_wing_price = 55.0
+    s.gross_pnl = 67.5
+    s.fees = 0.0
+    s.pnl = 67.5
+    msg = _format_close_message(67.5, session_label="13:30-15:30 UTC",
+                                straddle=s)
+    assert "Call wing (short)" in msg
+    assert "Put wing (short)" in msg
+    assert "(call + put + wings)" in msg
+
+
+def test_close_message_no_wings_unchanged():
+    from core.notifier import _format_close_message
+    s = _straddle_with_wings(family="UM", qty=0.5, num=1)
+    s.call_wing_leg = None
+    s.put_wing_leg = None
+    s.exit_call_price = 350.0
+    s.exit_put_price = 250.0
+    s.gross_pnl = 10.0
+    s.fees = 0.0
+    s.pnl = 10.0
+    msg = _format_close_message(10.0, straddle=s)
+    assert "wing" not in msg.lower()
+    assert "(call + put)" in msg
+
+
 # ────────────────────────── runner ────────────────────────────────
 
 if __name__ == "__main__":
