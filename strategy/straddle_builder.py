@@ -517,11 +517,41 @@ async def unwind_straddle(
                  has_put_wing=straddle.has_put_wing)
         wing_exits = await unwind_wings(exchange, market, portfolio, straddle)
 
-    rfq_result = await exchange.send_rfq_sell(
-        straddle.call_leg.instrument,
-        straddle.put_leg.instrument,
-        straddle.call_leg.qty,
-    )
+    # ── SHORTS-FIRST body sell ──────────────────────────────────────────
+    # Never sell a body leg while its covering short wing is still open:
+    # unwind_wings re-read the live book and told us which wings are STILL
+    # short (call_open / put_open). We HOLD those body legs (each long body
+    # covers its short wing) and let the shorts-first post-close reconcile
+    # buy the wing back first, then sell the body. This closes the
+    # naked-short window that existed when a wing buyback failed but the
+    # body sold anyway. Initialise exit prices to entry now so a held or
+    # failed leg gets 0 P&L instead of crashing on missing fields.
+    exit_call_price = straddle.entry_call_price
+    exit_put_price = straddle.entry_put_price
+    defer_call_body = bool(wing_exits.get("call_open"))
+    defer_put_body = bool(wing_exits.get("put_open"))
+    if defer_call_body or defer_put_body:
+        log.warning("body_sell_deferred_wing_open", id=straddle.id,
+                    defer_call=defer_call_body, defer_put=defer_put_body)
+        await notifier.send(
+            f"<b>⛔ HOLDING BODY LEG — WING STILL SHORT</b> [{straddle.id}]\n"
+            f"A short wing did not buy back, so its covering LONG body leg is "
+            f"HELD (not sold) to avoid a naked short. The shorts-first "
+            f"post-close reconcile buys the wing back FIRST, then sells the "
+            f"body.\n"
+            f"Holding call body: {defer_call_body} | "
+            f"put body: {defer_put_body}"
+        )
+
+    # Skip the atomic 2-leg RFQ when deferring — it sells BOTH legs at once,
+    # which would flatten a body leg we must hold as cover.
+    rfq_result = None
+    if not (defer_call_body or defer_put_body):
+        rfq_result = await exchange.send_rfq_sell(
+            straddle.call_leg.instrument,
+            straddle.put_leg.instrument,
+            straddle.call_leg.qty,
+        )
     if rfq_result is not None:
         # Store native exit prices directly — Straddle.call_pnl is
         # family-aware (BTC × spot for CM, USD × 1 for UM).
@@ -532,12 +562,8 @@ async def unwind_straddle(
                  call=exit_call_price, put=exit_put_price,
                  unit=family.native_quote_unit_label())
     else:
-        # ── Concurrent unwind: sell BOTH legs at once ──
-        # Initialise to the entry native prices so a leg that fails to
-        # sell gets a P&L of 0 instead of crashing on missing fields.
-        # Successful chases overwrite below.
-        exit_call_price = straddle.entry_call_price
-        exit_put_price = straddle.entry_put_price
+        # ── Per-leg maker chase: sell ONLY the legs whose covering wing is
+        # closed/absent; a deferred leg is held as cover (result stays None).
 
         _, call_ask = await market.get_option_bid_ask(
             straddle.call_leg.instrument,
@@ -607,17 +633,27 @@ async def unwind_straddle(
                               instrument=symbol, exc_info=True)
                     return None
 
-        call_task = asyncio.create_task(_sell_leg(
-            straddle.call_leg.instrument,
-            straddle.call_leg.qty, call_ask,
-        ), name=f"chase_sell_call_{straddle.id}")
-        put_task = asyncio.create_task(_sell_leg(
-            straddle.put_leg.instrument,
-            straddle.put_leg.qty, put_ask,
-        ), name=f"chase_sell_put_{straddle.id}")
+        call_task = (
+            asyncio.create_task(_sell_leg(
+                straddle.call_leg.instrument,
+                straddle.call_leg.qty, call_ask,
+            ), name=f"chase_sell_call_{straddle.id}")
+            if not defer_call_body else None
+        )
+        put_task = (
+            asyncio.create_task(_sell_leg(
+                straddle.put_leg.instrument,
+                straddle.put_leg.qty, put_ask,
+            ), name=f"chase_sell_put_{straddle.id}")
+            if not defer_put_body else None
+        )
+
+        async def _await_or_none(task):
+            return await task if task is not None else None
 
         results = await asyncio.gather(
-            call_task, put_task, return_exceptions=True,
+            _await_or_none(call_task), _await_or_none(put_task),
+            return_exceptions=True,
         )
         call_result, put_result = results
 
@@ -661,6 +697,9 @@ async def unwind_straddle(
                     f"Residual: {straddle.call_leg.qty - call_filled_btc:.4f} BTC\n"
                     f"post_close_reconcile will flag the orphan."
                 )
+        elif defer_call_body:
+            log.info("call_body_held_as_cover", id=straddle.id,
+                     instrument=straddle.call_leg.instrument)
         else:
             log.warning("call_sell_failed",
                         instrument=straddle.call_leg.instrument)
@@ -703,6 +742,9 @@ async def unwind_straddle(
                     f"Residual: {straddle.put_leg.qty - put_filled_btc:.4f} BTC\n"
                     f"post_close_reconcile will flag the orphan."
                 )
+        elif defer_put_body:
+            log.info("put_body_held_as_cover", id=straddle.id,
+                     instrument=straddle.put_leg.instrument)
         else:
             log.warning("put_sell_failed",
                         instrument=straddle.put_leg.instrument)
@@ -957,8 +999,37 @@ async def unwind_wings(
             f"covers it. Post-close reconcile will buy it back."
         )
 
+    # ── Authoritative "is the short wing STILL open?" verdict ────────────
+    # The caller (unwind_straddle) must NOT sell the covering body leg while
+    # its short wing is still open (shorts-first). A confirmed-flat live read
+    # is the ONLY thing that releases the body; a wing that existed but whose
+    # buyback we can't verify (fetch error / partial) is treated as STILL
+    # OPEN so we err on the side of holding the cover. A side that never had
+    # a wing is False (nothing to cover → body sells normally).
+    call_open = straddle.call_wing_leg is not None
+    put_open = straddle.put_wing_leg is not None
+    try:
+        live = await exchange.list_open_positions()
+        live_amt = {
+            p.get("instrument_name"): float(p.get("amount", 0.0) or 0.0)
+            for p in live
+        }
+        if straddle.call_wing_leg is not None:
+            call_open = live_amt.get(
+                straddle.call_wing_leg.instrument, 0.0) < 0
+        if straddle.put_wing_leg is not None:
+            put_open = live_amt.get(
+                straddle.put_wing_leg.instrument, 0.0) < 0
+    except Exception:
+        log.warning("wing_close_position_recheck_failed", id=straddle.id,
+                    exc_info=True)
+        # keep fail-safe defaults (a wing that existed is assumed still open)
+    result["call_open"] = call_open
+    result["put_open"] = put_open
+
     log.info("wings_unwound", id=straddle.id,
-             call_exit=result["call"], put_exit=result["put"])
+             call_exit=result["call"], put_exit=result["put"],
+             call_open=call_open, put_open=put_open)
     return result
 
 

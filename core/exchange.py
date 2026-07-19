@@ -2319,6 +2319,24 @@ class OKXExchange:
                           qty_btc=qty_btc, px=bid)
                 return {**empty, "order_id": ord_id}
             avg_px = bid
+            # Visibility: a taker cross is the ONE non-maker order the algo
+            # places automatically. It only ever REDUCES an existing long
+            # (position-checked above — never opens/adds a short), and fires
+            # only when a maker sell was rejected with 51008. Surface it so a
+            # taker fill is never silent.
+            try:
+                from core import notifier
+                await notifier.send(
+                    f"<b>⚠️ TAKER FLATTEN (51008 fallback)</b>\n"
+                    f"A maker (post-only) sell was rejected for margin "
+                    f"(51008), so a TAKER sell crossed the bid to REDUCE a "
+                    f"long (position-safe — never opens a short).\n"
+                    f"Symbol: {instrument}\n"
+                    f"Sold: {qty_btc:.4f} BTC @ ${bid:,.4f} (taker)"
+                )
+            except Exception:
+                log.warning("taker_flatten_long_alert_failed",
+                            instrument=instrument, exc_info=True)
             residual_target = long_contracts - want_contracts
             for _ in range(12):  # up to ~60s
                 await asyncio.sleep(5)
