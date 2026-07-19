@@ -410,6 +410,45 @@ fine; httpx self-heals its connection pool. Only intervene if:
 
 ---
 
+## Entry lock — self-healing for orphans (2026-07-19)
+
+Entry locks come in two flavours, centralised through `Algo._set_entry_lock`:
+
+- **Orphan / position locks** (`clearable_when_flat=True`): post-close residual
+  ("RE-FLATTEN EXHAUSTED"), startup-reconcile "exchange has positions but state
+  is empty", and pre-entry "exchange not flat" stacking guard. These
+  **auto-release** on the next session's entry once the exchange is re-queried
+  and confirmed **genuinely flat** — e.g. a worthless 0DTE leg that settled at
+  the 08:00 UTC expiry. **No manual restart needed.** Gated by
+  `SELF_HEAL_LOCK_ON_FLAT` (default **true**); set false to restore the old
+  always-manual behaviour.
+- **Kill-switch locks** (`clearable_when_flat=False`): contract-size mismatch,
+  chase-deadline validation, chase-pricing self-test, UM unit guard,
+  "could not fetch positions", stale-`positions.json` reconcile mismatch, and
+  the consecutive-failure circuit breaker. These **never** auto-clear and still
+  require an operator restart.
+
+Auto-release is **fail-closed**: flag off, non-clearable lock, no creds, a
+fetch error, or ANY live position all keep it latched. This fixed the
+2026-07-18 ETH lockout where a worthless long put (`ETH-USD-260718-1825-P`)
+settled at expiry but the in-memory lock stayed latched for a day. The
+stale-`positions.json` case is deliberately NOT clearable (the exchange is
+already flat there, so a flat-recheck would wrongly release instantly — the
+fault is corrupt local state needing a reset).
+
+## Logs — structured events now persist to file (2026-07-19)
+
+`utils/logging_config.py` routes BOTH structlog events and stdlib records
+(httpx) through `ProcessorFormatter` into stdout AND `logs/algo.log` (the
+host-mounted `./logs` volume). Previously `PrintLoggerFactory` wrote structlog
+events to stdout ONLY, so trade events (`chase_sell_attempt` with `bid=`/`ask=`)
+lived only in `docker logs` and were wiped by every `--force-recreate`. To
+audit a stuck leg now: `grep chase_sell_attempt logs/algo.log`. Orphan /
+reconcile Telegram alerts also now include live `bid`/`ask` + a sellability
+verdict (`_fmt_positions_with_book`).
+
+---
+
 ## When in doubt
 
 - Read this file first.

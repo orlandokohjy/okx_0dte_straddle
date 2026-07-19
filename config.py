@@ -37,6 +37,21 @@ RESET_STATE_ON_BOOT: bool = os.getenv(
     "RESET_STATE_ON_BOOT", "false",
 ).lower() == "true"
 
+# ─────────────── Self-healing entry lock (orphan auto-release) ────────
+# A POSITION/orphan entry-lock (post-close residual, startup or pre-entry
+# "exchange not flat") historically stayed latched until an operator ran
+# force_liquidate + restarted — even after the residual settled on its own
+# (e.g. a worthless 0DTE leg expiring at 08:00 UTC). With this flag on, the
+# entry gate RE-VERIFIES the exchange before skipping a locked session: if it
+# is now genuinely flat, the orphan lock auto-releases and trading resumes —
+# no manual restart. ONLY orphan/position locks are eligible; kill-switch
+# locks (config/self-test/API/stale-state/circuit-breaker) NEVER auto-clear
+# and still require an operator restart. Set false to restore the old
+# always-manual behaviour.
+SELF_HEAL_LOCK_ON_FLAT: bool = os.getenv(
+    "SELF_HEAL_LOCK_ON_FLAT", "true",
+).lower() == "true"
+
 # True iff API credentials are present. Used to gate startup-time auth calls
 # (reconcile, equity sync) independently from DRY_RUN. With creds + DRY_RUN
 # we still validate auth on startup, just don't place orders.
