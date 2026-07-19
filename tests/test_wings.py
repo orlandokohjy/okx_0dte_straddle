@@ -206,6 +206,11 @@ class _FakeExchange:
     async def get_option_iv_batch(self, syms):
         return {}
 
+    async def list_open_positions(self):
+        # After the (successful) wing buy-backs the book is flat, so both
+        # body legs are free to sell.
+        return []
+
 
 def test_close_is_shorts_first():
     from strategy import straddle_builder
@@ -229,6 +234,73 @@ def test_close_is_shorts_first():
     assert buy_idxs, f"expected wing buy-to-close ops, got {ex.ops}"
     assert max(buy_idxs) < first_sell, (
         f"SHORTS-FIRST violated: {ex.ops}")
+
+
+# ─────── 4b. NAKED-SHORT GUARD: hold body leg if wing not closed ──────
+
+class _StuckWingExchange:
+    """Call-wing buy-back FAILS and the book still shows it short; the put
+    wing closes cleanly. The call BODY leg must therefore be HELD (not sold)
+    while the put body sells normally — never a naked short call."""
+    def __init__(self, call_wing_inst: str):
+        self.ops: list[str] = []
+        self._call_wing_inst = call_wing_inst
+
+    async def get_spot_price(self):
+        return 62000.0
+
+    async def send_rfq_sell(self, *a, **k):
+        self.ops.append("RFQ")            # must NOT be used when deferring
+        return None
+
+    async def chase_buy(self, instrument, qty, ref, **k):
+        self.ops.append(f"BUY {instrument}")
+        if instrument == self._call_wing_inst:
+            return None                   # call wing buy-back fails
+        return {"average_price": 55.0, "order_id": "b2",
+                "filled_qty_btc": qty, "fully_filled": True, "metrics": {}}
+
+    async def chase_sell(self, instrument, qty, ref, **k):
+        self.ops.append(f"SELL {instrument}")
+        return {"average_price": 340.0, "order_id": "s2",
+                "filled_qty_btc": qty, "fully_filled": True, "metrics": {}}
+
+    async def get_option_iv_batch(self, syms):
+        return {}
+
+    async def list_open_positions(self):
+        # Call wing is STILL short; everything else is flat.
+        return [{"instrument_name": self._call_wing_inst, "amount": -1.0}]
+
+
+def test_body_leg_held_when_wing_buyback_fails():
+    from strategy import straddle_builder
+
+    tmpdir = tempfile.mkdtemp()
+    config.STATE_DIR = tmpdir
+    config.EQUITY_FILE = os.path.join(tmpdir, "equity.json")
+    config.POSITIONS_FILE = os.path.join(tmpdir, "positions.json")
+    config.TRADE_LOG_FILE = os.path.join(tmpdir, "trade_log.csv")
+
+    pf = Portfolio()
+    s = _straddle_with_wings(family="UM", qty=0.5, num=1)
+    pf.set_straddle(s)
+
+    call_wing_inst = s.call_wing_leg.instrument
+    ex, mk = _StuckWingExchange(call_wing_inst), _FakeMarket()
+    asyncio.run(straddle_builder.unwind_straddle(ex, mk, pf, reason="test"))
+
+    call_body = s.call_leg.instrument
+    put_body = s.put_leg.instrument
+    sells = [o for o in ex.ops if o.startswith("SELL")]
+    # The naked-short guard: the call BODY (covers the stuck short call wing)
+    # must NOT be sold; the put body sells normally.
+    assert f"SELL {call_body}" not in ex.ops, (
+        f"naked-short guard failed — sold covering call body: {ex.ops}")
+    assert f"SELL {put_body}" in ex.ops, (
+        f"put body should still sell: {ex.ops}")
+    # And we must NOT have used the atomic RFQ (it would flatten both legs).
+    assert "RFQ" not in ex.ops, f"RFQ must be skipped when deferring: {ex.ops}"
 
 
 # ─────────────── 5. SESSION CLOSE message renders wings ───────────

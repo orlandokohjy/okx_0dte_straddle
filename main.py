@@ -600,7 +600,15 @@ class Algo:
         compute their window correctly (close_utc + 24h when < entry_utc).
         """
         CLOSE_RACE_BUFFER_MIN = 5.0  # min cushion between chase end and close
-        deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+        # With wings enabled the entry runs the body chase and THEN the wing
+        # chase sequentially, so the worst-case entry duration is the sum.
+        # Validate against that sum or the body wing chase at close could run
+        # past the close cron (2026-07-19 wing deadline review).
+        wing_deadline = (
+            float(config.WING_CHASE_DEADLINE_MIN)
+            if config.ENABLE_WINGS else 0.0
+        )
+        deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN) + wing_deadline
         violations: list[str] = []
         # Disabled sessions don't fire, so their windows can't race the
         # close cron — skip them. This lets an operator surgically
@@ -623,8 +631,14 @@ class Algo:
                     f"configured={deadline:.0f} min"
                 )
         if violations:
+            label = (
+                f"OPTION_ENTRY_CHASE_DEADLINE_MIN"
+                f"+WING_CHASE_DEADLINE_MIN={deadline:.0f}"
+                if wing_deadline > 0
+                else f"OPTION_ENTRY_CHASE_DEADLINE_MIN={deadline:.0f}"
+            )
             return False, (
-                f"OPTION_ENTRY_CHASE_DEADLINE_MIN={deadline:.0f} "
+                f"{label} "
                 f"would race the close cron on: " + "; ".join(violations)
             )
         return True, ""
@@ -1764,11 +1778,23 @@ class Algo:
                 break
             eff_round_min = min(round_min, remaining_min)
 
+            # SHORTS-FIRST: a residual LONG may be a body leg still covering a
+            # residual SHORT wing (held back by unwind_straddle). Selling that
+            # long while the short is open = a naked short. So while ANY short
+            # remains, buy back shorts ONLY and hold every long; longs are sold
+            # only once the round re-read confirms no short is left.
+            shorts_present = any(
+                float(p.get("amount", 0.0)) < 0 for p in positions
+            )
             any_progress = False
             for p in positions:
                 symbol = p.get("instrument_name", "")
                 amt = float(p.get("amount", 0.0))
                 if not symbol or amt == 0:
+                    continue
+                if shorts_present and amt > 0:
+                    log.info("reflatten_hold_long_until_shorts_flat",
+                             instrument=symbol, round=round_no)
                     continue
                 try:
                     bid, ask = await self.market.get_option_bid_ask(symbol)
