@@ -1433,7 +1433,6 @@ class Algo:
                         await build_wings(
                             self.exchange, self.market, self.portfolio,
                             straddle, wings,
-                            chase_deadline_min=chase_deadline_min,
                         )
                     else:
                         log.warning("no_valid_wings_body_only",
