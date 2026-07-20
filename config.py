@@ -482,14 +482,16 @@ def _derive_close(
 def _build_schedule(
     entries: list[tuple[str, int, int]], weekdays: frozenset[int],
 ) -> list[Session]:
-    """Build a list of fixed-coin 2.0-per-leg sessions from (name, h, m)
+    """Build a list of fixed-coin 10.0-per-leg sessions from (name, h, m)
     specs, deriving each close from the next contiguous entry (chained roll)
     or a full 30-min hold (standalone / chain tail).
 
-    NOTE (ETH stack): sizing is fixed 2.0 units of the underlying coin per
-    leg (2 ETH notional when BASE_COIN=ETH). The mode is still named
+    NOTE (ETH stack): sizing is fixed 10.0 units of the underlying coin per
+    leg (10 ETH notional when BASE_COIN=ETH). The mode is still named
     "fixed_btc" for historical reasons — it means fixed-coin notional, not
-    literally BTC. Overridable per session via <NAME>_QTY_PER_LEG in .env."""
+    literally BTC. Overridable per session via <NAME>_QTY_PER_LEG in .env.
+    NOTE: 10 ETH/leg requires MAX_QTY_PER_LEG_BTC >= 10 in .env (else the
+    sizing cap clamps it) and enough subaccount margin to fund the buy."""
     entry_mins = {h * 60 + m for (_, h, m) in entries}
     out: list[Session] = []
     for (name, h, m) in entries:
@@ -501,7 +503,7 @@ def _build_schedule(
             close_utc=_derive_close(h, m, next_entry_min),
             weekdays=weekdays,
             default_sizing_mode="fixed_btc",
-            default_qty_per_leg=2.0,
+            default_qty_per_leg=10.0,
         ))
     return out
 
