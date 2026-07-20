@@ -2053,6 +2053,31 @@ class OKXExchange:
                     continue
 
                 if sCode in FATAL_CODES:
+                    if sCode == "51008" and opening:
+                        # Sell-to-open a wing failed on margin. There is no
+                        # long to reduce — taker-crossing would OPEN a short
+                        # at a bad price. This is an EXPECTED, SAFE outcome:
+                        # abort the wing and let the caller hold the covered
+                        # plain straddle (never naked). Emit a CLEAR wing note
+                        # rather than the generic "non-recoverable" fatal alert
+                        # so it does not read like an account problem.
+                        log.warning("chase_sell_open_margin_abort",
+                                    instrument=instrument, sCode=sCode,
+                                    filled_so_far=filled_contracts)
+                        try:
+                            from core import notifier
+                            await notifier.send(
+                                f"<b>WING NOT OPENED — insufficient margin</b>\n"
+                                f"{instrument}\n"
+                                f"OKX 51008 on sell-to-open. Holding the plain "
+                                f"straddle on this side — covered, never naked. "
+                                f"No action needed; the wing will sell when "
+                                f"there is margin headroom."
+                            )
+                        except Exception:
+                            log.warning("wing_open_abort_alert_failed",
+                                        instrument=instrument, exc_info=True)
+                        break
                     log.error("chase_sell_fatal_reject",
                               instrument=instrument, sCode=sCode, sMsg=sMsg,
                               attempt=attempt, filled_so_far=filled_contracts)
@@ -2067,15 +2092,7 @@ class OKXExchange:
                     # the taker fee is not tracked in fees_by_ord_id, so
                     # this leg's fee_usd metric may understate on this rare
                     # emergency path — flatten correctness > fee precision.
-                    if sCode == "51008" and opening:
-                        # Sell-to-open a wing failed on margin. There is no
-                        # long to reduce — taker-crossing would OPEN a short
-                        # at a bad price. Abort this wing; the body still
-                        # covers us. Caller degrades to body-only on this side.
-                        log.warning("chase_sell_open_margin_abort",
-                                    instrument=instrument, sCode=sCode,
-                                    filled_so_far=filled_contracts)
-                    elif sCode == "51008":
+                    if sCode == "51008":
                         remaining_now = max(
                             0, target_contracts - filled_contracts)
                         taker = await self._taker_flatten_long(
