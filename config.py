@@ -465,14 +465,14 @@ EXPIRY_ROLL_HOUR_UTC: int = 8
 # one calendar day later (Tue-Sat) since they belong to the prior trading
 # day (see EXPIRY_ROLL_HOUR_UTC / _build_schedule).
 #
-# Sizing (signal version): every window is 0.25 BTC/leg and signal-GATED
+# Sizing (signal version): every window is 0.5 BTC/leg and signal-GATED
 # (skip when should_trade != true) EXCEPT the two SIGNAL-SCALED windows
-# below, which never skip — 0.125 BTC floor, upsized to 0.25 BTC only on an
+# below, which never skip — 0.25 BTC floor, upsized to 0.5 BTC only on an
 # explicit should_trade=true. See _WEEKDAY_SIGNAL_SCALED.
 _WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
-    ("wd_1100", 11, 0),    # SIGNAL-SCALED (0.5 → 1.0)
+    ("wd_1100", 11, 0),    # SIGNAL-SCALED (0.25 → 0.5)
     ("wd_1130", 11, 30),
-    ("wd_1200", 12, 0),    # SIGNAL-SCALED (0.5 → 1.0)
+    ("wd_1200", 12, 0),    # SIGNAL-SCALED (0.25 → 0.5)
     ("wd_1300", 13, 0),
     ("wd_1330", 13, 30),
     ("wd_1400", 14, 0),
@@ -485,11 +485,11 @@ _WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
 _WEEKDAY_DAYS: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon-Fri trading days
 
 # Weekday windows that are signal-SCALED (floor + upsize) rather than
-# signal-GATED. Listed twice in the operator's spec → 0.125 BTC floor,
-# 0.25 BTC on an explicit should_trade=true, never skipped.
+# signal-GATED. Listed twice in the operator's spec → 0.25 BTC floor,
+# 0.5 BTC on an explicit should_trade=true, never skipped.
 _WEEKDAY_SIGNAL_SCALED: frozenset[str] = frozenset({"wd_1100", "wd_1200"})
-_WEEKDAY_FULL_QTY: float = 0.25    # BTC/leg full (gated & scaled-upsize) size
-_WEEKDAY_FLOOR_QTY: float = 0.125  # BTC/leg floor for signal-scaled windows
+_WEEKDAY_FULL_QTY: float = 0.5     # BTC/leg full (gated & scaled-upsize) size
+_WEEKDAY_FLOOR_QTY: float = 0.25   # BTC/leg floor for signal-scaled windows
 
 _WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
     ("we_0900", 9, 0),
@@ -612,6 +612,7 @@ SESSIONS: list[Session] = (
     + _build_schedule(
         _WEEKEND_ENTRIES, _WEEKEND_DAYS,
         enabled_default=WEEKEND_TRADING_ENABLED,
+        default_qty_per_leg=0.5,
     )
 )
 
