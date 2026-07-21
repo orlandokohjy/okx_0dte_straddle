@@ -73,20 +73,41 @@ async def _sim_pm(ex, leg_args: list) -> int:
     """
     import json
 
+    # position_builder requires an entry price per leg (avgPx). Optionally
+    # given as INST:SIGNED_CONTRACTS:PX; otherwise auto-fetched from mark.
     sim_pos = []
     for a in leg_args:
-        if ":" not in a:
-            print(f"[sim] bad leg (want INST:SIGNED_CONTRACTS): {a}")
+        parts = a.split(":")
+        if len(parts) < 2:
+            print(f"[sim] bad leg (want INST:SIGNED_CONTRACTS[:PX]): {a}")
             return 3
-        inst, pos = a.rsplit(":", 1)
-        sim_pos.append({"instId": inst, "pos": str(int(float(pos)))})
+        inst = parts[0]
+        pos = parts[1]
+        px = parts[2] if len(parts) > 2 else ""
+        if not px:
+            try:
+                mk = await ex.get_option_mark_price(inst)
+                if not mk:
+                    t = await ex.get_ticker(inst)
+                    bid, ask = float(t.bid or 0.0), float(t.ask or 0.0)
+                    mk = (bid + ask) / 2 if (bid and ask) else (bid or ask)
+                px = str(mk)
+            except Exception as exc:
+                print(f"[sim] could not fetch avgPx for {inst}: {exc}")
+                return 3
+        sim_pos.append({
+            "instId": inst,
+            "pos": str(int(float(pos))),
+            "avgPx": str(px),
+        })
 
     print("=" * 72)
     print("PM POSITION-BUILDER SIMULATION (cross, hypothetical)")
     print("-" * 72)
     for p in sim_pos:
         side = "LONG " if float(p["pos"]) > 0 else "SHORT"
-        print(f"  {side} {p['instId']}  {p['pos']} contracts")
+        print(f"  {side} {p['instId']}  {p['pos']} contracts  "
+              f"@ avgPx={p['avgPx']}")
     print("-" * 72)
 
     try:
