@@ -436,6 +436,32 @@ stale-`positions.json` case is deliberately NOT clearable (the exchange is
 already flat there, so a flat-recheck would wrongly release instantly — the
 fault is corrupt local state needing a reset).
 
+## Post-close re-flatten now TAKER-escalates (2026-07-21)
+
+Maker-only re-flatten could get **permanently stranded**: a dying 0DTE leg
+whose ask sits far above mark means the maker slippage cap
+(`OPTION_CHASE_MAX_SLIPPAGE_FACTOR`, 1.15×mark) never reaches the ask, so
+`chase_buy_cap_hit`/`chase_sell` fires forever, 0 fills, until the 90-min
+budget expires and the account orphan-locks. This burned an hour+ of skipped
+sessions on 2026-07-21 (short call wing `67500-C`, ask 0.0019 vs cap 0.00144).
+
+Fixes in `_flatten_residual_until_flat`:
+- **Taker escalation.** After `CLOSE_FLATTEN_TAKER_AFTER_ROUNDS` (default 2)
+  maker rounds fail to reach flat, the loop CROSSES the spread via
+  `exchange._taker_flatten_long` (sell residual long @ bid) /
+  `_taker_flatten_short` (buy back residual short @ ask). Both are
+  position-safe (re-read live pos, capped → never flip side) and fire a
+  `⚠️ TAKER …` Telegram note. Guarantees flat in seconds instead of churning.
+- **Same-side legs chased CONCURRENTLY** (`asyncio.gather`) so a stuck leg
+  never blocks the other. Shorts-first gate still makes each batch single-sided.
+- **Wing buy-to-close is bounded** by `WING_EXIT_CHASE_DEADLINE_MIN` (default
+  10), NOT the 120-min body-exit budget — a stuck wing buyback used to hang the
+  whole unwind for hours and spawn duplicate chasers on the same leg. The
+  taker-escalating re-flatten is the backstop.
+
+Knobs: `CLOSE_FLATTEN_TAKER_AFTER_ROUNDS` (lower = escalate sooner, pays spread
+more often), `WING_EXIT_CHASE_DEADLINE_MIN`, `CLOSE_FLATTEN_ROUND_MIN`.
+
 ## Logs — structured events now persist to file (2026-07-19)
 
 `utils/logging_config.py` routes BOTH structlog events and stdlib records

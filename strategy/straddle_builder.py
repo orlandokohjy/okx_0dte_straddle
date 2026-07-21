@@ -1036,14 +1036,15 @@ async def unwind_wings(
         if ref_bid <= 0:
             return None
         try:
-            # Same persistent chaser the body gets on exit
-            # (OPTION_EXIT_CHASE_DEADLINE_MIN) instead of the old short
-            # 10-min WING_CHASE_DEADLINE_MIN — keep buying back the short
-            # until filled so we don't leave a residual short for the
-            # post-close reconcile to mop up.
+            # BOUNDED wing buy-to-close budget (WING_EXIT_CHASE_DEADLINE_MIN).
+            # Do NOT use the 120-min body-exit budget here: a stuck wing
+            # buyback would otherwise hang the entire unwind for hours,
+            # block sessions and spawn duplicate chasers on the same leg.
+            # The post-close re-flatten (now TAKER-escalating) is the
+            # backstop that guarantees any residual short is bought back.
             return await exchange.chase_buy(
                 leg.instrument, leg.qty, ref_bid,
-                deadline_min=config.OPTION_EXIT_CHASE_DEADLINE_MIN,
+                deadline_min=config.WING_EXIT_CHASE_DEADLINE_MIN,
             )
         except _TRANSIENT_HTTP_EXCEPTIONS as exc:
             log.warning("wing_buyback_transient", leg=label,

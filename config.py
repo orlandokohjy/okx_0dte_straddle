@@ -664,6 +664,17 @@ CLOSE_FLATTEN_BUDGET_MIN: float = float(
 CLOSE_FLATTEN_ROUND_MIN: float = float(
     os.getenv("CLOSE_FLATTEN_ROUND_MIN", "15.0")
 )
+# TAKER ESCALATION: maker-only can get permanently stranded when the book
+# won't lift our order — a dying 0DTE leg whose ask sits far above mark, so
+# the maker slippage cap (OPTION_CHASE_MAX_SLIPPAGE_FACTOR) never reaches it.
+# After this many maker rounds fail to reach flat, the re-flatten CROSSES the
+# spread (taker) to GUARANTEE the residual closes in seconds instead of
+# churning the whole budget and then orphan-locking. Taker is risk-reducing
+# here (sell a residual long / buy back a residual short), so paying a tick or
+# two is the right trade. Set very high to effectively disable escalation.
+CLOSE_FLATTEN_TAKER_AFTER_ROUNDS: int = int(
+    os.getenv("CLOSE_FLATTEN_TAKER_AFTER_ROUNDS", "2")
+)
 
 # Pre-entry spread gate: skip session if put or call (ask − bid) / mid > this
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(
@@ -698,6 +709,14 @@ WING_CALL_STRIKE_OFFSET: int = int(os.getenv("WING_CALL_STRIKE_OFFSET", "2"))
 # wing simply means we hold the plain straddle on that side (safe).
 WING_CHASE_DEADLINE_MIN: float = float(
     os.getenv("WING_CHASE_DEADLINE_MIN", "10.0")
+)
+# Wing BUY-TO-CLOSE maker-chase budget (minutes). DELIBERATELY BOUNDED — it
+# must NOT inherit the long 120-min body-exit budget, or a stuck wing buyback
+# hangs the whole unwind for hours (blocking sessions, spawning duplicate
+# chasers). Keep it short and let the post-close re-flatten (which now
+# TAKER-escalates) be the backstop that guarantees the short is closed.
+WING_EXIT_CHASE_DEADLINE_MIN: float = float(
+    os.getenv("WING_EXIT_CHASE_DEADLINE_MIN", "10.0")
 )
 # Spread gate for a wing (fraction of mid). Wider default than the body
 # because far-OTM 0DTE wings are thinner; a wing exceeding this is skipped

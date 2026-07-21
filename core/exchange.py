@@ -2385,6 +2385,106 @@ class OKXExchange:
                       instrument=instrument, exc_info=True)
             return empty
 
+    async def _taker_flatten_short(
+        self, instrument: str, max_qty_btc: float,
+    ) -> dict:
+        """PROVEN taker-cross buy-back for a residual SHORT option leg.
+
+        Mirror of ``_taker_flatten_long``: a maker buy-back can be stranded
+        when the ask sits far above mark and the maker slippage cap
+        (OPTION_CHASE_MAX_SLIPPAGE_FACTOR) never reaches it — the dying-0DTE
+        wide-spread case. A TAKER buy that crosses the current ask closes the
+        short IMMEDIATELY.
+
+        POSITION-SAFE: re-reads the live position and buys back only the short
+        actually held (capped at ``max_qty_btc``), so it can NEVER flip us into
+        a long. Returns ``{filled_qty_btc, average_price, order_id}`` —
+        ``filled_qty_btc == 0.0`` when nothing needed buying back. NEVER raises.
+        """
+        empty = {"filled_qty_btc": 0.0, "average_price": 0.0, "order_id": ""}
+        ct_val = config.OKX_CONTRACT_SIZE_BTC
+        try:
+            positions = await self.list_open_positions()
+            target = next(
+                (p for p in positions
+                 if p["instrument_name"] == instrument), None,
+            )
+            amt = 0.0 if target is None else float(target.get("amount", 0.0))
+            short_contracts = -amt if amt < 0 else 0.0
+            if short_contracts < 1.0:
+                log.info("taker_flatten_short_noop", instrument=instrument,
+                         live_amount=amt)
+                return empty
+            cap_contracts = int(round(max(0.0, max_qty_btc) / ct_val))
+            want_contracts = int(min(short_contracts, cap_contracts)) \
+                if cap_contracts > 0 else int(short_contracts)
+            if want_contracts <= 0:
+                return empty
+            ticker = await self.get_ticker(instrument)
+            ask = float(getattr(ticker, "ask", 0.0) or 0.0)
+            if ask <= 0:
+                log.error("taker_flatten_short_no_ask",
+                          instrument=instrument, ask=ask)
+                return empty
+            qty_btc = want_contracts * ct_val
+            log.warning("taker_flatten_short_placing", instrument=instrument,
+                        qty_btc=qty_btc, contracts=want_contracts, px=ask)
+            order = await self._place_limit_order(
+                instrument, "buy", qty_btc, ask, post_only=False,
+            )
+            sCode = str(order.get("sCode") or "")
+            sMsg = str(order.get("sMsg") or "")
+            ord_id = str(order.get("ordId") or "")
+            if sCode not in ("0", ""):
+                log.error("taker_flatten_short_rejected",
+                          instrument=instrument, sCode=sCode, sMsg=sMsg,
+                          qty_btc=qty_btc, px=ask)
+                return {**empty, "order_id": ord_id}
+            avg_px = ask
+            try:
+                from core import notifier
+                await notifier.send(
+                    f"<b>⚠️ TAKER BUY-BACK (flatten)</b>\n"
+                    f"A maker buy-back could not lift the ask, so a TAKER buy "
+                    f"crossed it to CLOSE a short (position-safe — never opens "
+                    f"a long).\n"
+                    f"Symbol: {instrument}\n"
+                    f"Bought: {qty_btc:.4f} BTC @ ${ask:,.4f} (taker)"
+                )
+            except Exception:
+                log.warning("taker_flatten_short_alert_failed",
+                            instrument=instrument, exc_info=True)
+            residual_target = -(short_contracts - want_contracts)
+            for _ in range(12):  # up to ~60s
+                await asyncio.sleep(5)
+                try:
+                    status = await self.get_order_status(instrument, ord_id)
+                    px = self._f(status, "avgPx", default=0.0)
+                    if px > 0:
+                        avg_px = px
+                except Exception:
+                    pass
+                try:
+                    pos_now = await self.list_open_positions()
+                    live = next(
+                        (p for p in pos_now
+                         if p["instrument_name"] == instrument), None,
+                    )
+                    remaining = 0.0 if live is None else float(
+                        live.get("amount", 0.0))
+                    if remaining >= residual_target - 1e-9:
+                        break
+                except Exception:
+                    pass
+            log.warning("taker_flatten_short_done", instrument=instrument,
+                        qty_btc=qty_btc, avg_px=avg_px, ord_id=ord_id)
+            return {"filled_qty_btc": qty_btc, "average_price": avg_px,
+                    "order_id": ord_id}
+        except Exception:
+            log.error("taker_flatten_short_exception",
+                      instrument=instrument, exc_info=True)
+            return empty
+
     # ──────────────────── RFQ (Block Trading) ─────────────────────
     #
     # OKX Block Trading API:

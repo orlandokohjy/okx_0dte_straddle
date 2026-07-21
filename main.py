@@ -1628,14 +1628,30 @@ class Algo:
                 float(p.get("amount", 0.0)) < 0 for p in positions
             )
 
+            # TAKER ESCALATION: once maker rounds have failed to reach flat,
+            # stop chasing maker (which can be stranded forever when the book
+            # won't lift a capped order) and CROSS the spread to guarantee the
+            # residual closes. Risk-reducing on both sides (sell long / buy
+            # back short), still shorts-first via the gate below.
+            use_taker = round_no > config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS
+
             async def _chase_leg(symbol: str, amt: float):
-                """Chase ONE residual leg for this round. Longs → maker sell,
-                shorts → maker buy-back. Returns the chase result or None."""
+                """Close ONE residual leg for this round. Longs → sell,
+                shorts → buy-back. Maker chase for the first rounds, then
+                taker-cross once ``use_taker``. Returns result or None."""
                 try:
+                    if use_taker:
+                        if amt > 0:
+                            log.warning("reflatten_taker_escalate_long",
+                                        instrument=symbol, round=round_no)
+                            return await self.exchange._taker_flatten_long(
+                                symbol, amt * ct)
+                        log.warning("reflatten_taker_escalate_short",
+                                    instrument=symbol, round=round_no)
+                        return await self.exchange._taker_flatten_short(
+                            symbol, abs(amt) * ct)
+
                     bid, ask = await self.market.get_option_bid_ask(symbol)
-                except Exception:
-                    bid = ask = 0.0
-                try:
                     if amt > 0:
                         if ask <= 0:
                             log.info("reflatten_skip_no_ask",
