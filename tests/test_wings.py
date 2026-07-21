@@ -338,6 +338,23 @@ def test_close_message_no_wings_unchanged():
     assert "(call + put)" in msg
 
 
+def test_close_message_unfilled_wing_shows_open_not_phantom_pnl():
+    from core.notifier import _format_close_message
+    s = _straddle_with_wings(family="UM", qty=1.0, num=1)
+    s.exit_call_price = 350.0
+    s.exit_put_price = 250.0
+    # Call wing bought back; PUT wing buy-back FAILED (exit price stays None).
+    s.exit_call_wing_price = 60.0
+    s.exit_put_wing_price = None
+    s.gross_pnl = 5.0
+    s.fees = 0.0
+    s.pnl = 5.0
+    msg = _format_close_message(5.0, straddle=s)
+    # The unfilled put wing must NOT render its full credit as realised P&L.
+    assert "STILL OPEN" in msg
+    assert "unrealised" in msg
+
+
 def test_iron_fly_entry_summary_renders_both_sides():
     from strategy.straddle_builder import _format_iron_fly_entry
     s = _straddle_with_wings(family="CM", qty=1.0, num=1)

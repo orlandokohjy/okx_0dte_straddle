@@ -323,11 +323,9 @@ def _format_close_message(
         f_exit = 1.0 if is_um else exit_spot
         if has_call_wing:
             e_cw = float(getattr(s, "entry_call_wing_price", 0.0) or 0.0)
-            x_cw = float(getattr(s, "exit_call_wing_price", 0.0) or 0.0)
+            x_cw_raw = getattr(s, "exit_call_wing_price", None)
             cw_strike = float(getattr(s, "call_wing_strike", 0.0) or 0.0)
             cw_credit = e_cw * f_entry * qty * num
-            cw_debit = x_cw * f_exit * qty * num
-            cw_pnl = cw_credit - cw_debit
             lines.append(
                 f"<b>Call wing (short)</b> "
                 f"{getattr(call_wing_leg, 'instrument', '?')}  "
@@ -335,17 +333,24 @@ def _format_close_message(
             lines.append(
                 f"  Sold:   {_fmt_native(e_cw)} "
                 f"({_fmt_signed_usd(cw_credit).lstrip('+')})")
-            lines.append(
-                f"  Bought: {_fmt_native(x_cw)} "
-                f"({_fmt_signed_usd(cw_debit).lstrip('+')})")
-            lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(cw_pnl)}")
+            if x_cw_raw is None:
+                # Buy-back did NOT complete — position still open. Booked P&L
+                # is 0 (neutral) until the reconcile/settlement closes it; do
+                # NOT render the credit as realised profit.
+                lines.append("  Bought: — (STILL OPEN — buy-back pending)")
+                lines.append("  Leg P&amp;L: unrealised (reconcile/settlement)")
+            else:
+                cw_debit = float(x_cw_raw) * f_exit * qty * num
+                lines.append(
+                    f"  Bought: {_fmt_native(float(x_cw_raw))} "
+                    f"({_fmt_signed_usd(cw_debit).lstrip('+')})")
+                lines.append(
+                    f"  Leg P&amp;L: {_fmt_signed_usd(cw_credit - cw_debit)}")
         if has_put_wing:
             e_pw = float(getattr(s, "entry_put_wing_price", 0.0) or 0.0)
-            x_pw = float(getattr(s, "exit_put_wing_price", 0.0) or 0.0)
+            x_pw_raw = getattr(s, "exit_put_wing_price", None)
             pw_strike = float(getattr(s, "put_wing_strike", 0.0) or 0.0)
             pw_credit = e_pw * f_entry * qty * num
-            pw_debit = x_pw * f_exit * qty * num
-            pw_pnl = pw_credit - pw_debit
             lines.append(
                 f"<b>Put wing (short)</b> "
                 f"{getattr(put_wing_leg, 'instrument', '?')}  "
@@ -353,10 +358,16 @@ def _format_close_message(
             lines.append(
                 f"  Sold:   {_fmt_native(e_pw)} "
                 f"({_fmt_signed_usd(pw_credit).lstrip('+')})")
-            lines.append(
-                f"  Bought: {_fmt_native(x_pw)} "
-                f"({_fmt_signed_usd(pw_debit).lstrip('+')})")
-            lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(pw_pnl)}")
+            if x_pw_raw is None:
+                lines.append("  Bought: — (STILL OPEN — buy-back pending)")
+                lines.append("  Leg P&amp;L: unrealised (reconcile/settlement)")
+            else:
+                pw_debit = float(x_pw_raw) * f_exit * qty * num
+                lines.append(
+                    f"  Bought: {_fmt_native(float(x_pw_raw))} "
+                    f"({_fmt_signed_usd(pw_debit).lstrip('+')})")
+                lines.append(
+                    f"  Leg P&amp;L: {_fmt_signed_usd(pw_credit - pw_debit)}")
         lines.append("")
 
     # ── P&L breakdown ──

@@ -781,6 +781,38 @@ async def unwind_straddle(
     return pnl
 
 
+async def _alert_wing_entry_shortfall(
+    straddle_id: str, leg: str, symbol: str,
+    filled_btc: float, target_btc: float,
+) -> None:
+    """Telegram alert when a wing SELL fills only partially on entry. The
+    filled portion is covered by the long body; the unfilled remainder just
+    leaves that side less-winged (smaller credit, less upside cap)."""
+    if filled_btc + 1e-9 >= target_btc:
+        return
+    await notifier.send(
+        f"<b>⚠️ {leg} WING PARTIAL (entry)</b> [{straddle_id}]\n"
+        f"{symbol}\n"
+        f"Sold {filled_btc:.4f} of {target_btc:.4f} BTC "
+        f"({(filled_btc / target_btc * 100 if target_btc else 0):.0f}%). "
+        f"Filled part is covered by the long body; the rest is simply "
+        f"un-winged on this side (never naked)."
+    )
+
+
+async def _alert_wing_not_sold(
+    straddle_id: str, leg: str, symbol: str,
+) -> None:
+    """Telegram alert when a wing SELL does not fill at all on entry (deadline
+    hit / no fill). The body is long-only on this side — covered, never naked."""
+    await notifier.send(
+        f"<b>⚠️ {leg} WING NOT SOLD (entry)</b> [{straddle_id}]\n"
+        f"{symbol}\n"
+        f"No fill within the chase deadline — this side is body-only "
+        f"(long straddle leg, covered, never naked). No wing credit here."
+    )
+
+
 async def build_wings(
     exchange: OKXExchange,
     market: MarketData,
@@ -804,9 +836,13 @@ async def build_wings(
 
     # Wing qty matches the body leg qty (one wing per straddle unit).
     total_qty = straddle.call_leg.qty
+    # Give the wing SELL the same persistent chaser the body gets on entry
+    # (OPTION_ENTRY_CHASE_DEADLINE_MIN) rather than the old short 10-min
+    # WING_CHASE_DEADLINE_MIN, so a short wing keeps retrying to fill in full
+    # instead of giving up early and leaving a partial.
     deadline = (
         chase_deadline_min if chase_deadline_min is not None
-        else config.WING_CHASE_DEADLINE_MIN
+        else config.OPTION_ENTRY_CHASE_DEADLINE_MIN
     )
 
     async def _sell_wing(wing: Optional[WingLeg], label: str):
@@ -872,6 +908,15 @@ async def build_wings(
                 leg="CALL WING (short)", side="entry",
                 straddle_id=straddle.id,
                 symbol=wings.call.option.symbol, result=call_res))
+            await _alert_wing_entry_shortfall(
+                straddle.id, "CALL", wings.call.option.symbol,
+                filled_btc, total_qty)
+        else:
+            await _alert_wing_not_sold(
+                straddle.id, "CALL", wings.call.option.symbol)
+    elif wings.call is not None:
+        await _alert_wing_not_sold(
+            straddle.id, "CALL", wings.call.option.symbol)
 
     if put_res and wings.put is not None:
         px = float(put_res.get("average_price", 0.0))
@@ -889,6 +934,15 @@ async def build_wings(
                 leg="PUT WING (short)", side="entry",
                 straddle_id=straddle.id,
                 symbol=wings.put.option.symbol, result=put_res))
+            await _alert_wing_entry_shortfall(
+                straddle.id, "PUT", wings.put.option.symbol,
+                filled_btc, total_qty)
+        else:
+            await _alert_wing_not_sold(
+                straddle.id, "PUT", wings.put.option.symbol)
+    elif wings.put is not None:
+        await _alert_wing_not_sold(
+            straddle.id, "PUT", wings.put.option.symbol)
 
     portfolio.set_straddle(straddle)
     log.info("wings_built", id=straddle.id,
@@ -982,9 +1036,14 @@ async def unwind_wings(
         if ref_bid <= 0:
             return None
         try:
+            # Same persistent chaser the body gets on exit
+            # (OPTION_EXIT_CHASE_DEADLINE_MIN) instead of the old short
+            # 10-min WING_CHASE_DEADLINE_MIN — keep buying back the short
+            # until filled so we don't leave a residual short for the
+            # post-close reconcile to mop up.
             return await exchange.chase_buy(
                 leg.instrument, leg.qty, ref_bid,
-                deadline_min=config.WING_CHASE_DEADLINE_MIN,
+                deadline_min=config.OPTION_EXIT_CHASE_DEADLINE_MIN,
             )
         except _TRANSIENT_HTTP_EXCEPTIONS as exc:
             log.warning("wing_buyback_transient", leg=label,

@@ -591,10 +591,12 @@ class Algo:
         CLOSE_RACE_BUFFER_MIN = 5.0  # min cushion between chase end and close
         # With wings enabled the entry runs the body chase and THEN the wing
         # chase sequentially, so the worst-case entry duration is the sum.
-        # Validate against that sum or the body wing chase at close could run
-        # past the close cron (2026-07-19 wing deadline review).
+        # The wing SELL now uses the SAME deadline as the body entry chase
+        # (OPTION_ENTRY_CHASE_DEADLINE_MIN) — persistent retry — so the
+        # worst-case entry is 2× that. Validate the sum or the wing chase
+        # could run past the close cron (2026-07-21 wing chaser unification).
         wing_deadline = (
-            float(config.WING_CHASE_DEADLINE_MIN)
+            float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
             if config.ENABLE_WINGS else 0.0
         )
         deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN) + wing_deadline
@@ -621,8 +623,7 @@ class Algo:
                 )
         if violations:
             label = (
-                f"OPTION_ENTRY_CHASE_DEADLINE_MIN"
-                f"+WING_CHASE_DEADLINE_MIN={deadline:.0f}"
+                f"OPTION_ENTRY_CHASE_DEADLINE_MIN×2 (body+wing)={deadline:.0f}"
                 if wing_deadline > 0
                 else f"OPTION_ENTRY_CHASE_DEADLINE_MIN={deadline:.0f}"
             )
