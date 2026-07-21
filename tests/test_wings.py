@@ -338,6 +338,28 @@ def test_close_message_no_wings_unchanged():
     assert "(call + put)" in msg
 
 
+def test_iron_fly_entry_summary_renders_both_sides():
+    from strategy.straddle_builder import _format_iron_fly_entry
+    s = _straddle_with_wings(family="CM", qty=1.0, num=1)
+    s.entry_spot_price = 64085.0
+    msg = _format_iron_fly_entry(s)
+    assert "IRON FLY ENTERED" in msg
+    assert "LONG body" in msg
+    assert "SHORT wings" in msg
+    assert "Call wing" in msg and "Put wing" in msg
+    assert "Net entry" in msg
+
+
+def test_iron_fly_entry_summary_marks_missing_wing():
+    from strategy.straddle_builder import _format_iron_fly_entry
+    s = _straddle_with_wings(family="CM", qty=1.0, num=1)
+    s.entry_spot_price = 64085.0
+    s.call_wing_leg = None  # one side degraded to body-only
+    msg = _format_iron_fly_entry(s)
+    assert "not sold" in msg
+    assert "Put wing" in msg
+
+
 # ────────────────────────── runner ────────────────────────────────
 
 if __name__ == "__main__":

@@ -897,14 +897,67 @@ async def build_wings(
              call_credit=straddle.entry_call_wing_price,
              put_credit=straddle.entry_put_wing_price)
     if straddle.has_wings:
-        await notifier.send(
-            f"<b>WINGS SOLD</b> [{straddle.id}]\n"
-            f"Structure is now a covered iron fly.\n"
-            f"Call wing: "
-            f"{('$%.0f' % straddle.call_wing_strike) if straddle.has_call_wing else '—'}\n"
-            f"Put wing:  "
-            f"{('$%.0f' % straddle.put_wing_strike) if straddle.has_put_wing else '—'}"
-        )
+        await notifier.send(_format_iron_fly_entry(straddle))
+
+
+def _format_iron_fly_entry(straddle: Straddle) -> str:
+    """Consolidated ENTRY summary of the full 4-leg iron fly: the LONG body
+    (debit paid) and the SHORT wings (credit received), with per-leg premiums
+    and the net entry debit. Family-aware USD (CM: premium×spot, UM: premium).
+    Makes the direction of every leg explicit (LONG body / SHORT wings)."""
+    spot = straddle.entry_spot_price
+    is_um = straddle._is_um()
+    unit = "USD" if is_um else "BTC"      # native premium quote unit
+
+    def _usd(qty: float, px: float) -> float:
+        mult = 1.0 if is_um else (spot if spot > 0 else 0.0)
+        return qty * px * mult
+
+    body_call = _usd(straddle.call_leg.qty, straddle.entry_call_price)
+    body_put = _usd(straddle.put_leg.qty, straddle.entry_put_price)
+    body_debit = body_call + body_put
+
+    lines = [
+        f"<b>🦋 IRON FLY ENTERED</b> [{straddle.id}] [{straddle.family or 'CM'}]",
+    ]
+    if spot > 0:
+        lines.append(f"Spot @ entry: ${spot:,.0f}")
+    lines.append("")
+    lines.append("<b>LONG body</b> (debit paid):")
+    lines.append(
+        f"  • Call ${straddle.strike:,.0f}  {straddle.entry_call_price:g} "
+        f"{unit}  ×{straddle.call_leg.qty:.4f} BTC  = ${body_call:,.2f}")
+    lines.append(
+        f"  • Put  ${straddle.strike:,.0f}  {straddle.entry_put_price:g} "
+        f"{unit}  ×{straddle.put_leg.qty:.4f} BTC  = ${body_put:,.2f}")
+
+    wing_credit = 0.0
+    lines.append("<b>SHORT wings</b> (credit received):")
+    if straddle.has_call_wing:
+        c = _usd(straddle.call_wing_leg.qty, straddle.entry_call_wing_price)
+        wing_credit += c
+        lines.append(
+            f"  • Call wing ${straddle.call_wing_strike:,.0f}  "
+            f"{straddle.entry_call_wing_price:g} {unit}  "
+            f"×{straddle.call_wing_leg.qty:.4f} BTC  = ${c:,.2f}")
+    else:
+        lines.append("  • Call wing — not sold (body-only, covered)")
+    if straddle.has_put_wing:
+        p = _usd(straddle.put_wing_leg.qty, straddle.entry_put_wing_price)
+        wing_credit += p
+        lines.append(
+            f"  • Put wing  ${straddle.put_wing_strike:,.0f}  "
+            f"{straddle.entry_put_wing_price:g} {unit}  "
+            f"×{straddle.put_wing_leg.qty:.4f} BTC  = ${p:,.2f}")
+    else:
+        lines.append("  • Put wing  — not sold (body-only, covered)")
+
+    net = body_debit - wing_credit
+    lines.append("")
+    lines.append(f"Body debit:  ${body_debit:,.2f}")
+    lines.append(f"Wing credit: ${wing_credit:,.2f}")
+    lines.append(f"<b>Net entry:  ${net:,.2f} debit</b>")
+    return "\n".join(lines)
 
 
 async def unwind_wings(
