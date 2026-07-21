@@ -918,7 +918,7 @@ def _format_iron_fly_entry(straddle: Straddle) -> str:
     body_debit = body_call + body_put
 
     lines = [
-        f"<b>🦋 IRON FLY ENTERED</b> [{straddle.id}] [{straddle.family or 'CM'}]",
+        f"<b>IRON FLY ENTERED</b> [{straddle.id}] [{straddle.family or 'CM'}]",
     ]
     if spot > 0:
         lines.append(f"Spot @ entry: ${spot:,.0f}")
