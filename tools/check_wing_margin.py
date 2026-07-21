@@ -49,17 +49,121 @@ _ACCT_LV = {
 }
 
 
+def _fmt_margin_fields(obj: dict) -> list[str]:
+    """Pull any margin-ish fields (imr/mmr/mr/eq) out of a position-builder
+    row, USD-equivalent. Keys vary by SDK version, so match loosely."""
+    out = []
+    for k, v in obj.items():
+        kl = k.lower()
+        if any(t in kl for t in ("imr", "mmr", "margin", "mr", "eq")) \
+                and not isinstance(v, (list, dict)):
+            try:
+                out.append(f"    {k:<16}: {float(v):,.2f}")
+            except (TypeError, ValueError):
+                out.append(f"    {k:<16}: {v}")
+    return out
+
+
+async def _sim_pm(ex, leg_args: list) -> int:
+    """Simulate a CROSS portfolio under Portfolio Margin and print its margin.
+
+    Each leg arg is ``instId:signedContracts`` (+long / -short). This is a
+    pure hypothetical (inclRealPosAndEq=False) so it shows the PM margin of
+    the intended iron fly independent of current messy state.
+    """
+    import json
+
+    sim_pos = []
+    for a in leg_args:
+        if ":" not in a:
+            print(f"[sim] bad leg (want INST:SIGNED_CONTRACTS): {a}")
+            return 3
+        inst, pos = a.rsplit(":", 1)
+        sim_pos.append({"instId": inst, "pos": str(int(float(pos)))})
+
+    print("=" * 72)
+    print("PM POSITION-BUILDER SIMULATION (cross, hypothetical)")
+    print("-" * 72)
+    for p in sim_pos:
+        side = "LONG " if float(p["pos"]) > 0 else "SHORT"
+        print(f"  {side} {p['instId']}  {p['pos']} contracts")
+    print("-" * 72)
+
+    try:
+        resp = await ex._call(
+            ex._account.position_builder,
+            inclRealPosAndEq=False,
+            simPos=sim_pos,
+        )
+    except Exception as exc:
+        print(f"[sim] position_builder call failed: {exc}")
+        return 3
+
+    if str(resp.get("code")) != "0":
+        print(f"[sim] OKX error code={resp.get('code')} "
+              f"msg={resp.get('msg')}")
+        # still dump any data
+    rows = ex._data_or_empty(resp)
+    if not rows:
+        print("[sim] empty response — raw below:")
+        print(json.dumps(resp, indent=2)[:2000])
+        return 0
+
+    top = rows[0]
+    print("PORTFOLIO MARGIN (USD-equivalent):")
+    for line in _fmt_margin_fields(top):
+        print(line)
+    # per-risk-unit detail if present
+    for key in ("riskUnitData", "marginBalance", "assetsData"):
+        val = top.get(key)
+        if isinstance(val, list) and val:
+            print(f"  {key}:")
+            for ru in val[:6]:
+                ident = ru.get("riskUnit") or ru.get("ccy") or "?"
+                print(f"    • {ident}")
+                for line in _fmt_margin_fields(ru):
+                    print("    " + line.strip())
+
+    # Compare to free equity so the verdict is obvious.
+    try:
+        bal = ex._data_or_empty(
+            await ex._call(ex._account.get_account_balance))
+        avail_eq = ex._f(bal[0], "availEq") if bal else 0.0
+        print("-" * 72)
+        print(f"  availEq (free, USD): ${avail_eq:,.2f}")
+        print("  If total IMR above << availEq, the covered fly fits under PM.")
+    except Exception:
+        pass
+    print("=" * 72)
+    print("Full raw response (for exact fields):")
+    print(json.dumps(rows, indent=2)[:3000])
+    return 0
+
+
 async def _run() -> int:
     if not config.HAS_OKX_CREDS:
         print("[check_wing_margin] No OKX credentials configured. Aborting.")
         return 2
 
+    ex = OKXExchange()
+    ex.connect()
+
+    # ── PM position-builder simulation ────────────────────────────────────
+    # For PM accounts OKX blocks the simple max-size endpoint (59202) because
+    # margin is computed holistically. The position-builder simulates a whole
+    # CROSS portfolio and returns its real PM margin, so we can prove the
+    # covered iron fly (long body offsets short wings) fits BEFORE flipping
+    # OKX_TD_MODE=cross. Usage:
+    #   check_wing_margin.py --sim INST:SIGNED_CONTRACTS [INST:SIGNED ...]
+    #   e.g. --sim BTC-...-64000-C:100 BTC-...-64000-P:100 \
+    #             BTC-...-65400-C:-100 BTC-...-63500-P:-100
+    # (+contracts = long, -contracts = short; 100 contracts = 1.0 BTC.)
+    if len(sys.argv) > 1 and sys.argv[1] == "--sim":
+        return await _sim_pm(ex, sys.argv[2:])
+
     inst = sys.argv[1] if len(sys.argv) > 1 else ""
     qty_btc = float(sys.argv[2]) if len(sys.argv) > 2 else float(
         config.QTY_PER_LEG)
-
-    ex = OKXExchange()
-    ex.connect()
 
     # ── 1) Account MODE + autoborrow (settles "can I even sell in this mode") ─
     try:
