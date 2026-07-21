@@ -1627,7 +1627,41 @@ class Algo:
             shorts_present = any(
                 float(p.get("amount", 0.0)) < 0 for p in positions
             )
-            any_progress = False
+
+            async def _chase_leg(symbol: str, amt: float):
+                """Chase ONE residual leg for this round. Longs → maker sell,
+                shorts → maker buy-back. Returns the chase result or None."""
+                try:
+                    bid, ask = await self.market.get_option_bid_ask(symbol)
+                except Exception:
+                    bid = ask = 0.0
+                try:
+                    if amt > 0:
+                        if ask <= 0:
+                            log.info("reflatten_skip_no_ask",
+                                     instrument=symbol, round=round_no)
+                            return None
+                        return await self.exchange.chase_sell(
+                            symbol, amt * ct, ask, deadline_min=eff_round_min,
+                        )
+                    if bid <= 0:
+                        log.info("reflatten_skip_no_bid",
+                                 instrument=symbol, round=round_no)
+                        return None
+                    return await self.exchange.chase_buy(
+                        symbol, abs(amt) * ct, bid, deadline_min=eff_round_min,
+                    )
+                except Exception:
+                    log.warning("reflatten_chase_error", instrument=symbol,
+                                round=round_no, exc_info=True)
+                    return None
+
+            # Fire every ELIGIBLE same-side leg CONCURRENTLY (a stuck maker
+            # order on one leg must not block the other). The shorts-first
+            # gate above guarantees the concurrent batch is single-sided:
+            # shorts-only while any short is open, longs-only once flat — so
+            # concurrency never opens a naked-short window.
+            tasks = []
             for p in positions:
                 symbol = p.get("instrument_name", "")
                 amt = float(p.get("amount", 0.0))
@@ -1637,38 +1671,15 @@ class Algo:
                     log.info("reflatten_hold_long_until_shorts_flat",
                              instrument=symbol, round=round_no)
                     continue
-                try:
-                    bid, ask = await self.market.get_option_bid_ask(symbol)
-                except Exception:
-                    bid = ask = 0.0
-                try:
-                    if amt > 0:
-                        # Long residual → maker sell the remaining qty.
-                        if ask <= 0:
-                            log.info("reflatten_skip_no_ask",
-                                     instrument=symbol, round=round_no)
-                            continue
-                        res = await self.exchange.chase_sell(
-                            symbol, amt * ct, ask,
-                            deadline_min=eff_round_min,
-                        )
-                    else:
-                        # Short residual (defensive — e.g. a prior oversell)
-                        # → maker buy back the remaining qty.
-                        if bid <= 0:
-                            log.info("reflatten_skip_no_bid",
-                                     instrument=symbol, round=round_no)
-                            continue
-                        res = await self.exchange.chase_buy(
-                            symbol, abs(amt) * ct, bid,
-                            deadline_min=eff_round_min,
-                        )
-                except Exception:
-                    log.warning("reflatten_chase_error", instrument=symbol,
-                                round=round_no, exc_info=True)
-                    res = None
-                if res:
-                    any_progress = True
+                tasks.append(_chase_leg(symbol, amt))
+
+            any_progress = False
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                any_progress = any(
+                    (r is not None and not isinstance(r, BaseException))
+                    for r in results
+                )
 
             try:
                 positions = await self.exchange.list_open_positions()
