@@ -462,6 +462,34 @@ Fixes in `_flatten_residual_until_flat`:
 Knobs: `CLOSE_FLATTEN_TAKER_AFTER_ROUNDS` (lower = escalate sooner, pays spread
 more often), `WING_EXIT_CHASE_DEADLINE_MIN`, `CLOSE_FLATTEN_ROUND_MIN`.
 
+## Close is now TWO-PHASE — no SESSION CLOSE until confirmed flat (2026-07-21)
+
+Previously `unwind_straddle` initialised `exit_call_price`/`exit_put_price` to
+the ENTRY prices and then called `close_straddle` UNCONDITIONALLY — so if a body
+sell failed (or was held to cover an open wing), it still booked the trade with
+entry-as-exit (≈0 leg P&L), logged it, marked the straddle **closed**, and
+emitted the SESSION CLOSE summary — while the legs were still open. The open
+legs then showed up as the "residual/orphan". (Equity self-corrected via the
+post-close `sync_equity`, but the summary, trade-log row, and closed-state were
+phantom.)
+
+Now the close is **two-phase**:
+- **Phase 1 (unwind):** sell body / buy back wings, recording each REAL fill via
+  `Straddle.record_exit_fill(instrument, price)` (runtime-only, not persisted).
+  Then re-read the live book (`_own_legs_flat`, checks only THIS straddle's
+  legs). If flat → finalize now (as before). If **not** flat → **DEFER**: leave
+  the straddle `open`, send `⏳ UNWIND INCOMPLETE — FINALIZING AFTER RE-FLATTEN`,
+  return 0.0. `hard_close` skips `notify_close` when `has_open` is still True.
+- **Phase 2 (`_on_close`, after the re-flatten):** if the straddle is still open,
+  `_finalize_deferred_close` books it with the exit fills captured during unwind
+  AND the re-flatten (`_flatten_residual_until_flat` records fills into the open
+  straddle), re-syncs equity from the wallet, and sends the real SESSION CLOSE.
+
+Safety: finalize runs whether the re-flatten reached flat OR exhausted
+(orphan-locked), so the straddle is **never left open** (which would block every
+future entry). Legs with no recorded fill fall back to the entry price (≈0 leg
+P&L / "unrealised"); the equity delta is the honest headline.
+
 ## Logs — structured events now persist to file (2026-07-19)
 
 `utils/logging_config.py` routes BOTH structlog events and stdlib records

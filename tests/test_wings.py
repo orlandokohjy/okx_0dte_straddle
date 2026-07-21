@@ -234,6 +234,9 @@ def test_close_is_shorts_first():
     assert buy_idxs, f"expected wing buy-to-close ops, got {ex.ops}"
     assert max(buy_idxs) < first_sell, (
         f"SHORTS-FIRST violated: {ex.ops}")
+    # Exchange is flat (list_open_positions == []), so the two-phase finalize
+    # must BOOK the close: straddle is no longer open.
+    assert not pf.has_open, "flat exchange must finalize the close"
 
 
 # ─────── 4b. NAKED-SHORT GUARD: hold body leg if wing not closed ──────
@@ -301,6 +304,80 @@ def test_body_leg_held_when_wing_buyback_fails():
         f"put body should still sell: {ex.ops}")
     # And we must NOT have used the atomic RFQ (it would flatten both legs).
     assert "RFQ" not in ex.ops, f"RFQ must be skipped when deferring: {ex.ops}"
+
+
+# ───── 4c. TWO-PHASE FINALIZE: defer the close while a leg is open ────
+
+class _PartialBodyExchange:
+    """The put body sells, but the CALL body sell fails and the live book
+    still shows it long. The unwind must DEFER finalization (leave the
+    straddle open) rather than book a phantom close with an entry-price
+    exit — the exact bug behind 'SESSION CLOSE with P&L while legs open'."""
+    def __init__(self, stuck_inst: str):
+        self.ops: list[str] = []
+        self._stuck = stuck_inst
+
+    async def get_spot_price(self):
+        return 62000.0
+
+    async def send_rfq_sell(self, *a, **k):
+        return None
+
+    async def chase_buy(self, instrument, qty, ref, **k):
+        return {"average_price": 55.0, "order_id": "b",
+                "filled_qty_btc": qty, "fully_filled": True, "metrics": {}}
+
+    async def chase_sell(self, instrument, qty, ref, **k):
+        self.ops.append(f"SELL {instrument}")
+        if instrument == self._stuck:
+            return None                      # call body sell fails
+        return {"average_price": 340.0, "order_id": "s",
+                "filled_qty_btc": qty, "fully_filled": True, "metrics": {}}
+
+    async def get_option_iv_batch(self, syms):
+        return {}
+
+    async def list_open_positions(self):
+        # Call body is STILL long → NOT flat.
+        return [{"instrument_name": self._stuck, "amount": 1.0}]
+
+
+def test_unwind_defers_finalize_when_not_flat():
+    from strategy import straddle_builder
+
+    tmpdir = tempfile.mkdtemp()
+    config.STATE_DIR = tmpdir
+    config.EQUITY_FILE = os.path.join(tmpdir, "equity.json")
+    config.POSITIONS_FILE = os.path.join(tmpdir, "positions.json")
+    config.TRADE_LOG_FILE = os.path.join(tmpdir, "trade_log.csv")
+
+    pf = Portfolio()
+    s = _straddle_with_wings(family="UM", qty=0.5, num=1)
+    s.call_wing_leg = None   # isolate the BODY defer (no wings)
+    s.put_wing_leg = None
+    pf.set_straddle(s)
+
+    stuck = s.call_leg.instrument
+    ex, mk = _PartialBodyExchange(stuck), _FakeMarket()
+    pnl = asyncio.run(
+        straddle_builder.unwind_straddle(ex, mk, pf, reason="test"))
+
+    # DEFER: the straddle must remain OPEN (not booked) and no P&L returned.
+    assert pf.has_open, "must defer finalize while a leg is still open"
+    assert pnl == 0.0
+    # The put body that DID fill recorded its real exit fill for the later
+    # two-phase finalize; the stuck call body did not.
+    assert s.put_leg.instrument in s.exit_fills
+    assert s.call_leg.instrument not in s.exit_fills
+
+
+def test_record_exit_fill_ignores_bad_values():
+    s = _straddle_with_wings(family="UM", qty=0.5, num=1)
+    s.record_exit_fill("X", 0.0)        # non-positive
+    s.record_exit_fill("Y", None)       # type: ignore[arg-type]
+    s.record_exit_fill("", 10.0)        # empty instrument
+    s.record_exit_fill("Z", 12.5)       # valid
+    assert s.exit_fills == {"Z": 12.5}
 
 
 # ─────────────── 5. SESSION CLOSE message renders wings ───────────

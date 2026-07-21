@@ -158,6 +158,32 @@ class Straddle:
     def has_wings(self) -> bool:
         return self.has_call_wing or self.has_put_wing
 
+    # ── Realized exit fills (two-phase close) ─────────────────────────
+    # When the unwind cannot confirm the position is flat (a stuck maker
+    # leg, a held body covering an open wing), we DEFER finalization: the
+    # straddle stays ``open`` while the post-close re-flatten closes the
+    # residual, and ``close_straddle`` is called only once flat. Each leg
+    # that actually closes (unwind OR re-flatten) records its native fill
+    # price here so the deferred finalize books REAL exits, never the
+    # entry-price placeholder that produced phantom "closed" summaries.
+    # Runtime-only (not serialized): a restart re-reconciles from scratch.
+    def record_exit_fill(self, instrument: str, native_price: float) -> None:
+        try:
+            price = float(native_price)
+        except (TypeError, ValueError):
+            return
+        if price <= 0 or not instrument:
+            return
+        fills = getattr(self, "_exit_fills", None)
+        if fills is None:
+            fills = {}
+            self._exit_fills = fills
+        fills[instrument] = price
+
+    @property
+    def exit_fills(self) -> dict:
+        return getattr(self, "_exit_fills", None) or {}
+
     def _short_leg_usd_pnl(
         self, entry_px: float, exit_px: float, exit_spot: float = 0.0,
     ) -> float:
