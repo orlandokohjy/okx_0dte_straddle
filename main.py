@@ -456,6 +456,7 @@ class Algo:
                 f"  • [{s.time_label}]  "
                 f"{_days_str(s.weekdays)}  @ {s.describe_sizing()}"
                 f"{'  (close +1d)' if s.crosses_midnight else ''}"
+                f"{'  (with wings)' if config.session_wings_enabled(s) else ''}"
             )
             if s.sizing_mode not in ("pct_equity", "fixed_usd") \
                     or per_btc_premium_est <= 0:
@@ -478,6 +479,16 @@ class Algo:
         sessions_lines = "\n".join(
             _session_preview(s) for s in config.SESSIONS
         )
+        # Wings legend — only shown when the wing overlay is enabled, so the
+        # "(with wings)" tags above are unambiguous.
+        wings_note = ""
+        if config.ENABLE_WINGS:
+            wings_note = (
+                f"\n<i>Wings: covered iron fly sold on entries in the "
+                f"{config.WING_ENTRY_START_UTC.strftime('%H:%M')}–"
+                f"{config.WING_ENTRY_END_UTC.strftime('%H:%M')} UTC window "
+                f"only; all other entries are plain ATM straddles.</i>"
+            )
         # Group sessions for the banner so weekend vs weekday is visually
         # obvious at a glance.
         weekend_enabled = any(
@@ -509,6 +520,7 @@ class Algo:
             f"Time: {format_utc_sgt(now_utc())}\n"
             f"\n<b>Sessions:</b>\n"
             f"{sessions_lines}\n"
+            f"{wings_note}\n"
             + "\n".join(report_lines)
             + f"{lock_line}\n"
         )
