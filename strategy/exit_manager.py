@@ -38,6 +38,16 @@ class ExitManager:
             self._exchange, self._market, self._portfolio,
             reason="session_close",
         )
+        # TWO-PHASE FINALIZE: if the unwind could NOT confirm the position is
+        # flat it DEFERS — the straddle stays open (has_open == True) and no
+        # close is booked here. The caller (_on_close) runs the post-close
+        # re-flatten and then finalizes with the real exit fills, sending the
+        # SESSION CLOSE summary there. Emitting it now would be the phantom
+        # "closed while still open" message we are fixing, so skip it.
+        if self._portfolio.has_open:
+            log.info("hard_close_deferred_pending_reflatten",
+                     session=session_name, label=session_label)
+            return pnl
         # close_straddle stores entry/exit prices, gross_pnl, fees on
         # the just-closed Straddle; pull it via the dedicated accessor
         # so notify_close can render the full breakdown.

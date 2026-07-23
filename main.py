@@ -1588,6 +1588,18 @@ class Algo:
             f"{self._fmt_positions(positions)}"
         )
 
+        def _record_reflatten_fill(symbol: str, res):
+            """Feed a residual leg's realized close price into the open
+            straddle's exit-fills so the deferred two-phase finalize books
+            the REAL exit (never the entry-price placeholder). No-op when
+            the residual is a true orphan with no tracked straddle."""
+            s = self.portfolio.open_straddle
+            if s is None or not isinstance(res, dict):
+                return
+            px = float(res.get("average_price", 0.0) or 0.0)
+            if px > 0:
+                s.record_exit_fill(symbol, px)
+
         round_no = 0
         while now_utc() < deadline:
             round_no += 1
@@ -1595,6 +1607,13 @@ class Algo:
             if remaining_min <= 0:
                 break
             eff_round_min = min(round_min, remaining_min)
+
+            # TAKER ESCALATION: once maker rounds have failed to reach flat,
+            # stop chasing maker (which can be stranded forever when the book
+            # won't lift a capped order) and CROSS the spread to guarantee the
+            # residual closes. Risk-reducing on both sides (sell long / buy
+            # back short).
+            use_taker = round_no > config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS
 
             any_progress = False
             for p in positions:
@@ -1607,7 +1626,18 @@ class Algo:
                 except Exception:
                     bid = ask = 0.0
                 try:
-                    if amt > 0:
+                    if use_taker:
+                        if amt > 0:
+                            log.warning("reflatten_taker_escalate_long",
+                                        instrument=symbol, round=round_no)
+                            res = await self.exchange._taker_flatten_long(
+                                symbol, amt * ct)
+                        else:
+                            log.warning("reflatten_taker_escalate_short",
+                                        instrument=symbol, round=round_no)
+                            res = await self.exchange._taker_flatten_short(
+                                symbol, abs(amt) * ct)
+                    elif amt > 0:
                         # Long residual → maker sell the remaining qty.
                         if ask <= 0:
                             log.info("reflatten_skip_no_ask",
@@ -1634,6 +1664,7 @@ class Algo:
                     res = None
                 if res:
                     any_progress = True
+                    _record_reflatten_fill(symbol, res)
 
             try:
                 positions = await self.exchange.list_open_positions()
@@ -1739,6 +1770,49 @@ class Algo:
 
     # ──────────────────── Close ───────────────────────────────────
 
+    async def _finalize_deferred_close(
+        self, equity_before: float, session_label: str,
+    ):
+        """Book the close for a straddle whose unwind DEFERRED finalization
+        (couldn't confirm flat). Called after the post-close re-flatten, so the
+        exit fills captured during unwind + re-flatten are used to compute the
+        REAL P&L. Emits the SESSION CLOSE summary that hard_close skipped.
+
+        Runs even if the re-flatten EXHAUSTED (still not flat / orphan-locked):
+        the straddle must never be left open or every future entry blocks. For
+        any leg with no recorded fill we fall back to the entry price (≈0 leg
+        P&L, i.e. unrealised); the equity delta below is the honest headline.
+        """
+        s = self.portfolio.open_straddle
+        if s is None:
+            return None
+        fills = s.exit_fills
+        exit_call = fills.get(s.call_leg.instrument, s.entry_call_price)
+        exit_put = fills.get(s.put_leg.instrument, s.entry_put_price)
+        pnl = self.portfolio.close_straddle(
+            exit_call, exit_put, "session_close",
+        )
+        # close_straddle bumped the ledger by a COMPUTED net; the wallet (which
+        # includes any still-open leg's uPnL) is authoritative. Re-sync so the
+        # SESSION CLOSE equity delta stays honest.
+        if config.HAS_OKX_CREDS:
+            try:
+                live_equity = await self.exchange.get_account_equity()
+                if live_equity > 0:
+                    self.portfolio.sync_equity(live_equity)
+            except Exception:
+                log.warning("finalize_equity_resync_failed", exc_info=True)
+        closed = self.portfolio.last_closed_straddle
+        await notifier.notify_close(
+            pnl, "session_close",
+            session_label=session_label,
+            straddle=closed,
+            equity_before=equity_before,
+            equity_after=self.portfolio.equity,
+        )
+        log.info("deferred_close_finalized", id=s.id, pnl=f"${pnl:,.2f}")
+        return pnl
+
     async def _on_close(self, session: config.Session) -> None:
         label = session.time_label
         self._close_in_progress += 1
@@ -1753,6 +1827,19 @@ class Algo:
                 if live_equity > 0:
                     self.portfolio.sync_equity(live_equity)
                 await self._post_close_reconcile()
+
+            # TWO-PHASE FINALIZE: if the unwind DEFERRED (couldn't confirm flat)
+            # the straddle is still open. The re-flatten above has now run, so
+            # finalize the close with the REAL exit fills and emit the SESSION
+            # CLOSE summary. Runs whether the re-flatten reached flat OR
+            # exhausted (orphan-locked) — the straddle is NEVER left open, which
+            # would block every future entry.
+            if self.portfolio.has_open:
+                finalize_pnl = await self._finalize_deferred_close(
+                    equity_before, label,
+                )
+                if finalize_pnl is not None:
+                    pnl = finalize_pnl
 
             actual_pnl = self.portfolio.equity - equity_before
 

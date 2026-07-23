@@ -18,6 +18,26 @@ behavioural change:
   Same strike is used for the call and the put. Ties (spot exactly at a
   midpoint) break to the lower strike.
 
+Also ported from `feat/wings-on-plain` (close-path reliability — ETH's
+illiquid 0DTE books hit these hard, and they're what caused the ETH
+orphan-lock saga):
+
+- **Two-phase finalize.** `unwind_straddle` re-reads the live book
+  (`_own_legs_flat`) and, if either leg is still open, DEFERS: the straddle
+  stays `open`, a `⏳ UNWIND INCOMPLETE` note is sent, and NO `SESSION CLOSE`
+  is booked. `hard_close` skips `notify_close` while `has_open`.
+  `_on_close` calls `_finalize_deferred_close` after the re-flatten to book
+  REAL exit fills (`record_exit_fill`) and emit the true `SESSION CLOSE` —
+  runs whether the re-flatten reached flat or exhausted, so the straddle is
+  never left open (which would block every future entry). No more phantom
+  "closed with P&L while legs still open".
+- **Taker-escalation in the post-close re-flatten.** After
+  `CLOSE_FLATTEN_TAKER_AFTER_ROUNDS` (default 2) maker rounds fail to reach
+  flat, `_flatten_residual_until_flat` crosses the spread (taker) to
+  guarantee the residual closes, instead of churning the budget and then
+  orphan-locking. Adds `exchange._taker_flatten_short` (mirror of the
+  existing `_taker_flatten_long`).
+
 Everything else (sizing, sessions, margin mode, roll, locks) is unchanged
 from `feat/eth-support`. Meant to run in its own isolated worktree/stack
 reusing the existing ETH subaccount.

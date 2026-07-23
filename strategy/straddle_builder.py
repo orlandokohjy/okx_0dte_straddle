@@ -516,6 +516,8 @@ async def unwind_straddle(
         # family-aware (BTC × spot for CM, USD × 1 for UM).
         exit_call_price = float(rfq_result["call_price"])
         exit_put_price = float(rfq_result["put_price"])
+        straddle.record_exit_fill(straddle.call_leg.instrument, exit_call_price)
+        straddle.record_exit_fill(straddle.put_leg.instrument, exit_put_price)
         log.info("rfq_unwind_filled",
                  id=straddle.id, family=family.label(),
                  call=exit_call_price, put=exit_put_price,
@@ -623,6 +625,8 @@ async def unwind_straddle(
                 call_result.get("average_price", call_ask),
             )
             straddle.call_leg.exit_metrics = call_metrics
+            straddle.record_exit_fill(
+                straddle.call_leg.instrument, exit_call_price)
             call_fully = call_result.get("fully_filled", True)
             call_filled_btc = float(
                 call_result.get("filled_qty_btc", straddle.call_leg.qty),
@@ -665,6 +669,8 @@ async def unwind_straddle(
                 put_result.get("average_price", put_ask),
             )
             straddle.put_leg.exit_metrics = put_metrics
+            straddle.record_exit_fill(
+                straddle.put_leg.instrument, exit_put_price)
             put_fully = put_result.get("fully_filled", True)
             put_filled_btc = float(
                 put_result.get("filled_qty_btc", straddle.put_leg.qty),
@@ -715,11 +721,57 @@ async def unwind_straddle(
     except Exception:
         log.warning("exit_iv_capture_failed", id=straddle.id, exc_info=True)
 
+    # ── TWO-PHASE FINALIZE ───────────────────────────────────────────────
+    # Only FINALIZE the close (book P&L, log the trade, mark the straddle
+    # closed, emit the SESSION CLOSE summary) once the position is CONFIRMED
+    # FLAT on the exchange. If either leg is still open — a stuck maker chase
+    # or a partial fill — we DEFER: leave the straddle ``open`` and let the
+    # caller's post-close re-flatten close the residual, then finalize with the
+    # REAL exit fills. This kills the phantom "SESSION CLOSE with P&L" that was
+    # emitted while legs were still open (exit price defaulted to the entry
+    # price, ~0 leg P&L, and the open legs then appeared as orphans).
+    own_instruments = [
+        straddle.call_leg.instrument, straddle.put_leg.instrument,
+    ]
+    is_flat = await _own_legs_flat(exchange, own_instruments)
+
+    if not is_flat:
+        log.warning("unwind_incomplete_deferring_finalize", id=straddle.id,
+                    reason=reason, instruments=own_instruments)
+        await notifier.send(
+            f"<b>⏳ UNWIND INCOMPLETE — FINALIZING AFTER RE-FLATTEN</b> "
+            f"[{straddle.id}]\n"
+            f"One or more legs did not close within the maker chase, so the "
+            f"session is <b>NOT booked yet</b>. The post-close re-flatten will "
+            f"close the residual (taker-escalating), then the SESSION CLOSE "
+            f"summary + P&L will be sent with the REAL exit fills.\n"
+            f"Entries stay blocked until flat."
+        )
+        return 0.0
+
     pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
     log.info("straddle_unwound", id=straddle.id, reason=reason,
              pnl=f"${pnl:,.2f}",
              exit_call=exit_call_price, exit_put=exit_put_price)
     return pnl
+
+
+async def _own_legs_flat(exchange, instruments: list) -> bool:
+    """True iff NONE of ``instruments`` has a live open position. Best-effort:
+    on a fetch error return False (fail-safe → defer finalize rather than book
+    a close we can't confirm). Only this straddle's own legs are checked, so an
+    unrelated orphan never blocks finalizing this straddle."""
+    try:
+        live = await exchange.list_open_positions()
+    except Exception:
+        log.warning("own_legs_flat_fetch_failed", exc_info=True)
+        return False
+    want = set(instruments)
+    for p in live:
+        if p.get("instrument_name") in want and \
+                abs(float(p.get("amount", 0.0) or 0.0)) >= 1.0:
+            return False
+    return True
 
 
 async def _emergency_sell(

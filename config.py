@@ -700,6 +700,17 @@ CLOSE_FLATTEN_BUDGET_MIN: float = float(
 CLOSE_FLATTEN_ROUND_MIN: float = float(
     os.getenv("CLOSE_FLATTEN_ROUND_MIN", "15.0")
 )
+# TAKER ESCALATION: maker-only can get permanently stranded when the book
+# won't lift our order — a dying 0DTE leg whose ask sits far above mark, so
+# the maker slippage cap (OPTION_CHASE_MAX_SLIPPAGE_FACTOR) never reaches it.
+# After this many maker rounds fail to reach flat, the re-flatten CROSSES the
+# spread (taker) to GUARANTEE the residual closes in seconds instead of
+# churning the whole budget and then orphan-locking. Taker is risk-reducing
+# here (sell a residual long), so paying a tick or two is the right trade.
+# Set very high to effectively disable escalation.
+CLOSE_FLATTEN_TAKER_AFTER_ROUNDS: int = int(
+    os.getenv("CLOSE_FLATTEN_TAKER_AFTER_ROUNDS", "2")
+)
 
 # Pre-entry spread gate: skip session if put or call (ask − bid) / mid > this
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(
