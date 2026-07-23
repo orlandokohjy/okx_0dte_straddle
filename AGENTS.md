@@ -6,6 +6,24 @@ have already been resolved.
 
 ---
 
+## Branch variant: `feat/eth-atm` (this branch — replaces the ETH stack)
+
+Same ETH straddle as `feat/eth-support` (10 ETH/leg, no wings) with **one**
+behavioural change:
+
+- **Strike selection is now true ATM.** `select_straddle_pair` picks the
+  listed strike with the smallest `|strike − spot|` — it can be **above**
+  spot (slightly-OTM call / ITM put). The legacy selector always rounded
+  DOWN to an ITM call (long-delta bias); this variant is delta-balanced.
+  Same strike is used for the call and the put. Ties (spot exactly at a
+  midpoint) break to the lower strike.
+
+Everything else (sizing, sessions, margin mode, roll, locks) is unchanged
+from `feat/eth-support`. Meant to run in its own isolated worktree/stack
+reusing the existing ETH subaccount.
+
+---
+
 ## Production environment (DO NOT GUESS)
 
 - **VPS host**: `jiayi@188.166.214.51` (Ubuntu)
