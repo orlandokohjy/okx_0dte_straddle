@@ -589,18 +589,15 @@ class Algo:
         compute their window correctly (close_utc + 24h when < entry_utc).
         """
         CLOSE_RACE_BUFFER_MIN = 5.0  # min cushion between chase end and close
-        # With wings enabled the entry runs the body chase and THEN the wing
-        # chase sequentially, so the worst-case entry duration is the sum.
-        # The wing SELL now uses the SAME deadline as the body entry chase
-        # (OPTION_ENTRY_CHASE_DEADLINE_MIN) — persistent retry — so the
-        # worst-case entry is 2× that. Validate the sum or the wing chase
-        # could run past the close cron (2026-07-21 wing chaser unification).
-        wing_deadline = (
-            float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
-            if config.ENABLE_WINGS else 0.0
-        )
-        deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN) + wing_deadline
+        # Wings are now PER-SESSION (config.session_wings_enabled): only
+        # sessions in the wing window run the body chase AND THEN the wing
+        # chase sequentially, so ONLY those need the 2× (body+wing) budget.
+        # Non-wing sessions need only the single body-entry budget. Validate
+        # each session against its OWN worst-case so a tight non-wing window
+        # isn't rejected for a wing budget it never incurs.
+        body_deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
         violations: list[str] = []
+        any_wing_violation = False
         # Disabled sessions don't fire, so their windows can't race the
         # close cron — skip them. This lets an operator surgically
         # disable a misconfigured session without the validator (and
@@ -609,6 +606,8 @@ class Algo:
         for s in config.SESSIONS:
             if not s.enabled:
                 continue
+            has_wings = config.session_wings_enabled(s)
+            deadline = body_deadline * (2 if has_wings else 1)
             entry_min = s.entry_utc.hour * 60 + s.entry_utc.minute
             close_min = s.close_utc.hour * 60 + s.close_utc.minute
             if close_min < entry_min:
@@ -616,16 +615,18 @@ class Algo:
             window = close_min - entry_min
             max_safe_deadline = window - CLOSE_RACE_BUFFER_MIN
             if deadline > max_safe_deadline:
+                any_wing_violation = any_wing_violation or has_wings
                 violations.append(
-                    f"{s.name}: window={window:.0f} min, "
+                    f"{s.name}{'(+wings)' if has_wings else ''}: "
+                    f"window={window:.0f} min, "
                     f"max_safe_deadline={max_safe_deadline:.0f} min, "
                     f"configured={deadline:.0f} min"
                 )
         if violations:
             label = (
-                f"OPTION_ENTRY_CHASE_DEADLINE_MIN×2 (body+wing)={deadline:.0f}"
-                if wing_deadline > 0
-                else f"OPTION_ENTRY_CHASE_DEADLINE_MIN={deadline:.0f}"
+                "OPTION_ENTRY_CHASE_DEADLINE_MIN×2 (body+wing)"
+                if any_wing_violation
+                else f"OPTION_ENTRY_CHASE_DEADLINE_MIN={body_deadline:.0f}"
             )
             return False, (
                 f"{label} "
@@ -1423,7 +1424,7 @@ class Algo:
             # LONGS-FIRST — the body is fully filled here (build_straddle
             # returns None on any partial), so every wing is covered. Wing
             # failures are non-fatal: the plain straddle stands and is safe.
-            if config.ENABLE_WINGS:
+            if config.session_wings_enabled(session):
                 try:
                     wings = select_wings(
                         self.chain, pair.strike,

@@ -1,9 +1,10 @@
 """
-Select the ITM call and its matching put for the pure straddle.
+Select the ATM strike (call + put) for the straddle.
 
-Strategy: pick the nearest strike where the CALL is ITM (strike < spot),
-then use the same strike for the put (which will be OTM). This creates
-a standard straddle with a slight long-delta bias.
+Strategy: pick the listed strike CLOSEST to spot (|strike − spot| minimised,
+either side of spot) and use it for both the call and the put. This creates
+a balanced ATM straddle. (The legacy selector always rounded down to an ITM
+call, giving a long-delta bias — changed 2026-07-23.)
 """
 from __future__ import annotations
 
@@ -122,12 +123,14 @@ def _spread_pct(bid: float, ask: float, mark: float = 0.0) -> float:
 
 def select_straddle_pair(chain: OptionChain, spot: float) -> Optional[StraddlePair]:
     """
-    Find the nearest ITM call strike and its matching put.
+    Find the strike CLOSEST to spot (true ATM) and its call+put.
 
-    ITM call = strike < spot. We pick the closest strike below spot
-    that has both a call and a put with a valid ask (we're buying,
-    so ask > 0 is the relevant liquidity check; bid may be 0 on
-    thin demo books).
+    We pick the listed strike with the smallest |strike − spot| that has
+    BOTH a call and a put with a valid ask (we're buying, so ask > 0 is the
+    relevant liquidity check; bid may be 0 on thin demo books). The nearest
+    strike can be ABOVE spot (slightly-OTM call / ITM put) or below — unlike
+    the legacy selector which always rounded DOWN to an ITM call. Same strike
+    is used for both legs → a balanced ATM straddle (minimal delta bias).
     """
     log.info("chain_summary",
              total_calls=len(chain.calls),
@@ -138,35 +141,30 @@ def select_straddle_pair(chain: OptionChain, spot: float) -> Optional[StraddlePa
              call_strikes_above_spot=[c.strike for c in chain.calls
                                        if c.strike >= spot][:5])
 
-    itm_calls = [c for c in chain.calls if c.strike < spot and c.ask > 0]
-    if not itm_calls:
-        all_itm = [c for c in chain.calls if c.strike < spot]
-        log.warning("no_itm_calls",
-                    spot=spot,
-                    itm_strikes_present=[c.strike for c in all_itm],
-                    itm_with_zero_ask=[
-                        f"{c.strike}@bid={c.bid}/ask={c.ask}"
-                        for c in all_itm if c.ask <= 0
-                    ])
-        return None
-
-    best_call = max(itm_calls, key=lambda c: c.strike)
-
-    matching_put = None
+    # Strikes that have a tradable (ask > 0) call AND put. First occurrence
+    # per strike wins (chains list one contract per strike).
+    calls_by_strike: dict[float, OptionInfo] = {}
+    for c in chain.calls:
+        if c.ask > 0 and c.strike not in calls_by_strike:
+            calls_by_strike[c.strike] = c
+    puts_by_strike: dict[float, OptionInfo] = {}
     for p in chain.puts:
-        if p.strike == best_call.strike and p.ask > 0:
-            matching_put = p
-            break
+        if p.ask > 0 and p.strike not in puts_by_strike:
+            puts_by_strike[p.strike] = p
 
-    if matching_put is None:
-        same_strike_puts = [p for p in chain.puts if p.strike == best_call.strike]
-        log.warning("no_matching_put",
-                    strike=best_call.strike,
+    common = sorted(set(calls_by_strike) & set(puts_by_strike))
+    if not common:
+        log.warning("no_tradable_common_strike",
                     spot=spot,
-                    puts_at_strike=[
-                        f"bid={p.bid}/ask={p.ask}" for p in same_strike_puts
-                    ])
+                    call_strikes=sorted(calls_by_strike)[:10],
+                    put_strikes=sorted(puts_by_strike)[:10])
         return None
+
+    # Nearest strike to spot. Ties (spot exactly at a midpoint) break to the
+    # LOWER strike via the stable sort + <= comparison in min().
+    strike = min(common, key=lambda s: (abs(s - spot), s))
+    best_call = calls_by_strike[strike]
+    matching_put = puts_by_strike[strike]
 
     spread_call = _spread_pct(best_call.bid, best_call.ask, best_call.mark)
     spread_put = _spread_pct(matching_put.bid, matching_put.ask,

@@ -6,6 +6,26 @@ have already been resolved.
 
 ---
 
+## Branch variant: `feat/wings-atm-1300-1500` (2026-07-23)
+
+This branch diverges from `feat/wings-on-plain` in two deliberate ways:
+
+1. **Nearest-strike (true ATM) selection.** `select_straddle_pair` now picks
+   the listed strike with the smallest `|strike − spot|` — which can be ABOVE
+   spot — and uses it for both legs. The legacy selector always rounded DOWN
+   to an ITM call (long-delta bias). Applies to EVERY session.
+2. **Time-gated wings.** Wings are sold ONLY for sessions whose entry is in the
+   inclusive UTC window `[WING_ENTRY_START_UTC, WING_ENTRY_END_UTC]` (default
+   `13:00`–`14:30`; last wing entry 14:30 closes 15:00). All other sessions run
+   a plain ATM straddle. Gate = `config.session_wings_enabled(session)`;
+   `ENABLE_WINGS` is still the master switch. The chase-deadline validator is
+   per-session — only wing sessions carry the 2× (body+wing) budget.
+
+Run this variant as an ISOLATED stack (own worktree dir + `CONTAINER_NAME` +
+`COMPOSE_PROJECT_NAME`) — never on top of another stack's state.
+
+---
+
 ## Production environment (DO NOT GUESS)
 
 - **VPS host**: `jiayi@188.166.214.51` (Ubuntu)

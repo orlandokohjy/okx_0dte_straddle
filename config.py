@@ -730,6 +730,38 @@ WING_REQUIRE_FILLED_BODY: bool = os.getenv(
     "WING_REQUIRE_FILLED_BODY", "true",
 ).lower() == "true"
 
+# ── Per-session wing window (2026-07-23) ──────────────────────────────
+# Wings are TIME-GATED: only sessions whose ENTRY time falls in the inclusive
+# UTC window [WING_ENTRY_START_UTC, WING_ENTRY_END_UTC] run the iron fly
+# (body + short wings). Every other session runs a plain ATM straddle (no
+# wings). This lets one deployment run wings only during the liquid mid-day
+# window and plain straddles the rest of the day. ENABLE_WINGS is still the
+# master switch — with it false, NO session gets wings regardless of window.
+# Format: "HH:MM" UTC. Default 13:00–14:30 (last wing entry 14:30 closes 15:00).
+
+
+def _parse_hhmm(raw: str, default_h: int, default_m: int) -> time:
+    try:
+        hh, mm = raw.strip().split(":")
+        return time(int(hh), int(mm))
+    except (ValueError, AttributeError):
+        return time(default_h, default_m)
+
+
+WING_ENTRY_START_UTC: time = _parse_hhmm(
+    os.getenv("WING_ENTRY_START_UTC", "13:00"), 13, 0)
+WING_ENTRY_END_UTC: time = _parse_hhmm(
+    os.getenv("WING_ENTRY_END_UTC", "14:30"), 14, 30)
+
+
+def session_wings_enabled(session: "Session") -> bool:
+    """True iff wings should be sold for this session: the master ENABLE_WINGS
+    flag is on AND the session's entry time is within the inclusive wing
+    window. Used at entry time to gate wing selection/selling per-session."""
+    if not ENABLE_WINGS:
+        return False
+    return WING_ENTRY_START_UTC <= session.entry_utc <= WING_ENTRY_END_UTC
+
 # ──────────────────── Risk Management ─────────────────────────────
 MAX_DAILY_LOSS_PCT: float | None = None
 CIRCUIT_BREAKER_API_ERRORS: int = 5
