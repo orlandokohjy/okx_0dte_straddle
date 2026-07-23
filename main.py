@@ -1275,53 +1275,75 @@ class Algo:
                 log.info("trade_gate_ok",
                          session=session.name, reason=gate.reason)
 
-        if self.portfolio.has_open or self._close_in_progress > 0:
-            # A prior session's straddle is still unwinding (maker-only
-            # close hasn't filled yet) or its close handler is still
-            # finishing. Rather than skip outright, WAIT for the flat and
-            # then enter late — but only while enough of THIS window
-            # remains for a safe chase (see _wait_for_flat). If the cutoff
-            # passes first, skip.
-            flat = await self._wait_for_flat(session, label)
-            if not flat:
+        if config.STACKED_STRADDLES:
+            # Stacked mode: overlapping straddles from DIFFERENT session
+            # windows are expected and allowed — do NOT wait/skip on an
+            # already-open straddle, and do NOT block on a non-flat
+            # exchange (siblings legitimately leave positions on the book).
+            # The only thing we refuse is a DUPLICATE entry for the SAME
+            # session (a session fires once/day; a second fire would mean a
+            # scheduler glitch, and we must not book two straddles under one
+            # session key or the close/attribution would collide).
+            if self.portfolio.get_open(session.name) is not None:
+                log.warning("entry_skip_same_session_already_open",
+                            session=session.name)
+                await notifier.notify_skip(
+                    f"[{label}] this session already has an open straddle "
+                    f"(stacked mode allows OTHER sessions to overlap, not a "
+                    f"duplicate of the same session)"
+                )
                 return
+        else:
+            if self.portfolio.has_open or self._close_in_progress > 0:
+                # A prior session's straddle is still unwinding (maker-only
+                # close hasn't filled yet) or its close handler is still
+                # finishing. Rather than skip outright, WAIT for the flat and
+                # then enter late — but only while enough of THIS window
+                # remains for a safe chase (see _wait_for_flat). If the cutoff
+                # passes first, skip.
+                flat = await self._wait_for_flat(session, label)
+                if not flat:
+                    return
 
-        # ── Pre-entry exchange-flat guard (defence-in-depth) ──
-        # Local state can be WRONG: a phantom close (both sell legs failing
-        # on a transient disconnect) marks the straddle closed + resets
-        # local state while the exchange still holds the legs. The local
-        # `has_open` guard above then waves a new entry through, stacking a
-        # fresh straddle on top of the orphan (2026-06-18 incident). So
-        # before opening, query the EXCHANGE directly; if it is not flat,
-        # refuse and lock rather than trusting local state alone.
-        if config.HAS_OKX_CREDS:
-            try:
-                live_positions = await self.exchange.list_open_positions()
-            except Exception:
-                log.warning("preentry_position_check_failed",
-                            session=session.name, exc_info=True)
-                live_positions = []
-            if live_positions:
-                detail = ", ".join(
-                    f"{p['instrument_name']} {p['amount']:+.4f}"
-                    for p in live_positions
-                )
-                self._set_entry_lock(
-                    f"Pre-entry exchange not flat: {len(live_positions)} "
-                    f"open position(s) — possible orphan, refusing to stack",
-                    clearable_when_flat=True,
-                )
-                log.error("entry_blocked_exchange_not_flat",
-                          session=session.name, positions=detail)
-                await notifier.send(
-                    f"<b>⚠️ ENTRY BLOCKED — EXCHANGE NOT FLAT</b> [{label}]\n"
-                    f"Refusing to open a new straddle on top of an existing "
-                    f"position (stacking guard).\n\n"
-                    f"Live position(s): {detail}\n\n"
-                    f"<b>ENTRIES ARE NOW LOCKED.</b> Flatten with "
-                    f"tools/force_liquidate.py, then restart to clear."
-                )
-                return
+            # ── Pre-entry exchange-flat guard (defence-in-depth) ──
+            # Local state can be WRONG: a phantom close (both sell legs
+            # failing on a transient disconnect) marks the straddle closed +
+            # resets local state while the exchange still holds the legs. The
+            # local `has_open` guard above then waves a new entry through,
+            # stacking a fresh straddle on top of the orphan (2026-06-18
+            # incident). So before opening, query the EXCHANGE directly; if
+            # it is not flat, refuse and lock rather than trusting local
+            # state alone. (Disabled in stacked mode — see above.)
+            if config.HAS_OKX_CREDS:
+                try:
+                    live_positions = await self.exchange.list_open_positions()
+                except Exception:
+                    log.warning("preentry_position_check_failed",
+                                session=session.name, exc_info=True)
+                    live_positions = []
+                if live_positions:
+                    detail = ", ".join(
+                        f"{p['instrument_name']} {p['amount']:+.4f}"
+                        for p in live_positions
+                    )
+                    self._set_entry_lock(
+                        f"Pre-entry exchange not flat: {len(live_positions)} "
+                        f"open position(s) — possible orphan, refusing to "
+                        f"stack",
+                        clearable_when_flat=True,
+                    )
+                    log.error("entry_blocked_exchange_not_flat",
+                              session=session.name, positions=detail)
+                    await notifier.send(
+                        f"<b>⚠️ ENTRY BLOCKED — EXCHANGE NOT FLAT</b> "
+                        f"[{label}]\n"
+                        f"Refusing to open a new straddle on top of an "
+                        f"existing position (stacking guard).\n\n"
+                        f"Live position(s): {detail}\n\n"
+                        f"<b>ENTRIES ARE NOW LOCKED.</b> Flatten with "
+                        f"tools/force_liquidate.py, then restart to clear."
+                    )
+                    return
 
         total_options = await self.chain.refresh()
         if total_options == 0:
@@ -1828,6 +1850,10 @@ class Algo:
             log.info("post_close_flat_ok")
             return
 
+        if config.STACKED_STRADDLES:
+            await self._post_close_reconcile_stacked(positions)
+            return
+
         # Residual after unwind — keep trying to close it (maker-only) before
         # locking. The lock is a genuine last resort, not the first response.
         positions = await self._flatten_residual_until_flat(positions)
@@ -1870,6 +1896,59 @@ class Algo:
             f"<b>ENTRIES ARE NOW LOCKED</b> — the algo will NOT open new "
             f"straddles until this is resolved.\n"
             f"{heal_note}"
+        )
+
+    async def _post_close_reconcile_stacked(
+        self, positions: list[dict],
+    ) -> None:
+        """Sibling-aware, ALERT-ONLY post-close reconcile for stacked mode.
+
+        After closing one straddle, the exchange still legitimately holds
+        the legs of every OTHER open straddle. Subtract those tracked
+        contracts and only care about a genuine EXCESS beyond all tracked
+        straddles (an actual unclosed/partial leg).
+
+        Unlike single mode this NEVER auto-flattens (a flatten of a shared
+        instrument would liquidate a sibling straddle) and NEVER locks
+        entries (that would halt the whole stacked schedule). A real excess
+        is alerted; a worthless 0DTE leg settles at the 08:00 UTC expiry.
+        """
+        ct = config.OKX_CONTRACT_SIZE_BTC or 1.0
+        expected = self.portfolio.expected_open_contracts()  # signed contracts
+        excess: list[dict] = []
+        for p in positions:
+            sym = p.get("instrument_name", "")
+            amt = float(p.get("amount", 0.0))
+            exp = expected.get(sym, 0.0)
+            # Long straddles ⇒ positive expected. Residual excess is the
+            # amount above what all tracked straddles account for. Tolerate
+            # <1 contract of drift (rounding / partial settlement dust).
+            delta = amt - exp
+            if delta > 0.5:  # more long than tracked ⇒ unclosed long leg
+                excess.append({**p, "amount": delta})
+            elif amt < -0.5:  # any net short is never expected (all legs long)
+                excess.append(dict(p))
+
+        if not excess:
+            log.info("post_close_reconcile_ok_stacked",
+                     tracked_straddles=self.portfolio.open_count,
+                     live_positions=len(positions))
+            return
+
+        details = await self._fmt_positions_with_book(excess)
+        log.warning("post_close_excess_stacked",
+                    excess=len(excess),
+                    tracked_straddles=self.portfolio.open_count,
+                    detail=details)
+        await notifier.send(
+            f"<b>⚠️ POST-CLOSE EXCESS (stacked)</b>\n"
+            f"After closing this session's straddle the exchange holds "
+            f"more than the {self.portfolio.open_count} still-open tracked "
+            f"straddle(s) account for — a leg likely did not fully close:\n\n"
+            f"{details}\n\n"
+            f"Entries are NOT locked (stacked schedule keeps running). A "
+            f"worthless 0DTE leg settles at 08:00 UTC expiry; otherwise "
+            f"flatten the excess with tools/force_liquidate.py."
         )
 
     # ──────────────────── Close ───────────────────────────────────
@@ -2112,11 +2191,17 @@ class Algo:
         self.scheduler.stop()
 
         if self.portfolio.has_open:
-            log.warning("closing_remaining_position")
-            await unwind_straddle(
-                self.exchange, self.market, self.portfolio,
-                reason="shutdown",
-            )
+            log.warning("closing_remaining_position",
+                        open_straddles=self.portfolio.open_count)
+            # Snapshot session names first — close_straddle mutates the open
+            # set as each straddle is booked.
+            for sname in [s.session_name
+                          for s in self.portfolio.open_straddles()]:
+                await unwind_straddle(
+                    self.exchange, self.market, self.portfolio,
+                    reason="shutdown",
+                    session_name=sname,
+                )
 
         _release_singleton_lock()
         log.info("algo_stopped")

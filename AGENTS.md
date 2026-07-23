@@ -379,6 +379,40 @@ audit a stuck leg now: `grep chase_sell_attempt logs/algo.log`. Orphan /
 reconcile Telegram alerts also now include live `bid`/`ask` + a sellability
 verdict (`_fmt_positions_with_book`).
 
+## Stacked (overlapping) straddles — `STACKED_STRADDLES` (2026-07-24)
+
+**This branch only** (BTC 1h signal stack). The default algo runs AT MOST one
+open straddle at a time (`_wait_for_flat` + pre-entry exchange-flat guard +
+drive-to-flat post-close reconcile + orphan lock). The 1h stack's session
+windows OVERLAP, so we let several straddles be open at once via
+`STACKED_STRADDLES=true`. Everything below is gated on that flag — every
+other stack keeps its strict single-position safety.
+
+- **Portfolio** holds many open straddles keyed by `session_name`
+  (`_open: dict`), plus `_last_closed` for reporting. `set_straddle`,
+  `get_open(session)`, `open_straddles()`, `open_count`,
+  `expected_open_contracts(exclude_session)` are the multi-aware API.
+- **Entry** no longer waits/skips on an open straddle and does NOT block on a
+  non-flat exchange (siblings legitimately leave positions on the book). It
+  refuses ONLY a duplicate entry for the SAME session key.
+- **Close** targets one straddle by `session_name` and REDUCES the net
+  position by that straddle's own contracts (`chase_sell` of a fixed qty) —
+  never flattens the instrument to zero (which would liquidate a same-strike
+  sibling). `unwind_straddle`'s transient-retry resell honours a
+  `sibling_floor` so a reconnect can't oversell into a sibling.
+- **Reconcile** (`_post_close_reconcile_stacked`) is sibling-aware +
+  **ALERT-ONLY**: it subtracts `expected_open_contracts()` and only warns on a
+  genuine EXCESS beyond all tracked straddles. It NEVER auto-flattens and
+  NEVER locks entries (that would halt the whole overlapping schedule). A
+  worthless 0DTE leg settles at the 08:00 UTC expiry.
+- **Trade-off (accepted):** same-strike overlapping straddles NET on OKX, so
+  per-straddle realised P&L is APPROXIMATE (booked at each straddle's own
+  fills) and orphan cleanup is weaker (alert + expiry vs forced flatten).
+  Wallet equity stays correct — `_on_close` re-syncs equity from OKX.
+- **Restart caveat:** positions.json is still not loaded on boot, so a restart
+  while straddles are open trips the startup-reconcile orphan lock (same as
+  single mode). 0DTE settles daily, so this self-heals at expiry.
+
 ---
 
 ## When in doubt

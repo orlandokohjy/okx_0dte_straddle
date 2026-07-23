@@ -489,17 +489,35 @@ async def unwind_straddle(
     market: MarketData,
     portfolio: Portfolio,
     reason: str = "hard_close",
+    session_name: Optional[str] = None,
 ) -> float:
     """
     Close the open straddle.
     Primary: RFQ sell both legs atomically (if USE_RFQ=true).
     Fallback: leg-by-leg maker-only chase.
+
+    In stacked mode ``session_name`` selects WHICH straddle to close, and
+    the close REDUCES the net position by that straddle's own contracts
+    (chase_sell of a fixed qty) rather than flattening the instrument — a
+    same-strike sibling straddle keeps its contracts.
     """
-    straddle = portfolio.open_straddle
+    if session_name is not None:
+        straddle = portfolio.get_open(session_name)
+    else:
+        straddle = portfolio.open_straddle
     if straddle is None:
         return 0.0
 
-    log.info("unwinding", id=straddle.id, reason=reason)
+    # Contracts held by OTHER still-open straddles (0 in single mode). The
+    # transient-retry resell path below must never drive a shared
+    # instrument below this floor or it would liquidate a sibling straddle.
+    sibling_floor = portfolio.expected_open_contracts(
+        exclude_session=straddle.session_name,
+    )
+
+    log.info("unwinding", id=straddle.id, reason=reason,
+             session=straddle.session_name,
+             sibling_legs=len(sibling_floor))
 
     # Capture spot at exit for context — best-effort, never blocks the unwind.
     try:
@@ -574,14 +592,21 @@ async def unwind_straddle(
                     if p.get("instrument_name") == symbol:
                         remaining_contracts = float(p.get("amount", 0.0))
                         break
-                if remaining_contracts <= 0:
-                    # Original chase already flattened (or even shorted) the
-                    # leg before the disconnect — nothing left to sell.
+                # Never resell contracts that belong to a still-open sibling
+                # straddle on the same instrument (stacked mode). The live
+                # position is the NET across all straddles; only the excess
+                # above the sibling floor is ours to unwind.
+                floor = sibling_floor.get(symbol, 0.0)
+                sellable_contracts = remaining_contracts - floor
+                if sellable_contracts <= 0:
+                    # Original chase already flattened OUR share (or the whole
+                    # residual belongs to a sibling) — nothing left to sell.
                     log.info("sell_leg_already_flat_after_transient",
                              instrument=symbol,
-                             remaining_contracts=remaining_contracts)
+                             remaining_contracts=remaining_contracts,
+                             sibling_floor=floor)
                     return None
-                remaining_qty = remaining_contracts * config.OKX_CONTRACT_SIZE_BTC
+                remaining_qty = sellable_contracts * config.OKX_CONTRACT_SIZE_BTC
                 try:
                     _, fresh_ask = await market.get_option_bid_ask(symbol)
                 except Exception:
@@ -718,7 +743,10 @@ async def unwind_straddle(
     except Exception:
         log.warning("exit_iv_capture_failed", id=straddle.id, exc_info=True)
 
-    pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
+    pnl = portfolio.close_straddle(
+        exit_call_price, exit_put_price, reason,
+        session_name=straddle.session_name,
+    )
     log.info("straddle_unwound", id=straddle.id, reason=reason,
              pnl=f"${pnl:,.2f}",
              exit_call=exit_call_price, exit_put=exit_put_price)

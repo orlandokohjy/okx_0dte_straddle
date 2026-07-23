@@ -52,6 +52,39 @@ SELF_HEAL_LOCK_ON_FLAT: bool = os.getenv(
     "SELF_HEAL_LOCK_ON_FLAT", "true",
 ).lower() == "true"
 
+# ─────────────── Stacked (overlapping) straddles ──────────────────────
+# Default (single-straddle) behaviour: the algo runs AT MOST one open
+# straddle at a time — a new session that fires while a prior straddle is
+# still open WAITS for it to unwind (``_wait_for_flat``) and skips if it
+# cannot. The post-close reconcile then drives the exchange to strictly
+# FLAT and locks entries on any residual.
+#
+# With STACKED_STRADDLES=true this becomes a MULTI-straddle algo: several
+# overlapping straddles (one per session window) can be open at once. Key
+# behavioural changes, all gated on this flag so every other stack keeps
+# the strict single-straddle safety:
+#   • Entry no longer waits/skips on an already-open straddle. It only
+#     refuses a *duplicate* entry for the SAME session (a session fires
+#     once/day). The pre-entry "exchange must be flat" guard is relaxed —
+#     sibling straddles legitimately leave the book non-flat.
+#   • Each session closes only ITS OWN straddle by REDUCING the net
+#     position by that straddle's contracts (chase_sell of a fixed qty),
+#     never flattening the instrument to zero (which would nuke a sibling
+#     on the same strike).
+#   • The post-close reconcile becomes SIBLING-AWARE + ALERT-ONLY: it
+#     subtracts the contracts still legitimately held by other OPEN
+#     tracked straddles and NEVER auto-flattens or locks. A genuine excess
+#     beyond all tracked straddles is alerted (and a worthless 0DTE leg
+#     settles at 08:00 UTC expiry) — it does not halt the schedule.
+#
+# TRADE-OFF: same-strike overlapping straddles net on OKX, so per-straddle
+# realised P&L is APPROXIMATE (attributed at each straddle's own fills),
+# and orphan auto-cleanup is weaker (alert + expiry settlement instead of
+# forced flatten). Intended for the BTC 1h signal stack only.
+STACKED_STRADDLES: bool = os.getenv(
+    "STACKED_STRADDLES", "false",
+).lower() == "true"
+
 # True iff API credentials are present. Used to gate startup-time auth calls
 # (reconcile, equity sync) independently from DRY_RUN. With creds + DRY_RUN
 # we still validate auth on startup, just don't place orders.

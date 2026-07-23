@@ -237,7 +237,14 @@ class Portfolio:
 
     def __init__(self) -> None:
         self._equity: float = config.INITIAL_CAPITAL_USD
+        # Single-mode compat: the one open straddle (legacy). In stacked
+        # mode this is unused — `_open` holds every open straddle keyed by
+        # session_name, and `_last_closed` carries the most-recent close
+        # for reporting. Single mode keeps `_open` in sync (≤1 entry) so
+        # every accessor works identically regardless of mode.
         self._straddle: Optional[Straddle] = None
+        self._open: dict[str, Straddle] = {}
+        self._last_closed: Optional[Straddle] = None
         self._daily_pnl: float = 0.0
         self._load_equity()
         self._migrate_trade_log()
@@ -264,29 +271,80 @@ class Portfolio:
 
     @property
     def has_open(self) -> bool:
-        return self._straddle is not None and self._straddle.status == "open"
+        return len(self._open) > 0
+
+    @property
+    def open_count(self) -> int:
+        return len(self._open)
+
+    def open_straddles(self) -> list[Straddle]:
+        """Every currently-open straddle (0..N in stacked mode)."""
+        return list(self._open.values())
+
+    def get_open(self, session_name: str) -> Optional[Straddle]:
+        """The open straddle fired by `session_name`, or None."""
+        return self._open.get(session_name)
 
     @property
     def open_straddle(self) -> Optional[Straddle]:
-        return self._straddle if self.has_open else None
+        """Back-compat single-straddle accessor. Returns the sole open
+        straddle when exactly one is open; in stacked mode with several
+        open it returns the most recently opened (callers that must target
+        a specific session should use ``get_open``)."""
+        if not self._open:
+            return None
+        vals = list(self._open.values())
+        return vals[0] if len(vals) == 1 else vals[-1]
 
     @property
     def last_closed_straddle(self) -> Optional[Straddle]:
         """The most recently closed Straddle, or None if no straddle has
-        ever been opened (or the current one is still open). Used by the
-        SESSION CLOSE Telegram message to render entry/exit detail."""
-        if self._straddle is None or self._straddle.status != "closed":
+        ever been closed. Used by the SESSION CLOSE Telegram message to
+        render entry/exit detail."""
+        if self._last_closed is None or self._last_closed.status != "closed":
             return None
-        return self._straddle
+        return self._last_closed
+
+    def expected_open_contracts(
+        self, exclude_session: Optional[str] = None,
+    ) -> dict[str, float]:
+        """Signed net contracts per instrument summed over all OPEN
+        straddles (long straddle ⇒ +contracts on both legs), optionally
+        excluding one session. Contracts = leg BTC qty / contract size, to
+        match the exchange ``amount`` field. Used by the stacked-mode
+        reconcile to avoid touching legs that legitimately belong to a
+        still-open sibling straddle.
+        """
+        ct = config.OKX_CONTRACT_SIZE_BTC or 1.0
+        agg: dict[str, float] = {}
+        for name, s in self._open.items():
+            if exclude_session is not None and name == exclude_session:
+                continue
+            if s.status != "open":
+                continue
+            for leg in (s.call_leg, s.put_leg):
+                # A straddle is long both legs; qty is stored positive.
+                agg[leg.instrument] = agg.get(leg.instrument, 0.0) + (
+                    leg.qty / ct
+                )
+        return agg
 
     def set_straddle(self, s: Straddle) -> None:
         self._straddle = s
+        self._open[s.session_name] = s
         self._save_positions()
 
     def close_straddle(
         self, exit_call_price: float, exit_put_price: float, exit_reason: str,
+        session_name: Optional[str] = None,
     ) -> float:
-        s = self._straddle
+        # Resolve WHICH straddle to close. In stacked mode the caller passes
+        # the owning session so we book/reduce exactly that straddle; single
+        # mode falls back to the sole open straddle.
+        if session_name is not None:
+            s = self._open.get(session_name)
+        else:
+            s = self.open_straddle
         if s is None or s.status != "open":
             return 0.0
 
@@ -322,6 +380,14 @@ class Portfolio:
         s.gross_pnl = gross_pnl
         s.fees = total_fees_usd
 
+        # Remove from the open set and remember it for reporting. In single
+        # mode this leaves `_open` empty; in stacked mode any sibling
+        # straddles stay open and untouched.
+        self._open.pop(s.session_name, None)
+        self._last_closed = s
+        if self._straddle is s:
+            self._straddle = None
+
         self._equity += net_pnl
         self._daily_pnl += net_pnl
         self._save_equity()
@@ -336,8 +402,12 @@ class Portfolio:
         return net_pnl
 
     def reset_daily(self) -> None:
+        # Reset the rolling daily P&L accumulator. Do NOT clear open
+        # straddles here: close_straddle already removes a straddle when it
+        # is booked, and in stacked mode a sibling straddle may still be
+        # open when a different session closes (clearing `_open` here would
+        # silently drop tracking of a live position).
         self._daily_pnl = 0.0
-        self._straddle = None
         self._save_positions()
 
     # ──────────────── Persistence ─────────────────────────────────
@@ -360,7 +430,15 @@ class Portfolio:
 
     def _save_positions(self) -> None:
         os.makedirs(config.STATE_DIR, exist_ok=True)
-        data = self._straddle.to_dict() if self._straddle else None
+        # Stacked mode can hold several open straddles → persist a list so
+        # the on-disk snapshot is observable. Single mode writes the sole
+        # open straddle as a bare dict (legacy shape) for backward compat
+        # with any external reader of positions.json.
+        open_list = list(self._open.values())
+        if config.STACKED_STRADDLES:
+            data = [s.to_dict() for s in open_list]
+        else:
+            data = open_list[0].to_dict() if open_list else None
         with open(config.POSITIONS_FILE, "w") as f:
             json.dump(data, f, indent=2)
 

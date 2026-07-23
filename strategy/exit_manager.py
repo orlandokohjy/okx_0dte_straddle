@@ -28,7 +28,13 @@ class ExitManager:
         multi-session deployments can tell which window triggered the
         close. session_name is kept for structured logging only.
         """
-        if not self._portfolio.has_open:
+        # In stacked mode close only THIS session's straddle; otherwise fall
+        # back to the single open straddle.
+        target = (
+            self._portfolio.get_open(session_name)
+            if session_name else self._portfolio.open_straddle
+        )
+        if target is None:
             log.info("nothing_to_close",
                      session=session_name, label=session_label)
             return 0.0
@@ -37,6 +43,7 @@ class ExitManager:
         pnl = await unwind_straddle(
             self._exchange, self._market, self._portfolio,
             reason="session_close",
+            session_name=session_name or None,
         )
         # close_straddle stores entry/exit prices, gross_pnl, fees on
         # the just-closed Straddle; pull it via the dedicated accessor
