@@ -159,22 +159,33 @@ async def notify_entry(
     call_cost_total: float, put_cost_total: float,
     session_label: str = "",
     qty_per_leg: float = 0.0,
+    wings_enabled: bool = False,
 ) -> None:
     """All money values are USD. The caller is responsible for converting
     BTC-quoted OKX premiums to USD via spot before invoking this.
 
     session_label is a user-visible window such as ``13:30-15:30 UTC``.
+    wings_enabled marks a wing-eligible session (13:00–14:30 UTC window):
+    the header is tagged and a Wings line states covered wings will be sold.
     """
     header = "<b>SESSION ENTRY</b>"
     if session_label:
         header = f"<b>SESSION ENTRY [{session_label}]</b>"
+    if wings_enabled:
+        header += " (with wings)"
     qty_line = (
         f"BTC per leg: {qty_per_leg:.4f}\n" if qty_per_leg > 0 else ""
+    )
+    wings_line = (
+        "Wings: ON — covered call+put wings sold next (see IRON FLY ENTERED)\n"
+        if wings_enabled else
+        "Wings: OFF — plain ATM straddle\n"
     )
     await send(
         f"{header}\n"
         f"Straddles: {num_straddles}\n"
         f"{qty_line}"
+        f"{wings_line}"
         f"Equity: ${equity:,.2f}\n"
         f"\n<b>Fills</b>\n"
         f"Strike: ${strike:,.0f}\n"

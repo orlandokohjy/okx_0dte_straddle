@@ -1408,6 +1408,7 @@ class Algo:
                 put_cost_total=put_cost_total_usd,
                 session_label=label,
                 qty_per_leg=resolved_qty,
+                wings_enabled=config.session_wings_enabled(session),
             )
             log.info("session_entry_done",
                      session=session.name,
