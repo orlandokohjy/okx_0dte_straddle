@@ -602,18 +602,63 @@ WEEKEND_TRADING_ENABLED: bool = os.getenv(
     "WEEKEND_TRADING_ENABLED", "true",
 ).lower() in ("true", "1", "yes", "on")
 
-SESSIONS: list[Session] = (
-    _build_schedule(
-        _WEEKDAY_ENTRIES, _WEEKDAY_DAYS,
-        default_qty_per_leg=_WEEKDAY_FULL_QTY,
-        signal_scaled_names=_WEEKDAY_SIGNAL_SCALED,
-        signal_floor_qty=_WEEKDAY_FLOOR_QTY,
-    )
-    + _build_schedule(
-        _WEEKEND_ENTRIES, _WEEKEND_DAYS,
-        enabled_default=WEEKEND_TRADING_ENABLED,
-        default_qty_per_leg=0.5,
-    )
+# ── 1-HOUR VARIANT SCHEDULE (feat/trade-gate-1h) ──────────────────────
+# This stack is the okx_signal algo with 1-HOUR holds on a distinct set of
+# WEEKDAY windows and a separate signal file (TRADE_GATE_FILE default =
+# signals/trade_gate_1h.json). SAME mechanic as okx_signal: every window is
+# signal-GATED at 0.5 BTC/leg (skip when should_trade != true) — no ATM
+# strike change, no signal-scaled floor windows. Weekday-only (no weekend).
+# Windows may overlap (10:30/11:00/11:30) — the single-open-straddle guard
+# means an overlapping entry is skipped while the prior 1-hour hold is still
+# open, exactly like the base signal stack.
+#
+# (name, entry_h, entry_m, close_h, close_m) — close is a full 1-HOUR hold,
+# set EXPLICITLY (not the 30-min chained-roll derivation) so overlapping
+# windows each hold their own hour.
+_WEEKDAY_ENTRIES_1H: list[tuple[str, int, int, int, int]] = [
+    ("wd_1030", 10, 30, 11, 30),
+    ("wd_1100", 11,  0, 12,  0),
+    ("wd_1130", 11, 30, 12, 30),
+    ("wd_1300", 13,  0, 14,  0),
+    ("wd_1330", 13, 30, 14, 30),
+    ("wd_1430", 14, 30, 15, 30),
+    ("wd_0000",  0,  0,  1,  0),   # "2400-0100": pre-roll (<08:00) → fires Tue-Sat
+]
+
+
+def _build_schedule_1h(
+    entries: list[tuple[str, int, int, int, int]],
+    trading_days: frozenset[int],
+    *,
+    default_qty_per_leg: float,
+) -> list[Session]:
+    """Build 1-HOUR fixed_btc signal-gated sessions with EXPLICIT closes.
+
+    Mirrors _build_schedule's pre-roll day-shift (entries < 08:00 UTC belong
+    to the prior trading day, so they cron one calendar day later) but takes
+    an explicit close time and applies NO 30-min chaining — the 1-hour
+    windows deliberately overlap."""
+    out: list[Session] = []
+    for (name, eh, em, ch, cm) in entries:
+        cron_days = (
+            frozenset((d + 1) % 7 for d in trading_days)
+            if eh < EXPIRY_ROLL_HOUR_UTC else trading_days
+        )
+        out.append(_build_session(
+            name,
+            entry_utc=time(eh, em),
+            close_utc=time(ch, cm),
+            weekdays=cron_days,
+            default_sizing_mode="fixed_btc",
+            default_qty_per_leg=default_qty_per_leg,
+            default_enabled=True,
+        ))
+    return out
+
+
+SESSIONS: list[Session] = _build_schedule_1h(
+    _WEEKDAY_ENTRIES_1H, _WEEKDAY_DAYS,
+    default_qty_per_leg=_WEEKDAY_FULL_QTY,
 )
 
 
@@ -840,7 +885,7 @@ TRADE_GATE_ENABLED: bool = os.getenv(
 
 # Path to the JSON signal file, relative to the app working dir (/app).
 TRADE_GATE_FILE: str = os.getenv(
-    "TRADE_GATE_FILE", "signals/trade_gate.json",
+    "TRADE_GATE_FILE", "signals/trade_gate_1h.json",
 )
 
 # Max age of the file's ``generated_at_utc`` before the signal is treated
