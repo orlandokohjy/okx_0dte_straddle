@@ -606,7 +606,7 @@ WEEKEND_TRADING_ENABLED: bool = os.getenv(
 # This stack is the okx_signal algo with 1-HOUR holds on a distinct set of
 # WEEKDAY windows and a separate signal file (TRADE_GATE_FILE default =
 # signals/trade_gate_1h.json). SAME mechanic as okx_signal: every window is
-# signal-GATED at 0.5 BTC/leg (skip when should_trade != true) — no ATM
+# signal-GATED at 0.25 BTC/leg (skip when should_trade != true) — no ATM
 # strike change, no signal-scaled floor windows. Weekday-only (no weekend).
 # Windows may overlap (10:30/11:00/11:30) — the single-open-straddle guard
 # means an overlapping entry is skipped while the prior 1-hour hold is still
@@ -658,7 +658,7 @@ def _build_schedule_1h(
 
 SESSIONS: list[Session] = _build_schedule_1h(
     _WEEKDAY_ENTRIES_1H, _WEEKDAY_DAYS,
-    default_qty_per_leg=_WEEKDAY_FULL_QTY,
+    default_qty_per_leg=0.25,   # fixed 0.25 BTC/leg (signal-gated)
 )
 
 
