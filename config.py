@@ -774,6 +774,8 @@ COLLATERAL_BUFFER_FACTOR: float = float(
 )
 
 # Lock the algo after this many consecutive session failures.
+# Set to 0 (or negative) to DISABLE the circuit breaker entirely — the
+# failure counter still increments for logging but never locks entries.
 CONSECUTIVE_FAILURE_LIMIT: int = int(
     os.getenv("CONSECUTIVE_FAILURE_LIMIT", "3")
 )

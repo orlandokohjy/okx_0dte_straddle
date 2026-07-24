@@ -1478,7 +1478,14 @@ class Algo:
         log.warning("session_failure_recorded",
                     count=self._consecutive_failures,
                     limit=config.CONSECUTIVE_FAILURE_LIMIT, reason=reason)
-        if self._consecutive_failures >= config.CONSECUTIVE_FAILURE_LIMIT:
+        # CONSECUTIVE_FAILURE_LIMIT <= 0 DISABLES the circuit breaker: the
+        # failure counter still increments (for logging) but never locks
+        # entries. Use for stacks where a run of skips/failures (e.g. a
+        # signal window saying no-trade, or a transient illiquid leg) must
+        # not halt the whole schedule.
+        if (config.CONSECUTIVE_FAILURE_LIMIT > 0
+                and self._consecutive_failures
+                >= config.CONSECUTIVE_FAILURE_LIMIT):
             self._set_entry_lock(
                 f"{self._consecutive_failures} consecutive session failures "
                 f"— restart algo to reset"
