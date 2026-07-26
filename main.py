@@ -21,7 +21,7 @@ On the Saturday morning close (the last trading day of the week) you
 additionally get:
     SESSION CLOSE → DAILY REPORT → WEEKLY REPORT
 
-Position: 1 ITM call + 1 put (same strike) per session's qty_per_leg.
+Position: long OTM strangle — 1 next-OTM call + 1 next-OTM put per session.
 Compound sizing: 80% of current equity, override default = 1 straddle.
 Maker-only orders with 50%-gap-narrow chase, BOTH legs fired concurrently.
 
@@ -1224,7 +1224,7 @@ class Algo:
         pair = select_straddle_pair(self.chain, spot)
         if pair is None:
             await notifier.notify_skip(
-                f"[{label}] No valid ITM call + put pair near "
+                f"[{label}] No valid OTM strangle (next OTM call + put) near "
                 f"spot ${spot:,.0f}",
             )
             return
@@ -1409,7 +1409,8 @@ class Algo:
                 num_straddles=sizing.num_straddles,
                 equity=equity,
                 straddle_cost=sizing.straddle_cost,
-                strike=pair.strike,
+                strike=pair.call.strike,
+                put_strike=pair.put.strike,
                 call_fill=call_fill_usd,
                 put_fill=put_fill_usd,
                 call_cost_total=call_cost_total_usd,
