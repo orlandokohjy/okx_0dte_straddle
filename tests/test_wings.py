@@ -87,7 +87,8 @@ def test_select_wings_adjacent_offsets():
     # strikes spaced 500 apart; body at 62000
     strikes = [61000, 61500, 62000, 62500, 63000, 63500]
     ch = _chain(strikes, strikes)
-    w = select_wings(ch, 62000.0, call_offset=2, put_offset=1)
+    w = select_wings(ch, call_body_strike=62000.0, put_body_strike=62000.0,
+                     call_offset=2, put_offset=1)
     assert w.call is not None and w.put is not None
     # call wing = 2 strikes above body: 62500 (1st), 63000 (2nd)
     assert w.call.strike == 63000.0
@@ -100,7 +101,8 @@ def test_select_wings_requires_live_bid():
     # zero the bid on the intended call wing (63000) → must be rejected
     ch = _chain(strikes, strikes, bid={61500: 1.0, 62000: 1.0,
                                        62500: 1.0, 63000: 0.0})
-    w = select_wings(ch, 62000.0, call_offset=2, put_offset=1)
+    w = select_wings(ch, call_body_strike=62000.0, put_body_strike=62000.0,
+                     call_offset=2, put_offset=1)
     assert w.call is None            # no live bid at 63000
     assert w.put is not None and w.put.strike == 61500.0
 
@@ -108,7 +110,8 @@ def test_select_wings_requires_live_bid():
 def test_select_wings_insufficient_strikes():
     # only one strike above body → cannot satisfy call_offset=2
     ch = _chain([62000, 62500], [61500, 62000])
-    w = select_wings(ch, 62000.0, call_offset=2, put_offset=1)
+    w = select_wings(ch, call_body_strike=62000.0, put_body_strike=62000.0,
+                     call_offset=2, put_offset=1)
     assert w.call is None
     assert w.put is not None
 

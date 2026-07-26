@@ -695,16 +695,18 @@ RFQ_QUOTE_WAIT_SEC: int = int(os.getenv("RFQ_QUOTE_WAIT_SEC", "20"))
 # the algo SELLS two covered wings — turning the plain long straddle into a
 # (broken-wing) long iron butterfly: capped upside, cheaper cost, defined
 # risk. Maker-only, sold LONGS-FIRST on entry and bought back SHORTS-FIRST
-# on close so we are never naked-short.
-#   • short PUT  = WING_PUT_STRIKE_OFFSET adjacent listed strikes BELOW body
-#   • short CALL = WING_CALL_STRIKE_OFFSET adjacent listed strikes ABOVE body
-# Each wing is always COVERED by the body (long call K / long put K), so a
-# partial or one-sided wing fill is a defined spread, never a naked short.
-# Default OFF — with the flag disabled the plain straddle is byte-for-byte
-# unchanged (no wing selection, no extra orders, no state/log changes).
+# on close so we are never naked-short. This stack's body is a LONG OTM
+# STRANGLE, and wings sit ONE strike FURTHER OUT than each long leg →
+# reverse / long iron condor (defined risk, capped payoff):
+#   • short PUT  = WING_PUT_STRIKE_OFFSET listed strikes BELOW the long put
+#   • short CALL = WING_CALL_STRIKE_OFFSET listed strikes ABOVE the long call
+# Each wing is COVERED by the corresponding long leg, so a partial or
+# one-sided wing fill is a defined spread, never a naked short.
+# Default OFF — with the flag disabled the stack trades a plain long OTM
+# strangle (no wing selection, no extra orders, no state/log changes).
 ENABLE_WINGS: bool = os.getenv("ENABLE_WINGS", "false").lower() == "true"
 WING_PUT_STRIKE_OFFSET: int = int(os.getenv("WING_PUT_STRIKE_OFFSET", "1"))
-WING_CALL_STRIKE_OFFSET: int = int(os.getenv("WING_CALL_STRIKE_OFFSET", "2"))
+WING_CALL_STRIKE_OFFSET: int = int(os.getenv("WING_CALL_STRIKE_OFFSET", "1"))
 # Wing sell-to-open maker-chase budget (minutes). Kept short: an unfilled
 # wing simply means we hold the plain straddle on that side (safe).
 WING_CHASE_DEADLINE_MIN: float = float(

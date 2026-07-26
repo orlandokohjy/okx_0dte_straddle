@@ -424,7 +424,8 @@ async def build_straddle(
         id=straddle_id,
         call_leg=call_leg,
         put_leg=put_leg,
-        strike=pair.strike,
+        strike=pair.call.strike,
+        put_strike=pair.put.strike,
         qty_per_leg=qty_per_leg,
         entry_time=now_utc().isoformat(),
         entry_call_price=call_fill,
@@ -1038,7 +1039,8 @@ def _format_iron_fly_entry(straddle: Straddle) -> str:
         f"  • Call ${straddle.strike:,.0f}  {straddle.entry_call_price:g} "
         f"{unit}  ×{straddle.call_leg.qty:.4f} BTC  = ${body_call:,.2f}")
     lines.append(
-        f"  • Put  ${straddle.strike:,.0f}  {straddle.entry_put_price:g} "
+        f"  • Put  ${(straddle.put_strike or straddle.strike):,.0f}  "
+        f"{straddle.entry_put_price:g} "
         f"{unit}  ×{straddle.put_leg.qty:.4f} BTC  = ${body_put:,.2f}")
 
     wing_credit = 0.0

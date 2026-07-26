@@ -1228,7 +1228,7 @@ class Algo:
         pair = select_straddle_pair(self.chain, spot)
         if pair is None:
             await notifier.notify_skip(
-                f"[{label}] No valid ITM call + put pair near "
+                f"[{label}] No valid OTM strangle (next OTM call + put) near "
                 f"spot ${spot:,.0f}",
             )
             return
@@ -1413,7 +1413,8 @@ class Algo:
                 num_straddles=sizing.num_straddles,
                 equity=equity,
                 straddle_cost=sizing.straddle_cost,
-                strike=pair.strike,
+                strike=pair.call.strike,
+                put_strike=pair.put.strike,
                 call_fill=call_fill_usd,
                 put_fill=put_fill_usd,
                 call_cost_total=call_cost_total_usd,
@@ -1440,7 +1441,9 @@ class Algo:
             if config.session_wings_enabled(session):
                 try:
                     wings = select_wings(
-                        self.chain, pair.strike,
+                        self.chain,
+                        call_body_strike=pair.call.strike,
+                        put_body_strike=pair.put.strike,
                         call_offset=config.WING_CALL_STRIKE_OFFSET,
                         put_offset=config.WING_PUT_STRIKE_OFFSET,
                     )

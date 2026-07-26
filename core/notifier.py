@@ -160,13 +160,16 @@ async def notify_entry(
     session_label: str = "",
     qty_per_leg: float = 0.0,
     wings_enabled: bool = False,
+    put_strike: float = 0.0,
 ) -> None:
     """All money values are USD. The caller is responsible for converting
     BTC-quoted OKX premiums to USD via spot before invoking this.
 
     session_label is a user-visible window such as ``13:30-15:30 UTC``.
-    wings_enabled marks a wing-eligible session (13:00–14:30 UTC window):
-    the header is tagged and a Wings line states covered wings will be sold.
+    ``strike`` is the CALL (OTM) strike; ``put_strike`` the OTM put strike.
+    When they differ this is a long OTM strangle and both strikes are shown.
+    wings_enabled marks a wing-eligible session: the header is tagged and a
+    Wings line states covered wings will be sold.
     """
     header = "<b>SESSION ENTRY</b>"
     if session_label:
@@ -177,10 +180,17 @@ async def notify_entry(
         f"BTC per leg: {qty_per_leg:.4f}\n" if qty_per_leg > 0 else ""
     )
     wings_line = (
-        "Wings: ON — covered call+put wings sold next (see IRON FLY ENTERED)\n"
+        "Wings: ON — short call+put wings sold next (see IRON FLY ENTERED)\n"
         if wings_enabled else
-        "Wings: OFF — plain ATM straddle\n"
+        "Wings: OFF — long OTM strangle\n"
     )
+    if put_strike > 0 and abs(put_strike - strike) > 1e-9:
+        strike_lines = (
+            f"Call strike (OTM): ${strike:,.0f}\n"
+            f"Put strike (OTM):  ${put_strike:,.0f}\n"
+        )
+    else:
+        strike_lines = f"Strike: ${strike:,.0f}\n"
     await send(
         f"{header}\n"
         f"Straddles: {num_straddles}\n"
@@ -188,7 +198,7 @@ async def notify_entry(
         f"{wings_line}"
         f"Equity: ${equity:,.2f}\n"
         f"\n<b>Fills</b>\n"
-        f"Strike: ${strike:,.0f}\n"
+        f"{strike_lines}"
         f"Call premium per BTC: ${call_fill:,.2f}\n"
         f"Put premium per BTC: ${put_fill:,.2f}\n"
         f"\n<b>Capital used</b>\n"
@@ -235,6 +245,7 @@ def _format_close_message(
     qty = float(getattr(s, "qty_per_leg", 0.0))
     num = int(getattr(s, "num_straddles", 1))
     strike = float(getattr(s, "strike", 0.0))
+    put_strike = float(getattr(s, "put_strike", 0.0) or 0.0)
     entry_spot = float(getattr(s, "entry_spot_price", 0.0) or 0.0)
     exit_spot = float(getattr(s, "exit_spot_price", 0.0) or 0.0) or entry_spot
     spot_delta = exit_spot - entry_spot
@@ -276,19 +287,25 @@ def _format_close_message(
     lines: list[str] = [header]
     lines.append(f"ID: {getattr(s, 'id', '?')}")
 
+    # For a long OTM strangle the call/put sit at different strikes; show
+    # both. Legacy single-strike straddles (put_strike 0 or == call) show one.
+    if put_strike > 0 and abs(put_strike - strike) > 1e-9:
+        strike_str = f"Strikes: C ${strike:,.0f} / P ${put_strike:,.0f}"
+    else:
+        strike_str = f"Strike: ${strike:,.0f}"
     if strike > 0:
         if entry_spot > 0 and abs(spot_delta) > 0.01:
             lines.append(
-                f"Strike: ${strike:,.0f}  |  "
+                f"{strike_str}  |  "
                 f"Spot: ${entry_spot:,.0f} → ${exit_spot:,.0f} "
                 f"({_fmt_signed_usd(spot_delta)})"
             )
         elif entry_spot > 0:
             lines.append(
-                f"Strike: ${strike:,.0f}  |  Spot: ${entry_spot:,.0f}"
+                f"{strike_str}  |  Spot: ${entry_spot:,.0f}"
             )
         else:
-            lines.append(f"Strike: ${strike:,.0f}")
+            lines.append(strike_str)
 
     qty_line = f"Qty: {qty:.4f} BTC/leg"
     if num != 1:

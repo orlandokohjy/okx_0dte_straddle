@@ -22,7 +22,7 @@ log = structlog.get_logger(__name__)
 TRADE_LOG_FIELDS = [
     "date", "session", "family", "qty_per_leg",
     "entry_time", "exit_time", "exit_reason",
-    "num_straddles", "strike",
+    "num_straddles", "strike", "put_strike",
     "entry_spot", "exit_spot",
     "call_premium_entry", "call_premium_exit",
     "put_premium_entry", "put_premium_exit",
@@ -110,6 +110,12 @@ class Straddle:
     # context). Optional — older state files may not have them.
     entry_spot_price: float = 0.0
     exit_spot_price: float = 0.0
+
+    # OTM put strike for the long strangle body. The `strike` field above
+    # holds the CALL strike; for a strangle the put sits at a lower strike.
+    # 0.0 means "same as call strike" (legacy ATM straddle) — reports/display
+    # fall back to `strike` in that case. Cosmetic only: never used in P&L.
+    put_strike: float = 0.0
 
     # OKX mark implied vol (decimal, 0.58 = 58%) captured best-effort at
     # entry and exit for analytics. 0.0 means "not captured" (snapshot
@@ -326,6 +332,7 @@ class Straddle:
             "call_leg": self.call_leg.to_dict(),
             "put_leg": self.put_leg.to_dict(),
             "strike": self.strike,
+            "put_strike": self.put_strike,
             "qty_per_leg": self.qty_per_leg,
             "entry_time": self.entry_time,
             "entry_call_price": self.entry_call_price,
@@ -580,6 +587,7 @@ class Portfolio:
             "exit_reason": exit_reason,
             "num_straddles": s.num_straddles,
             "strike": s.strike,
+            "put_strike": s.put_strike or s.strike,
             "entry_spot": s.entry_spot_price,
             "exit_spot": s.exit_spot_price,
             "call_premium_entry": round(call_entry_usd, 4),
