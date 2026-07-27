@@ -95,6 +95,11 @@ QUOTE_COIN: str = os.getenv(
 # qty_per_leg from the Session that fired them — see SESSIONS below.
 QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "0.5"))
 
+# Default fixed-coin notional per leg (ETH units) applied to EVERY session
+# (still overridable per-session via <NAME>_QTY_PER_LEG). Change the sizing for
+# all sessions at once by setting DEFAULT_QTY_PER_LEG in .env.
+DEFAULT_QTY_PER_LEG: float = float(os.getenv("DEFAULT_QTY_PER_LEG", "30.0"))
+
 # OKX BTC options: 1 contract = 0.01 BTC of underlying notional, for
 # both CM and UM families on the user's account (verified empirically
 # 2026-05-15 from the OKX UI: 50 contracts displayed as 0.5 BTC).
@@ -195,7 +200,7 @@ EXPIRY_CUTOFF_UTC: time = time(8, 0)
 # equity grow ~75% before this cap binds. Operator should bump via
 # MAX_QTY_PER_LEG_BTC=10.0 (or similar) once equity grows past ~$13k.
 # When the cap DOES bind, sizing.py logs an INFO event so it's visible.
-MAX_QTY_PER_LEG_BTC: float = float(os.getenv("MAX_QTY_PER_LEG_BTC", "5.0"))
+MAX_QTY_PER_LEG_BTC: float = float(os.getenv("MAX_QTY_PER_LEG_BTC", "30.0"))
 # Lower bound below which we skip the session entirely. OKX's minimum
 # is 1 contract = 0.01 BTC; below that we cannot place an order.
 MIN_QTY_PER_LEG_BTC: float = float(os.getenv("MIN_QTY_PER_LEG_BTC", "0.01"))
@@ -503,7 +508,7 @@ def _build_schedule(
             close_utc=_derive_close(h, m, next_entry_min),
             weekdays=weekdays,
             default_sizing_mode="fixed_btc",
-            default_qty_per_leg=10.0,
+            default_qty_per_leg=DEFAULT_QTY_PER_LEG,
         ))
     return out
 
