@@ -753,14 +753,26 @@ WING_ENTRY_START_UTC: time = _parse_hhmm(
 WING_ENTRY_END_UTC: time = _parse_hhmm(
     os.getenv("WING_ENTRY_END_UTC", "14:30"), 14, 30)
 
+# Wings are weekday-only by default. Weekend sessions (Sat/Sun entry) run the
+# plain ATM straddle even inside the wing window unless this is set true.
+WING_WEEKENDS_ENABLED: bool = os.getenv(
+    "WING_WEEKENDS_ENABLED", "false",
+).lower() == "true"
+
 
 def session_wings_enabled(session: "Session") -> bool:
     """True iff wings should be sold for this session: the master ENABLE_WINGS
-    flag is on AND the session's entry time is within the inclusive wing
-    window. Used at entry time to gate wing selection/selling per-session."""
+    flag is on, the session's entry time is within the inclusive wing window,
+    AND (unless WING_WEEKENDS_ENABLED) the session fires on a weekday. Used at
+    entry time to gate wing selection/selling per-session."""
     if not ENABLE_WINGS:
         return False
-    return WING_ENTRY_START_UTC <= session.entry_utc <= WING_ENTRY_END_UTC
+    if not (WING_ENTRY_START_UTC <= session.entry_utc <= WING_ENTRY_END_UTC):
+        return False
+    if not WING_WEEKENDS_ENABLED and not (session.weekdays & _WEEKDAY_DAYS):
+        # Weekend-only session (no Mon-Fri entry day) → no wings.
+        return False
+    return True
 
 # ──────────────────── Risk Management ─────────────────────────────
 MAX_DAILY_LOSS_PCT: float | None = None
