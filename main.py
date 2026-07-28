@@ -360,21 +360,27 @@ class Algo:
         if not chase_ok:
             log.error("chase_deadline_validation_failed",
                       reason=chase_reason,
-                      deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+                      deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN,
+                      wing_deadline=config.WING_ENTRY_CHASE_DEADLINE_MIN)
             if not self._entry_locked:
                 self._set_entry_lock(chase_reason)
                 await notifier.send(
                     "<b>STARTUP CHASE-DEADLINE MISMATCH</b>\n"
                     f"{chase_reason}\n\n"
                     "<b>Entries are LOCKED</b> until reconciled.\n"
-                    "Action: in .env, set\n"
-                    "  <code>OPTION_ENTRY_CHASE_DEADLINE_MIN=25</code>\n"
-                    "(or any value ≤ shortest_session_window − 5 min) "
-                    "and restart the container."
+                    "Action: in .env, lower the offending knob so it fits "
+                    "the window, then restart:\n"
+                    "  • non-wing sessions need "
+                    "<code>OPTION_ENTRY_CHASE_DEADLINE_MIN</code> "
+                    "≤ window − 5\n"
+                    "  • wing sessions need "
+                    "<code>WING_ENTRY_CHASE_DEADLINE_MIN</code> × 2 "
+                    "≤ window − 5 (body then wings)"
                 )
         else:
             log.info("chase_deadline_validation_ok",
-                     deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+                     deadline=config.OPTION_ENTRY_CHASE_DEADLINE_MIN,
+                     wing_deadline=config.WING_ENTRY_CHASE_DEADLINE_MIN)
 
         # Auth-required startup safeguards. Run whenever we HAVE credentials,
         # regardless of DRY_RUN — this lets a dry-run boot still validate the
@@ -608,6 +614,7 @@ class Algo:
         # each session against its OWN worst-case so a tight non-wing window
         # isn't rejected for a wing budget it never incurs.
         body_deadline = float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+        wing_deadline = float(config.WING_ENTRY_CHASE_DEADLINE_MIN)
         violations: list[str] = []
         any_wing_violation = False
         # Disabled sessions don't fire, so their windows can't race the
@@ -619,7 +626,9 @@ class Algo:
             if not s.enabled:
                 continue
             has_wings = config.session_wings_enabled(s)
-            deadline = body_deadline * (2 if has_wings else 1)
+            # Wing sessions spend 2× the (shorter) wing budget; non-wing
+            # sessions spend 1× the (longer) body budget.
+            deadline = config.session_entry_total_budget_min(s)
             entry_min = s.entry_utc.hour * 60 + s.entry_utc.minute
             close_min = s.close_utc.hour * 60 + s.close_utc.minute
             if close_min < entry_min:
@@ -636,7 +645,8 @@ class Algo:
                 )
         if violations:
             label = (
-                "OPTION_ENTRY_CHASE_DEADLINE_MIN×2 (body+wing)"
+                f"WING_ENTRY_CHASE_DEADLINE_MIN={wing_deadline:.0f}×2 "
+                f"(body+wing)"
                 if any_wing_violation
                 else f"OPTION_ENTRY_CHASE_DEADLINE_MIN={body_deadline:.0f}"
             )
@@ -1053,15 +1063,16 @@ class Algo:
         the caller should then enter (possibly late). Returns False if
         the cutoff passed first — the caller should skip.
 
-        Cutoff: we must leave at least
-        ``OPTION_ENTRY_CHASE_DEADLINE_MIN + CLOSE_RACE_BUFFER_MIN`` minutes
+        Cutoff: we must leave at least this session's worst-case entry budget
+        (``session_entry_total_budget_min`` — 2× on wing sessions for
+        body-then-wings, 1× otherwise) plus ``CLOSE_RACE_BUFFER_MIN`` minutes
         before this session's own close, so a deferred entry never races
         the close cron / violates the chase-deadline margin.
         """
         POLL_SEC = 5.0
         CLOSE_RACE_BUFFER_MIN = 5.0
         required_min = (
-            float(config.OPTION_ENTRY_CHASE_DEADLINE_MIN)
+            config.session_entry_total_budget_min(session)
             + CLOSE_RACE_BUFFER_MIN
         )
 
@@ -1380,12 +1391,17 @@ class Algo:
             f"${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
         )
 
+        # Wing sessions must fit body-chase THEN wing-chase inside the window,
+        # so they use the shorter WING_ENTRY_CHASE_DEADLINE_MIN for both.
+        # Non-wing sessions chase the body once and get the full budget.
+        entry_chase_min = config.session_entry_chase_deadline_min(session)
         straddle = await build_straddle(
             self.exchange, self.market, self.portfolio,
             pair, sizing.num_straddles,
             qty_per_leg=resolved_qty,
             session_name=session.name,
             entry_spot=spot,
+            chase_deadline_min=entry_chase_min,
         )
         if straddle:
             self._consecutive_failures = 0
@@ -1448,6 +1464,7 @@ class Algo:
                         await build_wings(
                             self.exchange, self.market, self.portfolio,
                             straddle, wings,
+                            chase_deadline_min=entry_chase_min,
                         )
                     else:
                         log.warning("no_valid_wings_body_only",

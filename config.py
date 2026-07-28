@@ -779,6 +779,35 @@ def session_wings_enabled(session: "Session") -> bool:
         return False
     return True
 
+
+# ── Per-session entry-chase budget (wing vs non-wing) ─────────────────
+# A WING session spends its window on TWO sequential chases: the body legs
+# (both concurrently → 1× budget) and then the wing sells (another 1×). So a
+# wing session needs 2× the per-chase budget to fit, which used to force the
+# single shared knob down to ~10 min and needlessly shortened the NON-wing
+# sessions too. These are now decoupled: wing sessions use the short
+# WING_ENTRY_CHASE_DEADLINE_MIN (×2 total), non-wing sessions get the full
+# OPTION_ENTRY_CHASE_DEADLINE_MIN for their single body chase.
+WING_ENTRY_CHASE_DEADLINE_MIN: float = float(
+    os.getenv("WING_ENTRY_CHASE_DEADLINE_MIN", "10.0")
+)
+
+
+def session_entry_chase_deadline_min(session: "Session") -> float:
+    """Per-chase entry budget (minutes) for this session — applied to the body
+    chase AND (on wing sessions) to the wing sell chase."""
+    if session_wings_enabled(session):
+        return WING_ENTRY_CHASE_DEADLINE_MIN
+    return OPTION_ENTRY_CHASE_DEADLINE_MIN
+
+
+def session_entry_total_budget_min(session: "Session") -> float:
+    """Worst-case TOTAL entry time for this session: wing sessions chase body
+    then wings sequentially (2×), non-wing sessions chase the body only (1×).
+    Used by the startup window validator and the late-entry cutoff."""
+    per_chase = session_entry_chase_deadline_min(session)
+    return per_chase * (2.0 if session_wings_enabled(session) else 1.0)
+
 # ──────────────────── Risk Management ─────────────────────────────
 MAX_DAILY_LOSS_PCT: float | None = None
 CIRCUIT_BREAKER_API_ERRORS: int = 5

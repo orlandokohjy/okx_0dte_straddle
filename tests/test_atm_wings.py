@@ -86,8 +86,12 @@ def test_returns_none_when_no_tradable_common_strike():
 # ───────────────────── per-session wing gating ───────────────────────
 
 class _S:
-    def __init__(self, h, m):
+    def __init__(self, h, m, weekdays=None):
         self.entry_utc = time(h, m)
+        # session_wings_enabled() gates weekends via WING_WEEKENDS_ENABLED,
+        # so a stub needs entry days. Default to Mon-Fri.
+        self.weekdays = frozenset({0, 1, 2, 3, 4}) if weekdays is None \
+            else weekdays
 
 
 def test_wing_window_gating():
@@ -112,6 +116,76 @@ def test_master_switch_off_disables_all_wings():
         assert not config.session_wings_enabled(_S(13, 30))
     finally:
         config.ENABLE_WINGS = prev
+
+
+def test_weekend_session_gets_no_wings_by_default():
+    prev = config.ENABLE_WINGS
+    config.ENABLE_WINGS = True
+    try:
+        weekend = _S(13, 30, weekdays=frozenset({5, 6}))
+        assert not config.session_wings_enabled(weekend)
+    finally:
+        config.ENABLE_WINGS = prev
+
+
+# ──────────── decoupled wing / non-wing entry-chase budgets ───────────
+
+def test_non_wing_session_gets_full_entry_budget():
+    """A non-wing session chases the body once → 1× the long budget."""
+    prev = config.ENABLE_WINGS
+    config.ENABLE_WINGS = True
+    try:
+        s = _S(9, 0)  # outside the wing window
+        assert not config.session_wings_enabled(s)
+        assert config.session_entry_chase_deadline_min(s) == \
+            config.OPTION_ENTRY_CHASE_DEADLINE_MIN
+        assert config.session_entry_total_budget_min(s) == \
+            config.OPTION_ENTRY_CHASE_DEADLINE_MIN
+    finally:
+        config.ENABLE_WINGS = prev
+
+
+def test_wing_session_uses_short_budget_twice():
+    """A wing session chases body THEN wings → 2× the short wing budget."""
+    prev = config.ENABLE_WINGS
+    config.ENABLE_WINGS = True
+    try:
+        s = _S(13, 30)
+        assert config.session_wings_enabled(s)
+        assert config.session_entry_chase_deadline_min(s) == \
+            config.WING_ENTRY_CHASE_DEADLINE_MIN
+        assert config.session_entry_total_budget_min(s) == \
+            config.WING_ENTRY_CHASE_DEADLINE_MIN * 2
+    finally:
+        config.ENABLE_WINGS = prev
+
+
+def test_every_session_budget_fits_its_window():
+    """The real schedule must satisfy budget ≤ window − 5 for every enabled
+    session, so the startup validator can never lock entries on 20/10."""
+    prev_enable = config.ENABLE_WINGS
+    prev_body = config.OPTION_ENTRY_CHASE_DEADLINE_MIN
+    prev_wing = config.WING_ENTRY_CHASE_DEADLINE_MIN
+    config.ENABLE_WINGS = True
+    config.OPTION_ENTRY_CHASE_DEADLINE_MIN = 20.0
+    config.WING_ENTRY_CHASE_DEADLINE_MIN = 10.0
+    try:
+        for s in config.SESSIONS:
+            if not s.enabled:
+                continue
+            entry_min = s.entry_utc.hour * 60 + s.entry_utc.minute
+            close_min = s.close_utc.hour * 60 + s.close_utc.minute
+            if close_min < entry_min:
+                close_min += 24 * 60
+            max_safe = (close_min - entry_min) - 5.0
+            budget = config.session_entry_total_budget_min(s)
+            assert budget <= max_safe, (
+                f"{s.name}: budget={budget} > max_safe={max_safe}"
+            )
+    finally:
+        config.ENABLE_WINGS = prev_enable
+        config.OPTION_ENTRY_CHASE_DEADLINE_MIN = prev_body
+        config.WING_ENTRY_CHASE_DEADLINE_MIN = prev_wing
 
 
 if __name__ == "__main__":

@@ -134,6 +134,7 @@ async def build_straddle(
     qty_per_leg: float,
     session_name: str,
     entry_spot: float = 0.0,
+    chase_deadline_min: Optional[float] = None,
 ) -> Optional[Straddle]:
     """
     Execute the entry for N identical straddle units.
@@ -146,6 +147,11 @@ async def build_straddle(
     the Session that fired the entry. session_name is stamped onto the
     resulting Straddle so close handlers and the daily report can keep
     each session's results separable.
+
+    ``chase_deadline_min`` overrides the per-leg body-chase budget. The caller
+    passes the SESSION's budget (short on wing sessions, which must also fit a
+    wing chase afterwards; long on non-wing sessions). None → the global
+    OPTION_ENTRY_CHASE_DEADLINE_MIN default inside chase_buy.
     """
     # Session-distinguishing tag for the straddle id. utc_HHMM names map
     # to the 4-digit time so all four sessions get unique tags ("0900",
@@ -214,11 +220,17 @@ async def build_straddle(
                  call_ref=call_ref, put_ref=put_ref, qty=total_qty)
 
         put_task = asyncio.create_task(
-            exchange.chase_buy(pair.put.symbol, total_qty, put_ref),
+            exchange.chase_buy(
+                pair.put.symbol, total_qty, put_ref,
+                deadline_min=chase_deadline_min,
+            ),
             name=f"chase_buy_put_{straddle_id}",
         )
         call_task = asyncio.create_task(
-            exchange.chase_buy(pair.call.symbol, total_qty, call_ref),
+            exchange.chase_buy(
+                pair.call.symbol, total_qty, call_ref,
+                deadline_min=chase_deadline_min,
+            ),
             name=f"chase_buy_call_{straddle_id}",
         )
         # gather will return both results (or propagate the first exception
@@ -892,10 +904,11 @@ async def build_wings(
 
     # Wing qty matches the body leg qty (one wing per straddle unit).
     total_qty = straddle.call_leg.qty
-    # Give the wing SELL the same persistent chaser the body gets on entry
-    # (OPTION_ENTRY_CHASE_DEADLINE_MIN) rather than the old short 10-min
-    # WING_CHASE_DEADLINE_MIN, so a short wing keeps retrying to fill in full
-    # instead of giving up early and leaving a partial.
+    # Give the wing SELL the same persistent chaser the body got on entry, so
+    # a short wing keeps retrying to fill in full instead of giving up early
+    # and leaving a partial. The caller passes the SESSION budget
+    # (WING_ENTRY_CHASE_DEADLINE_MIN on wing sessions) — sized so body-chase
+    # + wing-chase both fit inside the window.
     deadline = (
         chase_deadline_min if chase_deadline_min is not None
         else config.OPTION_ENTRY_CHASE_DEADLINE_MIN
