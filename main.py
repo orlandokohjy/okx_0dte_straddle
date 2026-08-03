@@ -1598,7 +1598,15 @@ class Algo:
         log.warning("session_failure_recorded",
                     count=self._consecutive_failures,
                     limit=config.CONSECUTIVE_FAILURE_LIMIT, reason=reason)
-        if self._consecutive_failures >= config.CONSECUTIVE_FAILURE_LIMIT:
+        # CONSECUTIVE_FAILURE_LIMIT <= 0 DISABLES the circuit breaker: the
+        # failure counter still increments (for logging) but never locks
+        # entries. Without the > 0 test, a limit of 0 read as "off" would
+        # instead lock on the FIRST failure (1 >= 0), which is the opposite
+        # of what the knob reads like. Stacked stacks need this off: a run of
+        # trade-gate skips or one illiquid leg must not halt the schedule.
+        if (config.CONSECUTIVE_FAILURE_LIMIT > 0
+                and self._consecutive_failures
+                >= config.CONSECUTIVE_FAILURE_LIMIT):
             self._set_entry_lock(
                 f"{self._consecutive_failures} consecutive session failures "
                 f"— restart algo to reset"
