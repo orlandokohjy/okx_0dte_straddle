@@ -987,17 +987,51 @@ class Algo:
 
         if exchange_has_positions and not local_has_straddle:
             details = await self._fmt_positions_with_book(exchange_positions)
+            log.warning("startup_orphan_autofix_start",
+                        positions=len(exchange_positions))
+            await notifier.send(
+                f"<b>⚠️ RECONCILIATION MISMATCH — AUTO-FLATTENING</b>\n"
+                f"Exchange has open positions but algo state is empty.\n\n"
+                f"<b>Exchange positions:</b>\n{details}\n\n"
+                f"Auto-flattening now (no manual force_liquidate). "
+                f"Entries stay blocked only until flat."
+            )
+            # Local state empty ⇒ every live contract is excess / residual.
+            # Stacked path sells sibling-safe delta (here = full size);
+            # single-mode path drives the whole book to flat.
+            self._reconcile_active = True
+            try:
+                if config.STACKED_STRADDLES:
+                    excess = self._compute_stacked_excess(exchange_positions)
+                    remaining = await self._flatten_stacked_excess_until_cleared(
+                        excess,
+                    )
+                else:
+                    remaining = await self._flatten_residual_until_flat(
+                        exchange_positions,
+                    )
+            finally:
+                self._reconcile_active = False
+
+            if not remaining:
+                await notifier.send(
+                    "<b>✅ STARTUP ORPHAN CLEARED</b>\n"
+                    "Exchange is flat — entry lock not engaged. Trading OK."
+                )
+                return
+
+            details = await self._fmt_positions_with_book(remaining)
             self._set_entry_lock(
-                f"Exchange has {len(exchange_positions)} open position(s) "
+                f"Exchange has {len(remaining)} open position(s) "
                 f"but algo state is empty — possible orphan",
                 clearable_when_flat=True,
             )
             await notifier.send(
-                f"<b>⚠️ RECONCILIATION MISMATCH</b>\n"
-                f"Exchange has open positions but algo state is empty.\n\n"
-                f"<b>Exchange positions:</b>\n{details}\n\n"
-                f"<b>ACTION</b>: Entry locked until manually resolved.\n"
-                f"Either close the positions or update positions.json.\n"
+                f"<b>⚠️ RECONCILIATION MISMATCH — STILL OPEN</b>\n"
+                f"Auto-flatten did not fully clear:\n\n"
+                f"<b>Remaining:</b>\n{details}\n\n"
+                f"Entries locked until flat (auto-clears / will retry on "
+                f"entry). Last resort: tools/force_liquidate.py."
             )
             return
 
@@ -1726,9 +1760,35 @@ class Algo:
                         session=session_name, exc_info=True)
             return False
         if positions:
-            log.info("orphan_lock_still_not_flat",
+            # Don't just sit locked — try to clear the residual/excess, then
+            # re-check. Covers startup orphans that engaged the lock before
+            # auto-flatten existed, and any clearable lock with live legs.
+            log.info("orphan_lock_still_not_flat_trying_autofix",
                      session=session_name, positions=len(positions))
-            return False
+            if not self._reconcile_active:
+                self._reconcile_active = True
+                try:
+                    if config.STACKED_STRADDLES:
+                        excess = self._compute_stacked_excess(positions)
+                        if excess:
+                            await self._flatten_stacked_excess_until_cleared(
+                                excess,
+                            )
+                    else:
+                        await self._flatten_residual_until_flat(positions)
+                except Exception:
+                    log.warning("orphan_lock_autofix_failed",
+                                session=session_name, exc_info=True)
+                finally:
+                    self._reconcile_active = False
+                try:
+                    positions = await self.exchange.list_open_positions()
+                except Exception:
+                    return False
+                if positions:
+                    return False
+            else:
+                return False
         prior = self._lock_reason
         self._entry_locked = False
         self._lock_reason = ""
@@ -1978,6 +2038,10 @@ class Algo:
         round_no = 0
         taker_alerted = False
         persist_alerted = False
+        # Excess = already-failed close. Prefer taker quickly; cap maker
+        # rounds at 2 min so we don't burn CLOSE_FLATTEN_ROUND_MIN (15)
+        # before crossing the spread.
+        maker_cap_min = min(2.0, float(round_min))
         while True:
             past_soft = now_utc() >= soft_deadline
             round_no += 1
@@ -1986,8 +2050,8 @@ class Algo:
                 taker_alerted = True
                 await notifier.send(
                     "<b>⚠️ EXCESS RE-FLATTEN → TAKER</b>\n"
-                    "Maker rounds did not clear the excess — crossing the "
-                    "spread (taker) on excess qty only."
+                    "Crossing the spread (taker) on excess qty only — "
+                    "sibling floor respected."
                 )
             if past_soft and persist and not persist_alerted:
                 persist_alerted = True
@@ -1998,12 +2062,7 @@ class Algo:
                     f"<b>no manual action needed</b>."
                 )
 
-            remaining_min = max(
-                0.25,
-                (soft_deadline - now_utc()).total_seconds() / 60.0
-                if not past_soft else round_min,
-            )
-            eff_round_min = min(round_min, remaining_min)
+            eff_round_min = maker_cap_min
 
             for p in excess:
                 symbol = p.get("instrument_name", "")
