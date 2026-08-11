@@ -1293,6 +1293,25 @@ class Algo:
                     f"duplicate of the same session)"
                 )
                 return
+            # Self-heal: if a prior close left EXCESS above tracked siblings
+            # (or a full orphan when open_count=0), clear that delta before
+            # opening anything new — sibling-safe, no entry lock.
+            if config.HAS_OKX_CREDS and not self._reconcile_active:
+                try:
+                    live = await self.exchange.list_open_positions()
+                except Exception:
+                    log.warning("preentry_stacked_excess_fetch_failed",
+                                session=session.name, exc_info=True)
+                    live = []
+                excess = self._compute_stacked_excess(live) if live else []
+                if excess:
+                    log.warning("preentry_stacked_excess_autofix",
+                                session=session.name, excess=len(excess))
+                    self._reconcile_active = True
+                    try:
+                        await self._flatten_stacked_excess_until_cleared(excess)
+                    finally:
+                        self._reconcile_active = False
         else:
             if self.portfolio.has_open or self._close_in_progress > 0:
                 # A prior session's straddle is still unwinding (maker-only
@@ -1906,37 +1925,175 @@ class Algo:
             f"{heal_note}"
         )
 
-    async def _post_close_reconcile_stacked(
+    def _compute_stacked_excess(
         self, positions: list[dict],
-    ) -> None:
-        """Sibling-aware, ALERT-ONLY post-close reconcile for stacked mode.
+    ) -> list[dict]:
+        """Return legs held ABOVE what tracked sibling straddles explain.
 
-        After closing one straddle, the exchange still legitimately holds
-        the legs of every OTHER open straddle. Subtract those tracked
-        contracts and only care about a genuine EXCESS beyond all tracked
-        straddles (an actual unclosed/partial leg).
-
-        Unlike single mode this NEVER auto-flattens (a flatten of a shared
-        instrument would liquidate a sibling straddle) and NEVER locks
-        entries (that would halt the whole stacked schedule). A real excess
-        is alerted; a worthless 0DTE leg settles at the 08:00 UTC expiry.
+        ``amount`` on each returned dict is the EXCESS contracts to sell
+        (or the full short amount if unexpectedly short) — never the full
+        live position. Selling only this delta is sibling-safe.
         """
-        ct = config.OKX_CONTRACT_SIZE_BTC or 1.0
-        expected = self.portfolio.expected_open_contracts()  # signed contracts
+        expected = self.portfolio.expected_open_contracts()
         excess: list[dict] = []
         for p in positions:
             sym = p.get("instrument_name", "")
             amt = float(p.get("amount", 0.0))
             exp = expected.get(sym, 0.0)
-            # Long straddles ⇒ positive expected. Residual excess is the
-            # amount above what all tracked straddles account for. Tolerate
-            # <1 contract of drift (rounding / partial settlement dust).
             delta = amt - exp
             if delta > 0.5:  # more long than tracked ⇒ unclosed long leg
                 excess.append({**p, "amount": delta})
             elif amt < -0.5:  # any net short is never expected (all legs long)
                 excess.append(dict(p))
+        return excess
 
+    async def _flatten_stacked_excess_until_cleared(
+        self, excess: list[dict],
+    ) -> list[dict]:
+        """Persistently sell ONLY the excess-above-siblings qty.
+
+        Recomputes the sibling floor every round so a concurrent entry of
+        another session cannot be liquidated. Maker first, then taker.
+        With CLOSE_FLATTEN_PERSIST (default) keeps going past the soft
+        budget until excess is gone. Never locks entries.
+        """
+        budget_min = config.CLOSE_FLATTEN_BUDGET_MIN
+        round_min = config.CLOSE_FLATTEN_ROUND_MIN
+        ct = config.OKX_CONTRACT_SIZE_BTC or 1.0
+        soft_deadline = now_utc() + timedelta(minutes=budget_min)
+        taker_after = getattr(config, "CLOSE_FLATTEN_TAKER_AFTER_ROUNDS", 2)
+        persist = getattr(config, "CLOSE_FLATTEN_PERSIST", True)
+
+        log.warning("stacked_excess_reflatten_start",
+                    excess=len(excess), budget_min=budget_min,
+                    persist=persist)
+        details = await self._fmt_positions_with_book(excess)
+        await notifier.send(
+            f"<b>♻️ POST-CLOSE EXCESS — AUTO-FLATTENING</b>\n"
+            f"Selling only the excess above tracked sibling straddles "
+            f"(sibling-safe). Entries stay unlocked.\n\n"
+            f"{details}"
+        )
+
+        round_no = 0
+        taker_alerted = False
+        persist_alerted = False
+        while True:
+            past_soft = now_utc() >= soft_deadline
+            round_no += 1
+            use_taker = round_no > taker_after or (past_soft and persist)
+            if use_taker and not taker_alerted:
+                taker_alerted = True
+                await notifier.send(
+                    "<b>⚠️ EXCESS RE-FLATTEN → TAKER</b>\n"
+                    "Maker rounds did not clear the excess — crossing the "
+                    "spread (taker) on excess qty only."
+                )
+            if past_soft and persist and not persist_alerted:
+                persist_alerted = True
+                await notifier.send(
+                    f"<b>🔄 EXCESS RE-FLATTEN CONTINUING</b>\n"
+                    f"Still excess after {budget_min:.0f} min soft budget. "
+                    f"Keeping sibling-safe taker flatten running — "
+                    f"<b>no manual action needed</b>."
+                )
+
+            remaining_min = max(
+                0.25,
+                (soft_deadline - now_utc()).total_seconds() / 60.0
+                if not past_soft else round_min,
+            )
+            eff_round_min = min(round_min, remaining_min)
+
+            for p in excess:
+                symbol = p.get("instrument_name", "")
+                delta = float(p.get("amount", 0.0))
+                if not symbol or abs(delta) < 0.5:
+                    continue
+                try:
+                    if delta > 0:
+                        qty_btc = delta * ct
+                        if use_taker:
+                            await self.exchange._taker_flatten_long(
+                                symbol, qty_btc,
+                            )
+                        else:
+                            bid, ask = await self.market.get_option_bid_ask(
+                                symbol,
+                            )
+                            if ask <= 0:
+                                log.info("stacked_excess_skip_no_ask",
+                                         instrument=symbol, round=round_no)
+                                continue
+                            await self.exchange.chase_sell(
+                                symbol, qty_btc, ask,
+                                deadline_min=eff_round_min,
+                            )
+                    else:
+                        # Unexpected short — buy back excess short qty only.
+                        qty_btc = abs(delta) * ct
+                        bid, ask = await self.market.get_option_bid_ask(symbol)
+                        if bid <= 0:
+                            continue
+                        if use_taker:
+                            # No dedicated short helper used here; chase buy
+                            # back as maker/taker via chase_buy (taker path
+                            # below uses a crossing ask when available).
+                            await self.exchange.chase_buy(
+                                symbol, qty_btc, ask if ask > 0 else bid,
+                                deadline_min=eff_round_min,
+                            )
+                        else:
+                            await self.exchange.chase_buy(
+                                symbol, qty_btc, bid,
+                                deadline_min=eff_round_min,
+                            )
+                except Exception:
+                    log.warning("stacked_excess_chase_error",
+                                instrument=symbol, round=round_no,
+                                exc_info=True)
+
+            try:
+                positions = await self.exchange.list_open_positions()
+            except Exception:
+                log.warning("stacked_excess_requery_failed",
+                            round=round_no, exc_info=True)
+                await asyncio.sleep(5.0)
+                continue
+
+            excess = self._compute_stacked_excess(positions)
+            if not excess:
+                log.info("stacked_excess_cleared", rounds=round_no)
+                await notifier.send(
+                    f"<b>✅ POST-CLOSE EXCESS CLEARED</b>\n"
+                    f"Excess flat after {round_no} sibling-safe round(s). "
+                    f"Tracked siblings (if any) left untouched."
+                )
+                return []
+
+            if past_soft and not persist:
+                break
+            await asyncio.sleep(min(30.0, max(1.0, round_min * 60.0)))
+
+        log.warning("stacked_excess_reflatten_exhausted",
+                    rounds=round_no, remaining=len(excess))
+        return excess
+
+    async def _post_close_reconcile_stacked(
+        self, positions: list[dict],
+    ) -> None:
+        """Sibling-aware post-close reconcile for stacked mode.
+
+        After closing one straddle, the exchange still legitimately holds
+        the legs of every OTHER open straddle. Subtract those tracked
+        contracts and only act on genuine EXCESS beyond all tracked
+        straddles (an actual unclosed/partial leg).
+
+        Excess is auto-flattened by selling ONLY the delta above the
+        sibling floor (never a full-instrument flatten). Entries are
+        never locked. Worthless dust can still settle at 08:00 UTC.
+        """
+        excess = self._compute_stacked_excess(positions)
         if not excess:
             log.info("post_close_reconcile_ok_stacked",
                      tracked_straddles=self.portfolio.open_count,
@@ -1954,10 +2111,21 @@ class Algo:
             f"more than the {self.portfolio.open_count} still-open tracked "
             f"straddle(s) account for — a leg likely did not fully close:\n\n"
             f"{details}\n\n"
-            f"Entries are NOT locked (stacked schedule keeps running). A "
-            f"worthless 0DTE leg settles at 08:00 UTC expiry; otherwise "
-            f"flatten the excess with tools/force_liquidate.py."
+            f"Entries stay unlocked. Auto-flattening the excess qty only "
+            f"(siblings untouched) — no manual force_liquidate needed."
         )
+        remaining = await self._flatten_stacked_excess_until_cleared(excess)
+        if remaining:
+            details = await self._fmt_positions_with_book(remaining)
+            await notifier.send(
+                f"<b>⚠️ POST-CLOSE EXCESS STILL OPEN</b>\n"
+                f"Auto-flatten exhausted "
+                f"(CLOSE_FLATTEN_PERSIST="
+                f"{getattr(config, 'CLOSE_FLATTEN_PERSIST', True)}).\n\n"
+                f"{details}\n\n"
+                f"A worthless 0DTE leg settles at 08:00 UTC; otherwise "
+                f"flatten the excess with tools/force_liquidate.py."
+            )
 
     # ──────────────────── Close ───────────────────────────────────
 

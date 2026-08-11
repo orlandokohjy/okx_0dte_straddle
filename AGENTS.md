@@ -400,11 +400,12 @@ other stack keeps its strict single-position safety.
   never flattens the instrument to zero (which would liquidate a same-strike
   sibling). `unwind_straddle`'s transient-retry resell honours a
   `sibling_floor` so a reconnect can't oversell into a sibling.
-- **Reconcile** (`_post_close_reconcile_stacked`) is sibling-aware +
-  **ALERT-ONLY**: it subtracts `expected_open_contracts()` and only warns on a
-  genuine EXCESS beyond all tracked straddles. It NEVER auto-flattens and
-  NEVER locks entries (that would halt the whole overlapping schedule). A
-  worthless 0DTE leg settles at the 08:00 UTC expiry.
+- **Reconcile** (`_post_close_reconcile_stacked`) is sibling-aware: it
+  subtracts `expected_open_contracts()` and acts only on genuine EXCESS
+  beyond tracked straddles. It auto-flattens **excess qty only** (sibling-safe
+  — never a full-instrument flatten) and NEVER locks entries. Pre-entry also
+  clears leftover excess before opening a new session. Worthless dust can
+  still settle at the 08:00 UTC expiry.
 - **Trade-off (accepted):** same-strike overlapping straddles NET on OKX, so
   per-straddle realised P&L is APPROXIMATE (booked at each straddle's own
   fills) and orphan cleanup is weaker (alert + expiry vs forced flatten).

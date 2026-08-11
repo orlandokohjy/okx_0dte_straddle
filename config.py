@@ -871,6 +871,17 @@ CLOSE_FLATTEN_BUDGET_MIN: float = float(
 CLOSE_FLATTEN_ROUND_MIN: float = float(
     os.getenv("CLOSE_FLATTEN_ROUND_MIN", "15.0")
 )
+# After this many maker-only re-flatten rounds, escalate to taker-cross
+# (risk-reducing sell/buy-back). Also used by stacked excess auto-flatten.
+CLOSE_FLATTEN_TAKER_AFTER_ROUNDS: int = int(
+    os.getenv("CLOSE_FLATTEN_TAKER_AFTER_ROUNDS", "2")
+)
+# Keep re-flatten / stacked-excess flatten running past the soft budget
+# until the residual (or excess-above-siblings) is cleared. Default on so
+# operators are not forced to run force_liquidate for sellable leftovers.
+CLOSE_FLATTEN_PERSIST: bool = os.getenv(
+    "CLOSE_FLATTEN_PERSIST", "true",
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Pre-entry spread gate: skip session if put or call (ask − bid) / mid > this
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(

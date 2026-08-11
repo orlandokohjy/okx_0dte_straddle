@@ -199,15 +199,21 @@ def test_stacked_reconcile_alerts_on_excess_only():
     algo = _algo_with_portfolio(pf)
 
     sent = []
+    flattened = []
 
     async def _send(msg):
         sent.append(msg)
 
+    async def _flatten(excess):
+        flattened.append(list(excess))
+        return []  # cleared
+
     orig = main.notifier.send
     main.notifier.send = _send
+    algo._flatten_stacked_excess_until_cleared = _flatten
     try:
         # Live book has 40 on the call (15 more than the tracked sibling) →
-        # a genuine unclosed leg → ALERT (but never locks).
+        # a genuine unclosed leg → ALERT + sibling-safe auto-flatten.
         positions = [
             {"instrument_name": "C-65000", "amount": 40.0},
             {"instrument_name": "P-65000", "amount": 25.0},
@@ -216,11 +222,40 @@ def test_stacked_reconcile_alerts_on_excess_only():
     finally:
         main.notifier.send = orig
 
-    assert len(sent) == 1, sent
-    assert "EXCESS" in sent[0]
+    assert len(sent) >= 1, sent
+    assert any("EXCESS" in m for m in sent)
+    assert flattened and abs(flattened[0][0]["amount"] - 15.0) < 1e-9
     # Must NOT have locked entries (stacked schedule keeps running).
     assert getattr(algo, "_entry_locked", False) is False
     print("OK stacked_reconcile_alerts_on_excess_only")
+
+
+def test_compute_stacked_excess_full_orphan_when_none_tracked():
+    pf = _fresh_portfolio()
+    algo = _algo_with_portfolio(pf)
+    positions = [
+        {"instrument_name": "C-64000", "amount": 25.0},
+        {"instrument_name": "P-64000", "amount": 25.0},
+    ]
+    excess = algo._compute_stacked_excess(positions)
+    assert len(excess) == 2
+    assert all(abs(e["amount"] - 25.0) < 1e-9 for e in excess)
+    print("OK compute_stacked_excess_full_orphan_when_none_tracked")
+
+
+def test_compute_stacked_excess_respects_sibling_floor():
+    pf = _fresh_portfolio()
+    pf.set_straddle(_straddle("wd_1100", 64000, "C-64000", "P-64000"))
+    algo = _algo_with_portfolio(pf)
+    # 50 live = 25 sibling + 25 orphan excess
+    positions = [
+        {"instrument_name": "C-64000", "amount": 50.0},
+        {"instrument_name": "P-64000", "amount": 50.0},
+    ]
+    excess = algo._compute_stacked_excess(positions)
+    assert len(excess) == 2
+    assert all(abs(e["amount"] - 25.0) < 1e-9 for e in excess)
+    print("OK compute_stacked_excess_respects_sibling_floor")
 
 
 if __name__ == "__main__":
@@ -230,4 +265,6 @@ if __name__ == "__main__":
     test_expected_open_contracts_floor()
     test_stacked_reconcile_silent_when_matches_tracked()
     test_stacked_reconcile_alerts_on_excess_only()
+    test_compute_stacked_excess_full_orphan_when_none_tracked()
+    test_compute_stacked_excess_respects_sibling_floor()
     print("\nAll stacked-straddle tests passed.")
