@@ -122,6 +122,45 @@ def _utc_iso(t_unix: float) -> str:
     return datetime.fromtimestamp(t_unix, tz=timezone.utc).isoformat()
 
 
+
+def uncovered_reduce_sell_contracts(
+    live_long_contracts: float,
+    open_orders: list[dict],
+    instrument: str,
+    *,
+    exclude_ord_ids: frozenset[str] | None = None,
+) -> int:
+    """Contracts still needed to flatten ``instrument`` after resting sells.
+
+    2026-08-19: a partial-fill rollback already had a live SELL for the
+    leftover long when close re-flatten fired a *second* sell → ``51008``.
+    If open sells already cover the live long, return 0.
+    """
+    exclude = exclude_ord_ids or frozenset()
+    try:
+        long_c = int(round(max(0.0, float(live_long_contracts))))
+    except (TypeError, ValueError):
+        long_c = 0
+    if long_c <= 0:
+        return 0
+    resting = 0
+    for o in open_orders or []:
+        if o.get("instId") != instrument:
+            continue
+        if str(o.get("side") or "").lower() != "sell":
+            continue
+        oid = str(o.get("ordId") or "")
+        if oid and oid in exclude:
+            continue
+        try:
+            sz = int(round(float(o.get("sz") or 0)))
+            acc = int(round(float(o.get("accFillSz") or 0)))
+        except (TypeError, ValueError):
+            continue
+        resting += max(0, sz - acc)
+    return max(0, long_c - resting)
+
+
 async def _notify_chase_failure(
     *,
     side: str,
@@ -335,6 +374,47 @@ class Ticker:
     ask: float = 0.0
     mark: float = 0.0
     last: float = 0.0
+
+
+
+@dataclass
+class MarginSnapshot:
+    """USD equity + isolated IM headroom from ``GET /api/v5/account/balance``.
+
+    Isolated concurrent BUY legs freeze IM against ``availEq``, even when
+    ``totalEq`` (and USDT cash) look ample. ``avail_eq is None`` means OKX
+    omitted the field — fall back to ``totalEq``. A present ``0`` is real
+    zero headroom, not "missing".
+    """
+    total_eq: float = 0.0
+    avail_eq: float | None = None
+    iso_eq: float = 0.0
+    ord_froz: float = 0.0
+    imr: float = 0.0
+
+    @property
+    def spendable(self) -> float:
+        if self.avail_eq is not None:
+            return self.avail_eq
+        return self.total_eq
+
+
+# Isolated concurrent BUY: 51008/51016 are often transient. Retry like a
+# post-only reject. Do NOT Telegram FATAL on each retry. Keep 51008
+# special-cased on SELL. Opening wing shorts pass opening=True so the
+# reduce-sell cover-check does not block a new short.
+BUY_RETRYABLE_INSUFFICIENT: frozenset[str] = frozenset({"51008", "51016"})
+BUY_FATAL_CODES: frozenset[str] = frozenset({
+    "51000",
+    "51001",
+    "51010",
+    "51019",
+    "51020",
+    "51115",
+    "51121",
+    "51169",
+    "51198",
+})
 
 
 # ─────────────────────────── Exchange ────────────────────────────────
@@ -954,6 +1034,39 @@ class OKXExchange:
                 return self._f(d, "eqUsd") or self._f(d, "eq")
         return self._f(rows[0], "totalEq")
 
+    async def get_account_margin_snapshot(self) -> MarginSnapshot:
+        """Return USD equity + isolated IM headroom from account/balance.
+
+        ``get_account_equity`` stays on ``totalEq`` (P&L / pct_equity).
+        Pre-flight sizes isolated concurrent BUY legs against ``availEq``.
+        """
+        empty = MarginSnapshot()
+        try:
+            resp = await self._call(self._account.get_account_balance)
+            rows = self._data_or_empty(resp)
+        except Exception:
+            log.warning("get_account_margin_snapshot_failed", exc_info=True)
+            return empty
+        if not rows:
+            return empty
+        row = rows[0]
+        raw_avail = row.get("availEq")
+        if raw_avail is None or raw_avail == "":
+            avail_eq = None
+        else:
+            try:
+                avail_eq = float(raw_avail)
+            except (TypeError, ValueError):
+                avail_eq = None
+        return MarginSnapshot(
+            total_eq=self._f(row, "totalEq"),
+            avail_eq=avail_eq,
+            iso_eq=self._f(row, "isoEq"),
+            ord_froz=self._f(row, "ordFroz"),
+            imr=self._f(row, "imr"),
+        )
+
+
     async def list_open_positions(self) -> list[dict]:
         """List all option positions for the active family.
 
@@ -1007,6 +1120,38 @@ class OKXExchange:
         )
         rows = self._data_or_empty(resp)
         return rows
+
+
+    async def uncovered_reduce_sell_qty_btc(
+        self, instrument: str, want_qty_btc: float,
+        *,
+        exclude_ord_ids: frozenset[str] | None = None,
+    ) -> float:
+        """Coin still needed to reduce ``instrument`` after live longs and
+        resting sells. 0.0 = already covered (do not place another sell)."""
+        ct = config.OKX_CONTRACT_SIZE_BTC
+        try:
+            want_c = int(round(max(0.0, float(want_qty_btc)) / ct))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+        if want_c <= 0:
+            return 0.0
+        try:
+            live = await self.get_option_position(instrument)
+        except Exception:
+            log.warning("uncovered_reduce_live_pos_failed",
+                        instrument=instrument, exc_info=True)
+            live = want_c
+        try:
+            orders = await self.list_open_orders()
+        except Exception:
+            log.warning("uncovered_reduce_orders_failed",
+                        instrument=instrument, exc_info=True)
+            orders = []
+        still = uncovered_reduce_sell_contracts(
+            live, orders, instrument, exclude_ord_ids=exclude_ord_ids,
+        )
+        return float(min(want_c, still)) * ct
 
     async def cancel_orders_for_instrument(self, instrument: str) -> int:
         """Cancel any open orders for a specific instrument.
@@ -1392,19 +1537,7 @@ class OKXExchange:
         # for each order_id we touch and sum at the end.
         fees_by_ord_id: dict[str, float] = {}
 
-        FATAL_CODES = {
-            "51000",   # Parameter error
-            "51001",   # Instrument doesn't exist
-            "51008",   # Insufficient {ccy} margin (BTC for inverse options!)
-            "51010",   # tdMode/instType incompatible
-            "51016",   # Insufficient balance (general)
-            "51019",   # Net long not allowed under cross margin (use isolated)
-            "51020",   # Account in restricted mode
-            "51115",   # Margin mode not enabled / account-mode wrong
-            "51121",   # Position direction restriction
-            "51169",   # Pricing limit
-            "51198",   # Options trading not yet activated by user
-        }
+        FATAL_CODES = BUY_FATAL_CODES
 
         async def _credit_resting_fills(
             fallback_price: float,
@@ -1613,6 +1746,16 @@ class OKXExchange:
                     await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                     continue
 
+                if sCode in BUY_RETRYABLE_INSUFFICIENT:
+                    log.warning(
+                        "chase_buy_insufficient_retry",
+                        instrument=instrument, sCode=sCode, sMsg=sMsg,
+                        attempt=attempt, filled_so_far=filled_contracts,
+                        qty_btc=qty_btc,
+                    )
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
                 if sCode in FATAL_CODES:
                     log.error("chase_buy_fatal_reject",
                               instrument=instrument, sCode=sCode, sMsg=sMsg,
@@ -1791,6 +1934,8 @@ class OKXExchange:
     async def chase_sell(
         self, instrument: str, qty_btc: float, initial_ask: float,
         deadline_min: Optional[float] = None,
+        *,
+        opening: bool = False,
     ) -> Optional[dict]:
         """
         Maker-only sell chase with partial-fill tracking and queue-priority
@@ -2017,6 +2162,24 @@ class OKXExchange:
                         break
                     remaining_contracts = target_contracts - filled_contracts
                     remaining_qty_btc = remaining_contracts * ct_val
+
+                # Reduce-sell cover-check: skip if a resting sell already
+                # covers the live long. NEVER run this on opening shorts
+                # (wing overlay) — those have no long to cover.
+                if not opening:
+                    uncovered_btc = await self.uncovered_reduce_sell_qty_btc(
+                        instrument, remaining_qty_btc,
+                    )
+                    uncovered_c = int(round(uncovered_btc / ct_val)) if ct_val else 0
+                    if uncovered_c <= 0:
+                        log.info("chase_sell_skip_already_covered",
+                                 instrument=instrument, attempt=attempt,
+                                 remaining_contracts=remaining_contracts)
+                        await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                        continue
+                    if uncovered_c < remaining_contracts:
+                        remaining_contracts = uncovered_c
+                        remaining_qty_btc = remaining_contracts * ct_val
 
                 log.info("chase_sell_attempt",
                          instrument=instrument, attempt=attempt,
