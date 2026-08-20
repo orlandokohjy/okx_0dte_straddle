@@ -31,12 +31,32 @@ import structlog
 import config
 from core import family, notifier
 from core.exchange import OKXExchange, _TRANSIENT_HTTP_EXCEPTIONS
+from core import session_journal
 from core.portfolio import Portfolio, Straddle, StraddleLeg
 from data.market_data import MarketData
 from strategy.option_selector import StraddlePair, WingLeg, WingPair
 from utils.time_utils import now_utc
 
 log = structlog.get_logger(__name__)
+
+
+def _leg_metric_fields(result):
+    if not result:
+        return {}
+    metrics = result.get("metrics") or {}
+    return {
+        "px": result.get("average_price"),
+        "attempts": metrics.get("attempts"),
+        "duration_sec": metrics.get("duration_sec"),
+        "last_error": result.get("last_error") or metrics.get("last_error"),
+    }
+
+
+def _record_build_outcome(recorder, ctx, result, reason="", **extra):
+    if recorder is not None:
+        recorder.outcome(result, reason, **extra)
+    else:
+        session_journal.record_entry_outcome(ctx, result, reason, **extra)
 
 
 def _format_leg_fill_message(
@@ -134,6 +154,7 @@ async def build_straddle(
     qty_per_leg: float,
     session_name: str,
     entry_spot: float = 0.0,
+    recorder: Optional[session_journal.EntryRecorder] = None,
 ) -> Optional[Straddle]:
     """
     Execute the entry for N identical straddle units.
@@ -157,10 +178,27 @@ async def build_straddle(
         sess_tag = (session_name[:1] or "X").upper()
     straddle_id = f"OKX-{sess_tag}-{uuid.uuid4().hex[:8]}"
     total_qty = qty_per_leg * num_straddles
+    jctx = recorder.ctx if recorder is not None else session_journal.ctx_for_name(session_name)
 
     log.info("building_straddle", id=straddle_id, session=session_name,
              strike=pair.strike, qty_per_leg=qty_per_leg,
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles)
+    session_journal.emit(
+        "entry_attempt", jctx,
+        straddle_id=straddle_id,
+        call_symbol=pair.call.symbol,
+        put_symbol=pair.put.symbol,
+        qty_per_leg=qty_per_leg,
+        strike=pair.strike,
+        spot=entry_spot,
+    )
+    session_journal.upsert_summary(
+        jctx,
+        qty_per_leg=qty_per_leg,
+        strike=pair.strike,
+        call_symbol=pair.call.symbol,
+        put_symbol=pair.put.symbol,
+    )
 
     # ── Pre-entry spread gate ──
     call_spread = _spread_pct(pair.call.bid, pair.call.ask, pair.call.mark)
@@ -174,6 +212,7 @@ async def build_straddle(
         )
         log.warning("spread_gate_skip", id=straddle_id, msg=msg)
         await notifier.notify_skip(msg)
+        _record_build_outcome(recorder, jctx, "skipped", msg)
         return None
 
     # ── Optional RFQ atomic entry ──
@@ -250,6 +289,11 @@ async def build_straddle(
                         id=straddle_id,
                         filled_qty_btc=put_partial_qty,
                         target_qty_btc=total_qty)
+            session_journal.emit(
+                "leg_partial", jctx, leg="put", symbol=pair.put.symbol,
+                qty=put_partial_qty, target_qty=total_qty,
+                **_leg_metric_fields(put_result),
+            )
             put_result = None
         if call_result is not None and not call_result.get("fully_filled", True):
             call_partial_qty = float(call_result.get("filled_qty_btc", 0.0))
@@ -257,6 +301,11 @@ async def build_straddle(
                         id=straddle_id,
                         filled_qty_btc=call_partial_qty,
                         target_qty_btc=total_qty)
+            session_journal.emit(
+                "leg_partial", jctx, leg="call", symbol=pair.call.symbol,
+                qty=call_partial_qty, target_qty=total_qty,
+                **_leg_metric_fields(call_result),
+            )
             call_result = None
 
         # Per-leg fill notification fires for FULL-fill legs only. Partial
@@ -264,6 +313,11 @@ async def build_straddle(
         # the operator sees both messages: "PARTIAL FILL DETECTED" first,
         # then the partial-leg-failure handling below.
         if put_result is not None:
+            session_journal.emit(
+                "leg_fill", jctx, leg="put", symbol=pair.put.symbol,
+                qty=put_result.get("filled_qty_btc", total_qty),
+                **_leg_metric_fields(put_result),
+            )
             await notifier.send(
                 _format_leg_fill_message(
                     leg="PUT",
@@ -274,6 +328,11 @@ async def build_straddle(
                 )
             )
         if call_result is not None:
+            session_journal.emit(
+                "leg_fill", jctx, leg="call", symbol=pair.call.symbol,
+                qty=call_result.get("filled_qty_btc", total_qty),
+                **_leg_metric_fields(call_result),
+            )
             await notifier.send(
                 _format_leg_fill_message(
                     leg="CALL",
@@ -311,6 +370,24 @@ async def build_straddle(
                     exchange, pair.call.symbol, call_partial_qty,
                     pair.call.ask,
                 )
+            had_partial = put_partial_qty > 0 or call_partial_qty > 0
+            if put_partial_qty <= 0:
+                session_journal.emit("leg_no_fill", jctx, leg="put",
+                                    symbol=pair.put.symbol)
+            if call_partial_qty <= 0:
+                session_journal.emit("leg_no_fill", jctx, leg="call",
+                                    symbol=pair.call.symbol)
+            if had_partial:
+                session_journal.emit(
+                    "entry_rollback", jctx,
+                    put_qty=put_partial_qty, call_qty=call_partial_qty,
+                    reason="both_legs_failed_with_partial",
+                )
+            _record_build_outcome(
+                recorder, jctx,
+                "partial_flattened" if had_partial else "no_fill",
+                "both_legs_failed",
+            )
             return None
 
         if put_result is not None and call_result is None:
@@ -338,6 +415,14 @@ async def build_straddle(
                     exchange, pair.call.symbol, call_partial_qty,
                     pair.call.ask,
                 )
+            session_journal.emit(
+                "entry_rollback", jctx,
+                reason="call_leg_failed", put_qty=put_qty_for_emer,
+                call_qty=call_partial_qty,
+            )
+            _record_build_outcome(
+                recorder, jctx, "partial_flattened", "call_leg_failed",
+            )
             return None
 
         if call_result is not None and put_result is None:
@@ -366,6 +451,14 @@ async def build_straddle(
                     exchange, pair.put.symbol, put_partial_qty,
                     pair.put.ask,
                 )
+            session_journal.emit(
+                "entry_rollback", jctx,
+                reason="put_leg_failed", call_qty=call_qty_for_emer,
+                put_qty=put_partial_qty,
+            )
+            _record_build_outcome(
+                recorder, jctx, "partial_flattened", "put_leg_failed",
+            )
             return None
 
         # Both filled — build the legs.
@@ -472,6 +565,11 @@ async def build_straddle(
     else:
         cost_str = (f"n/a (spot=0, native={straddle_cost * num_straddles:.4f} "
                     f"{family.native_quote_unit_label()})")
+    _record_build_outcome(
+        recorder, jctx, "opened", intent="buy",
+        qty_per_leg=qty_per_leg, strike=pair.strike,
+        call_symbol=pair.call.symbol, put_symbol=pair.put.symbol,
+    )
     log.info("straddle_built", id=straddle_id, session=session_name,
              num=num_straddles,
              cost=cost_str,
