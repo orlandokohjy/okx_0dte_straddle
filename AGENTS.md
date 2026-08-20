@@ -191,6 +191,21 @@ hard safety net. The chase loop:
 If any future change removes `post_only=True` or the keep-alive guard,
 revert immediately.
 
+### Isolated IM / buy `51008` (2026-08-20) — SETTLED
+
+AIML is `acctLv=3` multi-ccy, hedge, **isolated**, USDT-funded. CM inverse
+auto-borrows BTC against USDT — do **not** tell the operator to "fund BTC"
+and do **not** set `OKX_TD_MODE=cross` (`51019` risk on net-long entries).
+
+`get_account_equity()` / `totalEq` is wallet equity (P&L and `pct_equity`).
+Isolated concurrent BUY legs freeze IM against **`availEq`**. Pre-flight
+sizes and gates on `availEq` (size down to `OKX_CONTRACT_SIZE_BTC`, else
+skip). `chase_buy` treats `51008` / `51016` as retryable — do **not**
+Telegram FATAL on each retry. `51008` on SELL stays special-cased
+(taker flatten + cover-check). 2026-08-20 wd_1100 / wd_1130 / wd_1200
+each passed pre-flight on `totalEq` (~$1.2k) then 51008'd the second
+leg because `availEq` was ~$606 (existing BTC borrow / IMR).
+
 ---
 
 ## Schedule architecture

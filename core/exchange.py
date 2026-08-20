@@ -376,6 +376,45 @@ class Ticker:
     last: float = 0.0
 
 
+@dataclass
+class MarginSnapshot:
+    """USD equity + isolated IM headroom from ``GET /api/v5/account/balance``.
+
+    Isolated concurrent BUY legs freeze IM against ``availEq``, even when
+    ``totalEq`` (and USDT cash) look ample. ``avail_eq is None`` means OKX
+    omitted the field — fall back to ``totalEq``. A present ``0`` is real
+    zero headroom, not "missing".
+    """
+    total_eq: float = 0.0
+    avail_eq: float | None = None
+    iso_eq: float = 0.0
+    ord_froz: float = 0.0
+    imr: float = 0.0
+
+    @property
+    def spendable(self) -> float:
+        if self.avail_eq is not None:
+            return self.avail_eq
+        return self.total_eq
+
+
+# Isolated concurrent BUY: 51008/51016 are often transient (sibling
+# reservation / fill not yet reflected). Retry like a post-only reject.
+# Do NOT Telegram FATAL on each retry. Keep 51008 special-cased on SELL.
+BUY_RETRYABLE_INSUFFICIENT: frozenset[str] = frozenset({"51008", "51016"})
+BUY_FATAL_CODES: frozenset[str] = frozenset({
+    "51000",   # Parameter error
+    "51001",   # Instrument doesn't exist
+    "51010",   # tdMode/instType incompatible
+    "51019",   # Net long not allowed under cross margin (use isolated)
+    "51020",   # Account in restricted mode
+    "51115",   # Margin mode not enabled / account-mode wrong
+    "51121",   # Position direction restriction
+    "51169",   # Pricing limit
+    "51198",   # Options trading not yet activated by user
+})
+
+
 # ─────────────────────────── Exchange ────────────────────────────────
 
 class OKXExchange:
@@ -993,6 +1032,40 @@ class OKXExchange:
                 return self._f(d, "eqUsd") or self._f(d, "eq")
         return self._f(rows[0], "totalEq")
 
+    async def get_account_margin_snapshot(self) -> MarginSnapshot:
+        """Return USD equity + isolated IM headroom from account/balance.
+
+        ``get_account_equity`` stays on ``totalEq`` (P&L / pct_equity).
+        Pre-flight must size isolated concurrent BUY legs against
+        ``availEq`` — see AGENTS.md "Isolated IM / buy 51008".
+        """
+        empty = MarginSnapshot()
+        try:
+            resp = await self._call(self._account.get_account_balance)
+            rows = self._data_or_empty(resp)
+        except Exception:
+            log.warning("get_account_margin_snapshot_failed", exc_info=True)
+            return empty
+        if not rows:
+            return empty
+        row = rows[0]
+        raw_avail = row.get("availEq")
+        avail_eq: float | None
+        if raw_avail is None or raw_avail == "":
+            avail_eq = None
+        else:
+            try:
+                avail_eq = float(raw_avail)
+            except (TypeError, ValueError):
+                avail_eq = None
+        return MarginSnapshot(
+            total_eq=self._f(row, "totalEq"),
+            avail_eq=avail_eq,
+            iso_eq=self._f(row, "isoEq"),
+            ord_froz=self._f(row, "ordFroz"),
+            imr=self._f(row, "imr"),
+        )
+
     async def list_open_positions(self) -> list[dict]:
         """List all option positions for the active family.
 
@@ -1458,19 +1531,7 @@ class OKXExchange:
         # for each order_id we touch and sum at the end.
         fees_by_ord_id: dict[str, float] = {}
 
-        FATAL_CODES = {
-            "51000",   # Parameter error
-            "51001",   # Instrument doesn't exist
-            "51008",   # Insufficient {ccy} margin (BTC for inverse options!)
-            "51010",   # tdMode/instType incompatible
-            "51016",   # Insufficient balance (general)
-            "51019",   # Net long not allowed under cross margin (use isolated)
-            "51020",   # Account in restricted mode
-            "51115",   # Margin mode not enabled / account-mode wrong
-            "51121",   # Position direction restriction
-            "51169",   # Pricing limit
-            "51198",   # Options trading not yet activated by user
-        }
+        FATAL_CODES = BUY_FATAL_CODES
 
         async def _credit_resting_fills(
             fallback_price: float,
@@ -1676,6 +1737,16 @@ class OKXExchange:
                         or "post_only" in sMsg.lower():
                     log.info("chase_buy_post_only_rejected",
                              instrument=instrument, attempt=attempt)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+
+                if sCode in BUY_RETRYABLE_INSUFFICIENT:
+                    log.warning(
+                        "chase_buy_insufficient_retry",
+                        instrument=instrument, sCode=sCode, sMsg=sMsg,
+                        attempt=attempt, filled_so_far=filled_contracts,
+                        qty_btc=qty_btc,
+                    )
                     await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                     continue
 
