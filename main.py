@@ -46,6 +46,7 @@ from core import family, notifier
 from core.exchange import OKXExchange
 from core.portfolio import Portfolio
 from core.scheduler import Scheduler
+from core import session_journal
 from data.market_data import MarketData
 from data.option_chain import OptionChain
 from risk.risk_manager import RiskManager
@@ -1157,6 +1158,11 @@ class Algo:
                 log.info("trade_gate_waiting",
                          session=session.name, reason=decision.reason,
                          wait_sec=wait_sec)
+                session_journal.record_gate_wait(
+                    session_journal.ctx_for(session),
+                    decision.reason,
+                    elapsed,
+                )
             await asyncio.sleep(poll_sec)
             decision = evaluate_trade_gate(session)
 
@@ -1189,12 +1195,22 @@ class Algo:
 
     async def _run_entry(self, session: config.Session) -> None:
         label = session.time_label
+        rec = session_journal.EntryRecorder(session)
         log.info("session_entry_start",
                  session=session.name,
                  label=label,
                  sizing_mode=session.sizing_mode,
                  pct_equity=session.pct_equity,
                  fallback_qty_per_leg=session.qty_per_leg)
+        try:
+            await self._run_entry_body(session, rec)
+        finally:
+            rec.finish_if_needed()
+
+    async def _run_entry_body(
+        self, session: config.Session, rec: session_journal.EntryRecorder,
+    ) -> None:
+        label = session.time_label
 
         if self._entry_locked:
             # Orphan/position locks may auto-release once the exchange is
@@ -1207,6 +1223,7 @@ class Algo:
                 await notifier.notify_skip(
                     f"[{label}] Entry locked: {self._lock_reason}",
                 )
+                rec.blocked(self._lock_reason or "entry_locked")
                 return
 
         api_check = self.risk.check_api_health(self.exchange.error_count)
@@ -1216,6 +1233,7 @@ class Algo:
             await notifier.notify_skip(
                 f"[{label}] {api_check.reason}",
             )
+            rec.blocked(api_check.reason)
             return
 
         loss_check = self.risk.check_daily_loss()
@@ -1225,6 +1243,7 @@ class Algo:
             await notifier.notify_skip(
                 f"[{label}] {loss_check.reason}",
             )
+            rec.blocked(loss_check.reason)
             return
 
         # ── External trade-gate signal (optional, default OFF) ──
@@ -1241,8 +1260,12 @@ class Algo:
         # floor. Signal-GATED windows keep the fail-safe skip below.
         qty_override: float | None = None
         if config.TRADE_GATE_ENABLED:
+            gate_t0 = now_utc()
             gate = await self._resolve_trade_gate(session, label)
+            gate_wait_sec = (now_utc() - gate_t0).total_seconds()
             if session.signal_scaled:
+                intent = "full" if gate.allowed else "floor"
+                rec.gate_decision(gate, wait_sec=gate_wait_sec, intent=intent)
                 if gate.allowed:
                     qty_override = session.qty_per_leg
                     log.info("trade_gate_scaled_full",
@@ -1264,14 +1287,17 @@ class Algo:
                         f"{_fmt_should_trade(gate)}\n{gate.reason}",
                     )
             elif not gate.allowed:
+                rec.gate_decision(gate, wait_sec=gate_wait_sec, intent="skip")
                 log.info("entry_blocked_trade_gate",
                          session=session.name, reason=gate.reason)
                 await notifier.notify_skip(
                     f"[{label}] Trade gate — entry skipped: "
                     f"{_fmt_should_trade(gate)} — {gate.reason}",
                 )
+                rec.outcome("skipped_signal", gate.reason, intent="skip")
                 return
             else:
+                rec.gate_decision(gate, wait_sec=gate_wait_sec, intent="buy")
                 log.info("trade_gate_ok",
                          session=session.name, reason=gate.reason)
 
@@ -1284,6 +1310,7 @@ class Algo:
             # passes first, skip.
             flat = await self._wait_for_flat(session, label)
             if not flat:
+                rec.blocked("prior_straddle_not_flat_cutoff", result="blocked")
                 return
 
         # ── Pre-entry exchange-flat guard (defence-in-depth) ──
@@ -1321,6 +1348,7 @@ class Algo:
                     f"<b>ENTRIES ARE NOW LOCKED.</b> Flatten with "
                     f"tools/force_liquidate.py, then restart to clear."
                 )
+                rec.blocked(f"exchange_not_flat: {detail}")
                 return
 
         total_options = await self.chain.refresh()
@@ -1329,6 +1357,7 @@ class Algo:
             await notifier.notify_skip(
                 f"[{label}] No 0DTE options found on OKX",
             )
+            rec.outcome("skipped", "no_0dte_options")
             return
 
         spot = await self.exchange.get_spot_price()
@@ -1338,6 +1367,7 @@ class Algo:
                 f"[{label}] No valid ITM call + put pair near "
                 f"spot ${spot:,.0f}",
             )
+            rec.outcome("skipped", "no_valid_pair")
             return
 
         if config.HAS_OKX_CREDS:
@@ -1371,6 +1401,7 @@ class Algo:
             )
             log.warning("entry_skipped_by_sizing", **sizing_audit)
             await notifier.notify_skip(msg)
+            rec.outcome("skipped", str(sizing_audit.get("skip_reason", "sizing")))
             return
 
         # Premium quotes are in BTC; sizer needs spot to compute USD costs.
@@ -1421,6 +1452,7 @@ class Algo:
             )
             log.warning("zero_straddles", msg=msg)
             await notifier.notify_skip(msg)
+            rec.outcome("skipped", "insufficient_capital")
             return
 
         entry_check = self.risk.check_entry(
@@ -1429,6 +1461,7 @@ class Algo:
         if not entry_check.allowed:
             log.warning("entry_blocked", reason=entry_check.reason)
             await notifier.notify_skip(entry_check.reason)
+            rec.blocked(entry_check.reason)
             return
 
         # ── Pre-entry collateral check ──
@@ -1445,6 +1478,7 @@ class Algo:
                 )
                 log.warning("collateral_check_failed", msg=msg)
                 await notifier.notify_skip(msg)
+                rec.blocked("insufficient_collateral")
                 return
             log.info("collateral_check_ok",
                      available=f"${available:,.2f}",
@@ -1504,6 +1538,7 @@ class Algo:
                 f"entry chase ({chase_deadline_min:.1f} min &lt; "
                 f"{MIN_ENTRY_CHASE_MIN:.0f} min) — skipping."
             )
+            rec.outcome("skipped", "insufficient_window")
             return
         log.info("entry_chase_deadline_resolved",
                  session=session.name,
@@ -1517,6 +1552,7 @@ class Algo:
             session_name=session.name,
             entry_spot=spot,
             chase_deadline_min=chase_deadline_min,
+            recorder=rec,
         )
         if straddle:
             self._consecutive_failures = 0
@@ -1562,6 +1598,14 @@ class Algo:
                      put_fill_native=straddle.entry_put_price,
                      call_fill_usd=call_fill_usd,
                      put_fill_usd=put_fill_usd)
+            rec.outcome(
+                "opened",
+                intent="buy",
+                qty_per_leg=resolved_qty,
+                strike=pair.strike,
+                call_symbol=pair.call.symbol,
+                put_symbol=pair.put.symbol,
+            )
         else:
             log.error("straddle_build_failed", session=session.name)
             self._register_session_failure(
@@ -1715,6 +1759,12 @@ class Algo:
         log.warning("post_close_residual_reflatten_start",
                     positions=len(positions), budget_min=budget_min,
                     round_min=round_min)
+        _jctx = getattr(self, "_journal_close_ctx", None)
+        if _jctx is not None:
+            session_journal.emit(
+                "reflatten_round", _jctx, round=0,
+                positions=len(positions), reason="start",
+            )
         await notifier.send(
             f"<b>♻️ POST-CLOSE RESIDUAL — RE-FLATTENING</b>\n"
             f"Unwind left {len(positions)} open leg(s). Persistently "
@@ -1801,8 +1851,11 @@ class Algo:
                     rounds=round_no, remaining=len(positions))
         return positions
 
-    async def _post_close_reconcile(self) -> None:
-        """After unwind, verify exchange is actually flat. Alert on orphans."""
+    async def _post_close_reconcile(self) -> str:
+        """After unwind, verify exchange is actually flat. Alert on orphans.
+
+        Returns ``clean`` / ``reflatten`` / ``orphan`` / ``unknown``.
+        """
         # A re-flatten loop from an earlier session's close may still be
         # running (its budget can span the next window). It re-reads the
         # family-wide position set each round and will absorb any residual,
@@ -1810,29 +1863,29 @@ class Algo:
         # instrument would oversell into a short.
         if self._reconcile_active:
             log.info("post_close_reconcile_skip_already_active")
-            return
+            return "unknown"
         self._reconcile_active = True
         try:
-            await self._post_close_reconcile_inner()
+            return await self._post_close_reconcile_inner()
         finally:
             self._reconcile_active = False
 
-    async def _post_close_reconcile_inner(self) -> None:
+    async def _post_close_reconcile_inner(self) -> str:
         try:
             positions = await self.exchange.list_open_positions()
         except Exception:
             log.warning("post_close_reconcile_fetch_failed", exc_info=True)
-            return
+            return "unknown"
 
         if not positions:
             log.info("post_close_flat_ok")
-            return
+            return "clean"
 
         # Residual after unwind — keep trying to close it (maker-only) before
         # locking. The lock is a genuine last resort, not the first response.
         positions = await self._flatten_residual_until_flat(positions)
         if not positions:
-            return
+            return "reflatten"
 
         details = await self._fmt_positions_with_book(positions)
         log.warning("post_close_orphan_detected",
@@ -1871,23 +1924,36 @@ class Algo:
             f"straddles until this is resolved.\n"
             f"{heal_note}"
         )
+        return "orphan"
 
     # ──────────────────── Close ───────────────────────────────────
 
     async def _on_close(self, session: config.Session) -> None:
         label = session.time_label
         self._close_in_progress += 1
+        close_ctx = session_journal.ctx_for(session)
+        self._journal_close_ctx = close_ctx
+        session_journal.emit("close_start", close_ctx)
         try:
             equity_before = self.portfolio.equity
             pnl = await self.exit_mgr.hard_close(
                 session_name=session.name, session_label=label,
             )
 
+            close_status = "n/a"
             if config.HAS_OKX_CREDS:
                 live_equity = await self.exchange.get_account_equity()
                 if live_equity > 0:
                     self.portfolio.sync_equity(live_equity)
-                await self._post_close_reconcile()
+                close_status = await self._post_close_reconcile()
+            elif self.portfolio.last_closed_straddle is not None:
+                close_status = "clean"
+
+            row = session_journal.find_summary(close_ctx.session_id)
+            opened = bool(row and row.get("entry_result") == "opened")
+            if close_status == "clean" and not opened:
+                close_status = "n/a"
+            session_journal.record_close_outcome(close_ctx, close_status)
 
             actual_pnl = self.portfolio.equity - equity_before
 
@@ -2030,6 +2096,7 @@ class Algo:
             # entry waiting on _wait_for_flat never races the position
             # wipe at the tail of this handler.
             self._close_in_progress = max(0, self._close_in_progress - 1)
+            self._journal_close_ctx = None
 
     @staticmethod
     def _is_last_close_for_weekday(

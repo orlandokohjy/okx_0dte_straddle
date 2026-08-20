@@ -122,6 +122,45 @@ def _utc_iso(t_unix: float) -> str:
     return datetime.fromtimestamp(t_unix, tz=timezone.utc).isoformat()
 
 
+def uncovered_reduce_sell_contracts(
+    live_long_contracts: float,
+    open_orders: list[dict],
+    instrument: str,
+    *,
+    exclude_ord_ids: frozenset[str] | None = None,
+) -> int:
+    """Contracts still needed to flatten ``instrument`` after resting sells.
+
+    2026-08-19: a partial-fill rollback already had a live SELL for the
+    leftover 0.3 put when the 01:55 close re-flatten fired a *second* 0.3
+    sell (0.6 vs 0.3 held) → isolated ``51008``. If open sells already
+    cover the live long, return 0 so the caller does not place another.
+    """
+    exclude = exclude_ord_ids or frozenset()
+    try:
+        long_c = int(round(max(0.0, float(live_long_contracts))))
+    except (TypeError, ValueError):
+        long_c = 0
+    if long_c <= 0:
+        return 0
+    resting = 0
+    for o in open_orders or []:
+        if o.get("instId") != instrument:
+            continue
+        if str(o.get("side") or "").lower() != "sell":
+            continue
+        oid = str(o.get("ordId") or "")
+        if oid and oid in exclude:
+            continue
+        try:
+            sz = int(round(float(o.get("sz") or 0)))
+            acc = int(round(float(o.get("accFillSz") or 0)))
+        except (TypeError, ValueError):
+            continue
+        resting += max(0, sz - acc)
+    return max(0, long_c - resting)
+
+
 async def _notify_chase_failure(
     *,
     side: str,
@@ -1007,6 +1046,37 @@ class OKXExchange:
         )
         rows = self._data_or_empty(resp)
         return rows
+
+    async def uncovered_reduce_sell_qty_btc(
+        self, instrument: str, want_qty_btc: float,
+        *,
+        exclude_ord_ids: frozenset[str] | None = None,
+    ) -> float:
+        """BTC still needed to reduce ``instrument`` after live longs and
+        resting sells. 0.0 = already covered (do not place another sell)."""
+        ct = config.OKX_CONTRACT_SIZE_BTC
+        try:
+            want_c = int(round(max(0.0, float(want_qty_btc)) / ct))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+        if want_c <= 0:
+            return 0.0
+        try:
+            live = await self.get_option_position(instrument)
+        except Exception:
+            log.warning("uncovered_reduce_live_pos_failed",
+                        instrument=instrument, exc_info=True)
+            live = want_c
+        try:
+            orders = await self.list_open_orders()
+        except Exception:
+            log.warning("uncovered_reduce_orders_failed",
+                        instrument=instrument, exc_info=True)
+            orders = []
+        still = uncovered_reduce_sell_contracts(
+            live, orders, instrument, exclude_ord_ids=exclude_ord_ids,
+        )
+        return float(min(want_c, still)) * ct
 
     async def cancel_orders_for_instrument(self, instrument: str) -> int:
         """Cancel any open orders for a specific instrument.
@@ -2014,6 +2084,22 @@ class OKXExchange:
                     remaining_contracts = target_contracts - filled_contracts
                     remaining_qty_btc = remaining_contracts * ct_val
 
+                # Don't stack a second reduce-sell on top of one that
+                # already covers the live long (rollback + close re-flatten).
+                uncovered_btc = await self.uncovered_reduce_sell_qty_btc(
+                    instrument, remaining_qty_btc,
+                )
+                uncovered_c = int(round(uncovered_btc / ct_val)) if ct_val else 0
+                if uncovered_c <= 0:
+                    log.info("chase_sell_skip_already_covered",
+                             instrument=instrument, attempt=attempt,
+                             remaining_contracts=remaining_contracts)
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+                if uncovered_c < remaining_contracts:
+                    remaining_contracts = uncovered_c
+                    remaining_qty_btc = remaining_contracts * ct_val
+
                 log.info("chase_sell_attempt",
                          instrument=instrument, attempt=attempt,
                          price=new_price, bid=bid, ask=ask, mark=mark,
@@ -2276,6 +2362,14 @@ class OKXExchange:
             want_contracts = int(min(long_contracts, cap_contracts)) \
                 if cap_contracts > 0 else int(long_contracts)
             if want_contracts <= 0:
+                return empty
+            already_btc = await self.uncovered_reduce_sell_qty_btc(
+                instrument, want_contracts * ct_val,
+            )
+            want_contracts = int(round(already_btc / ct_val)) if ct_val else 0
+            if want_contracts <= 0:
+                log.info("taker_flatten_long_skip_already_covered",
+                         instrument=instrument, live_amount=amt)
                 return empty
             ticker = await self.get_ticker(instrument)
             bid = float(getattr(ticker, "bid", 0.0) or 0.0)

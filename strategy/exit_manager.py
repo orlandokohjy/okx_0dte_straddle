@@ -31,6 +31,16 @@ class ExitManager:
         if not self._portfolio.has_open:
             log.info("nothing_to_close",
                      session=session_name, label=session_label)
+            try:
+                from core import session_journal
+                session_journal.emit(
+                    "close_outcome",
+                    session_journal.ctx_for_name(session_name),
+                    result="n/a",
+                    reason="nothing_to_close",
+                )
+            except Exception:
+                pass
             return 0.0
 
         equity_before = self._portfolio.equity
