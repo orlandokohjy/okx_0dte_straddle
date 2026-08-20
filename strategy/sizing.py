@@ -316,6 +316,35 @@ def compute_qty_per_leg(
     return qty, audit
 
 
+
+def fit_qty_to_spendable(
+    qty_btc: float,
+    required_usd: float,
+    spendable_usd: float,
+    *,
+    min_qty: float | None = None,
+    safety: float = 0.95,
+) -> float:
+    """Scale qty down so isolated IM (``required_usd``) fits ``availEq``.
+
+    Returns 0 if even ``MIN_QTY_PER_LEG_BTC`` would still exceed
+    spendable. Caller then skips instead of opening one-leg + 51008.
+    """
+    floor = config.MIN_QTY_PER_LEG_BTC if min_qty is None else min_qty
+    if qty_btc <= 0 or required_usd <= 0:
+        return qty_btc
+    if spendable_usd <= 0:
+        return 0.0
+    if spendable_usd >= required_usd:
+        return qty_btc
+    scaled = _round_down_to_contract(
+        qty_btc * (spendable_usd / required_usd) * safety,
+    )
+    if scaled < floor:
+        return 0.0
+    return scaled
+
+
 def telegram_summary_line(audit: dict, qty: float, num_straddles: int) -> str:
     """One-line "how was this sized?" string for the entry Telegram banner.
 
@@ -328,6 +357,10 @@ def telegram_summary_line(audit: dict, qty: float, num_straddles: int) -> str:
     """
     decision = audit.get("decision", "?")
     qty_str = f"{qty:.4f} BTC × {num_straddles}"
+
+    if decision == "avail_eq_fit":
+        prior = float(audit.get("prior_qty_btc") or 0.0)
+        return f"Sized down to availEq ({prior:.4f} → {qty_str})"
 
     if decision == "fixed_btc":
         return f"Sized fixed_btc: {qty_str}"

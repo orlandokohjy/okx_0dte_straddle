@@ -278,6 +278,25 @@ hard safety net. The chase loop:
 If any future change removes `post_only=True` or the keep-alive guard,
 revert immediately.
 
+### Session journal vs trade_log (2026-08-20) — SETTLED
+
+`trade_log.csv` stays booked P&L only (one row per fully opened + closed
+straddle). Skips, no-fills, one-leg rollbacks, and orphan flattens go to
+`state/session_events.jsonl` + `state/session_summary.csv`. Join key:
+`stack, trading_day, session, session_id`. Journal I/O is fail-open.
+
+### Isolated IM / buy `51008` (2026-08-20) — SETTLED
+
+Pre-flight sizes and gates on **`availEq`** (size down to contract, else
+skip). `get_account_equity()` / `totalEq` remains wallet equity (P&L /
+pct_equity). `chase_buy` treats `51008` / `51016` as retryable — do **not**
+Telegram FATAL on each retry. `51008` on SELL stays special-cased (taker
+flatten + cover-check). Do **not** flip `OKX_TD_MODE` here: PM (`acctLv=4`)
+stacks stay `cross`; multi-ccy (`acctLv=3`) stacks stay `isolated`.
+Opening wing shorts pass `opening=True` so the reduce-sell cover-check
+does not block a new short.
+
+
 ### `51008` on sell (residual flatten) — SETTLED
 
 Maker `chase_sell` on a residual long leg can be rejected with `51008`
@@ -342,8 +361,14 @@ it's also `utc_2230` (Sun close). Tue-Sat use `utc_0100`.
 - `ENABLED=false` disables a session without code changes.
   `ENABLED=true` re-enables.
 - `MAX_QTY_PER_LEG_BTC=0` disables the safety cap entirely.
-  Anything > 0 caps `qty_per_leg` at that BTC value (applies to
-  `pct_equity` sizing only — `fixed_btc` never trips the cap).
+  Anything > 0 caps `qty_per_leg` at that coin value.
+  ⚠️ **It caps `fixed_btc` TOO** — `sizing.py` runs `_apply_max_cap()` inside
+  the `fixed_btc` fast path (see `size_position`). An earlier revision of this
+  file claimed "`fixed_btc` never trips the cap"; that was WRONG and it cost a
+  debugging cycle when a `DEFAULT_QTY_PER_LEG=30` ETH stack silently traded a
+  clamped size instead. **Whenever you raise `DEFAULT_QTY_PER_LEG`, raise
+  `MAX_QTY_PER_LEG_BTC` to at least the same value** (or set it to `0`).
+  When the cap binds, `sizing.py` logs `sizing_capped_to_max` at INFO.
 - `OPTION_ENTRY_CHASE_DEADLINE_MIN=25.0` is the production setting.
   The validator at startup ensures this fits inside every enabled
   session's window.
