@@ -52,7 +52,12 @@ from risk.risk_manager import RiskManager
 from strategy.exit_manager import ExitManager
 from strategy.option_selector import select_straddle_pair, select_wings
 from strategy.position_sizer import size_position
-from strategy.sizing import compute_qty_per_leg, telegram_summary_line
+from core import session_journal
+from strategy.sizing import (
+    compute_qty_per_leg,
+    fit_qty_to_spendable,
+    telegram_summary_line,
+)
 from strategy.straddle_builder import build_straddle, build_wings, unwind_straddle
 from utils import volume_tracker
 from utils.logging_config import setup_logging
@@ -1140,6 +1145,15 @@ class Algo:
             )
 
     async def _run_entry(self, session: config.Session) -> None:
+        rec = session_journal.EntryRecorder(session)
+        try:
+            await self._run_entry_body(session, rec)
+        finally:
+            rec.finish_if_needed()
+
+    async def _run_entry_body(
+        self, session: config.Session, rec: session_journal.EntryRecorder,
+    ) -> None:
         label = session.time_label
         log.info("session_entry_start",
                  session=session.name,
@@ -1159,6 +1173,7 @@ class Algo:
                 await notifier.notify_skip(
                     f"[{label}] Entry locked: {self._lock_reason}",
                 )
+                rec.blocked(self._lock_reason or "entry_locked")
                 return
 
         api_check = self.risk.check_api_health(self.exchange.error_count)
@@ -1168,6 +1183,7 @@ class Algo:
             await notifier.notify_skip(
                 f"[{label}] {api_check.reason}",
             )
+            rec.blocked(api_check.reason)
             return
 
         loss_check = self.risk.check_daily_loss()
@@ -1177,6 +1193,7 @@ class Algo:
             await notifier.notify_skip(
                 f"[{label}] {loss_check.reason}",
             )
+            rec.blocked(loss_check.reason)
             return
 
         if self.portfolio.has_open or self._close_in_progress > 0:
@@ -1188,6 +1205,7 @@ class Algo:
             # passes first, skip.
             flat = await self._wait_for_flat(session, label)
             if not flat:
+                rec.outcome("skipped", "wait_for_flat")
                 return
 
         # ── Pre-entry exchange-flat guard (defence-in-depth) ──
@@ -1225,6 +1243,7 @@ class Algo:
                     f"<b>ENTRIES ARE NOW LOCKED.</b> Flatten with "
                     f"tools/force_liquidate.py, then restart to clear."
                 )
+                rec.blocked("exchange_not_flat")
                 return
 
         total_options = await self.chain.refresh()
@@ -1233,6 +1252,7 @@ class Algo:
             await notifier.notify_skip(
                 f"[{label}] No 0DTE options found on OKX",
             )
+            rec.outcome("skipped", "no_0dte_options")
             return
 
         spot = await self.exchange.get_spot_price()
@@ -1242,6 +1262,7 @@ class Algo:
                 f"[{label}] No valid ITM call + put pair near "
                 f"spot ${spot:,.0f}",
             )
+            rec.outcome("skipped", "no_valid_pair")
             return
 
         if config.HAS_OKX_CREDS:
@@ -1274,6 +1295,7 @@ class Algo:
             )
             log.warning("entry_skipped_by_sizing", **sizing_audit)
             await notifier.notify_skip(msg)
+            rec.outcome("skipped", str(sizing_audit.get("skip_reason", "sizing")))
             return
 
         # Premium quotes are in BTC; sizer needs spot to compute USD costs.
@@ -1324,6 +1346,7 @@ class Algo:
             )
             log.warning("zero_straddles", msg=msg)
             await notifier.notify_skip(msg)
+            rec.outcome("skipped", "insufficient_capital")
             return
 
         entry_check = self.risk.check_entry(
@@ -1332,26 +1355,97 @@ class Algo:
         if not entry_check.allowed:
             log.warning("entry_blocked", reason=entry_check.reason)
             await notifier.notify_skip(entry_check.reason)
+            rec.blocked(entry_check.reason)
             return
 
-        # ── Pre-entry collateral check ──
+        # ── Pre-entry collateral check (isolated availEq) ──
+        margin_snap = None
         if config.HAS_OKX_CREDS:
-            available = await self.exchange.get_account_equity()
-            required = sizing.total_capital_required \
-                * config.COLLATERAL_BUFFER_FACTOR
-            if available > 0 and available < required:
-                msg = (
-                    f"Insufficient OKX trading-account balance.\n"
-                    f"Available: ${available:,.2f}\n"
-                    f"Required (× {config.COLLATERAL_BUFFER_FACTOR:.2f} "
-                    f"buffer): ${required:,.2f}"
+            margin_snap = await self.exchange.get_account_margin_snapshot()
+            have_snap = (
+                margin_snap.total_eq > 0 or margin_snap.avail_eq is not None
+            )
+            required = (
+                sizing.total_capital_required * config.COLLATERAL_BUFFER_FACTOR
+            )
+            if have_snap:
+                spendable = margin_snap.spendable
+                if spendable > 0 and spendable < required and resolved_qty > 0:
+                    fitted = fit_qty_to_spendable(
+                        resolved_qty, required, spendable,
+                    )
+                    if fitted > 0 and fitted < resolved_qty:
+                        old_qty = resolved_qty
+                        resolved_qty = fitted
+                        sizing = size_position(
+                            equity, pair.call.ask, pair.put.ask, spot,
+                            qty_per_leg=resolved_qty,
+                        )
+                        if session.sizing_mode in ("pct_equity", "fixed_usd"):
+                            forced_n = 1
+                        elif config.NUM_STRADDLES_OVERRIDE > 0:
+                            forced_n = config.NUM_STRADDLES_OVERRIDE
+                        else:
+                            forced_n = sizing.num_straddles
+                        if forced_n != sizing.num_straddles:
+                            sizing.num_straddles = forced_n
+                            sizing.total_call_cost = (
+                                sizing.call_cost_per * sizing.num_straddles
+                            )
+                            sizing.total_put_cost = (
+                                sizing.put_cost_per * sizing.num_straddles
+                            )
+                            sizing.total_capital_required = (
+                                (sizing.total_call_cost + sizing.total_put_cost)
+                                * 1.05
+                            )
+                        required = (
+                            sizing.total_capital_required
+                            * config.COLLATERAL_BUFFER_FACTOR
+                        )
+                        sizing_audit = {
+                            **sizing_audit,
+                            "decision": "avail_eq_fit",
+                            "prior_qty_btc": old_qty,
+                            "final_qty_btc": resolved_qty,
+                            "avail_eq": margin_snap.avail_eq,
+                            "total_eq": margin_snap.total_eq,
+                        }
+                        log.warning(
+                            "collateral_qty_reduced",
+                            old_qty=old_qty,
+                            new_qty=resolved_qty,
+                            avail_eq=margin_snap.avail_eq,
+                            total_eq=margin_snap.total_eq,
+                            required=required,
+                        )
+                if spendable < required:
+                    avail_s = (
+                        f"${margin_snap.avail_eq:,.2f}"
+                        if margin_snap.avail_eq is not None
+                        else "n/a"
+                    )
+                    msg = (
+                        f"Insufficient isolated availEq.\n"
+                        f"availEq: {avail_s}\n"
+                        f"totalEq: ${margin_snap.total_eq:,.2f}\n"
+                        f"Required (× {config.COLLATERAL_BUFFER_FACTOR:.2f} "
+                        f"IM): ${required:,.2f}"
+                    )
+                    log.warning("collateral_check_failed", msg=msg)
+                    await notifier.notify_skip(msg)
+                    rec.blocked("insufficient_collateral")
+                    return
+                log.info(
+                    "collateral_check_ok",
+                    avail_eq=margin_snap.avail_eq,
+                    total_eq=margin_snap.total_eq,
+                    imr=margin_snap.imr,
+                    spendable=f"${spendable:,.2f}",
+                    required=f"${required:,.2f}",
                 )
-                log.warning("collateral_check_failed", msg=msg)
-                await notifier.notify_skip(msg)
-                return
-            log.info("collateral_check_ok",
-                     available=f"${available:,.2f}",
-                     required=f"${required:,.2f}")
+            else:
+                log.warning("collateral_snapshot_empty")
 
         log.info(
             "preflight_check_passed",
@@ -1367,6 +1461,32 @@ class Algo:
             ),
         )
 
+
+        req_im = (
+            sizing.total_capital_required * config.COLLATERAL_BUFFER_FACTOR
+        )
+        if (
+            margin_snap is not None
+            and (margin_snap.total_eq > 0 or margin_snap.avail_eq is not None)
+        ):
+            avail_eq_s = (
+                f"${margin_snap.avail_eq:,.2f}"
+                if margin_snap.avail_eq is not None
+                else "n/a"
+            )
+            avail_line = (
+                f"  OKX availEq: {avail_eq_s} "
+                f"(totalEq ${margin_snap.total_eq:,.2f})\n"
+                f"  Required (×{config.COLLATERAL_BUFFER_FACTOR:.2f} IM): "
+                f"${req_im:,.2f}\n"
+                f"  Headroom: ${margin_snap.spendable - req_im:,.2f}\n"
+            )
+        else:
+            avail_line = (
+                f"  Available: ${sizing.available_capital:,.2f}\n"
+                f"  Headroom: "
+                f"${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
+            )
         sizing_summary = telegram_summary_line(
             sizing_audit, resolved_qty, sizing.num_straddles,
         )
@@ -1386,9 +1506,7 @@ class Algo:
             f"  Call cost: ${sizing.total_call_cost:,.2f}\n"
             f"  Put cost: ${sizing.total_put_cost:,.2f}\n"
             f"  Total (w/ 5% buffer): ${sizing.total_capital_required:,.2f}\n"
-            f"  Available: ${sizing.available_capital:,.2f}\n"
-            f"  Headroom: "
-            f"${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
+            f"{avail_line}"
         )
 
         # Wing sessions must fit body-chase THEN wing-chase inside the window,
@@ -1402,6 +1520,7 @@ class Algo:
             session_name=session.name,
             entry_spot=spot,
             chase_deadline_min=entry_chase_min,
+            recorder=rec,
         )
         if straddle:
             self._consecutive_failures = 0
@@ -1914,6 +2033,9 @@ class Algo:
     async def _on_close(self, session: config.Session) -> None:
         label = session.time_label
         self._close_in_progress += 1
+        close_ctx = session_journal.ctx_for(session)
+        self._journal_close_ctx = close_ctx
+        session_journal.emit("close_start", close_ctx)
         try:
             equity_before = self.portfolio.equity
             pnl = await self.exit_mgr.hard_close(
@@ -1925,6 +2047,13 @@ class Algo:
                 if live_equity > 0:
                     self.portfolio.sync_equity(live_equity)
                 await self._post_close_reconcile()
+
+            row = session_journal.find_summary(close_ctx.session_id)
+            opened = bool(row and row.get("entry_result") == "opened")
+            close_status = "clean" if opened else "n/a"
+            if self.portfolio.has_open:
+                close_status = "reflatten"
+            session_journal.record_close_outcome(close_ctx, close_status)
 
             # TWO-PHASE FINALIZE: if the unwind DEFERRED (couldn't confirm flat)
             # the straddle is still open. The re-flatten above has now run, so
