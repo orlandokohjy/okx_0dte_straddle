@@ -394,6 +394,38 @@ class Portfolio:
         self._save_positions()
         self._log_trade(s, exit_reason, gross_pnl=gross_pnl, fees=total_fees_usd)
 
+        try:
+            from core import session_journal
+            cx = s.call_leg.exit_metrics or {}
+            px = s.put_leg.exit_metrics or {}
+            exit_chase = max(
+                float(cx.get("duration_sec") or 0),
+                float(px.get("duration_sec") or 0),
+            )
+            held = ""
+            if s.entry_time and s.exit_time:
+                from datetime import datetime
+                try:
+                    held = int((
+                        datetime.fromisoformat(s.exit_time.replace("Z", "+00:00"))
+                        - datetime.fromisoformat(s.entry_time.replace("Z", "+00:00"))
+                    ).total_seconds())
+                except Exception:
+                    held = ""
+            session_journal.record_straddle_booked(
+                session_journal.ctx_for_name(s.session_name),
+                net_pnl=net_pnl,
+                exit_reason=exit_reason,
+                qty_per_leg=s.qty_per_leg,
+                strike=s.strike,
+                call_symbol=s.call_leg.instrument,
+                put_symbol=s.put_leg.instrument,
+                exit_chase_sec=exit_chase or "",
+                held_sec=held,
+            )
+        except Exception:
+            log.warning("session_journal_booked_failed", exc_info=True)
+
         log.info("straddle_closed",
                  gross_pnl=f"${gross_pnl:,.2f}",
                  fees=f"${total_fees_usd:,.2f}",

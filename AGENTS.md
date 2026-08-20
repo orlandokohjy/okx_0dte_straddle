@@ -379,6 +379,27 @@ audit a stuck leg now: `grep chase_sell_attempt logs/algo.log`. Orphan /
 reconcile Telegram alerts also now include live `bid`/`ask` + a sellability
 verdict (`_fmt_positions_with_book`).
 
+## Session journal vs trade_log (2026-08-20)
+
+`state/trade_log.csv` is the **P&L ledger only** — one row per fully opened
+and closed straddle. Skips, no-fills, one-leg emergency flattens, and orphan
+flattens never go there.
+
+Every scheduled window is recorded in:
+
+- `state/session_events.jsonl` — append-only, one JSON object per action
+  (`session_due`, `gate_decision`, `entry_blocked`, `entry_attempt`,
+  `leg_fill` / `leg_partial` / `leg_no_fill`, `entry_rollback`,
+  `entry_outcome`, `close_start`, `reflatten_round`, `close_outcome`,
+  `straddle_booked`, `orphan_flatten`)
+- `state/session_summary.csv` — one row per scheduled session, upserted as
+  the window progresses. Join key: `stack`, `trading_day`, `session`,
+  `session_id` (`{date}_{session}_{stack}`).
+
+`entry_result` is `opened` / `skipped_signal` / `no_fill` /
+`partial_flattened` / `blocked` / `skipped`. `net_pnl` is blank unless a
+straddle was booked. Journal I/O is fail-open and must never block trading.
+
 ## Stacked (overlapping) straddles — `STACKED_STRADDLES` (2026-07-24)
 
 **This branch only** (BTC 1h signal stack). The default algo runs AT MOST one

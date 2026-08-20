@@ -980,3 +980,7 @@ EQUITY_FILE: str = f"{STATE_DIR}/equity.json"
 POSITIONS_FILE: str = f"{STATE_DIR}/positions.json"
 TRADE_LOG_FILE: str = f"{STATE_DIR}/trade_log.csv"
 VOLUME_FILE: str = f"{STATE_DIR}/volume.csv"
+# Session journal — every scheduled window (skips / no-fill / rollback),
+# not only booked P&L. trade_log.csv stays the ledger.
+SESSION_EVENTS_FILE: str = f"{STATE_DIR}/session_events.jsonl"
+SESSION_SUMMARY_FILE: str = f"{STATE_DIR}/session_summary.csv"
