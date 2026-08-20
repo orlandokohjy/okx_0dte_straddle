@@ -53,7 +53,11 @@ from risk.risk_manager import RiskManager
 from strategy.exit_manager import ExitManager
 from strategy.option_selector import select_straddle_pair
 from strategy.position_sizer import size_position
-from strategy.sizing import compute_qty_per_leg, telegram_summary_line
+from strategy.sizing import (
+    compute_qty_per_leg,
+    fit_qty_to_spendable,
+    telegram_summary_line,
+)
 from strategy.straddle_builder import build_straddle, unwind_straddle
 from risk.trade_gate import GateDecision, evaluate_trade_gate
 from utils import volume_tracker
@@ -1464,26 +1468,109 @@ class Algo:
             rec.blocked(entry_check.reason)
             return
 
-        # ── Pre-entry collateral check ──
+        # ── Pre-entry collateral check (isolated availEq) ──
+        # totalEq is wallet equity (P&L / pct_equity). Isolated concurrent
+        # BUY legs freeze IM against availEq — using totalEq here is how
+        # 2026-08-20 wd_1100/1130/1200 each opened one leg then 51008'd
+        # the other. Size down to what availEq can fund; skip if even
+        # MIN_QTY does not fit. Empty snapshot → fail-open (old behaviour).
+        margin_snap = None
         if config.HAS_OKX_CREDS:
-            available = await self.exchange.get_account_equity()
-            required = sizing.total_capital_required \
-                * config.COLLATERAL_BUFFER_FACTOR
-            if available > 0 and available < required:
-                msg = (
-                    f"Insufficient OKX trading-account balance.\n"
-                    f"Available: ${available:,.2f}\n"
-                    f"Required (× {config.COLLATERAL_BUFFER_FACTOR:.2f} "
-                    f"buffer): ${required:,.2f}"
+            margin_snap = await self.exchange.get_account_margin_snapshot()
+            have_snap = (
+                margin_snap.total_eq > 0 or margin_snap.avail_eq is not None
+            )
+            required = (
+                sizing.total_capital_required * config.COLLATERAL_BUFFER_FACTOR
+            )
+            if have_snap:
+                spendable = margin_snap.spendable
+                if spendable > 0 and spendable < required and resolved_qty > 0:
+                    fitted = fit_qty_to_spendable(
+                        resolved_qty, required, spendable,
+                    )
+                    if fitted > 0 and fitted < resolved_qty:
+                        old_qty = resolved_qty
+                        resolved_qty = fitted
+                        sizing = size_position(
+                            equity, pair.call.ask, pair.put.ask, spot,
+                            qty_per_leg=resolved_qty,
+                        )
+                        if session.sizing_mode in ("pct_equity", "fixed_usd"):
+                            forced_n = 1
+                        elif config.NUM_STRADDLES_OVERRIDE > 0:
+                            forced_n = config.NUM_STRADDLES_OVERRIDE
+                        else:
+                            forced_n = sizing.num_straddles
+                        if forced_n != sizing.num_straddles:
+                            sizing.num_straddles = forced_n
+                            sizing.total_call_cost = (
+                                sizing.call_cost_per * sizing.num_straddles
+                            )
+                            sizing.total_put_cost = (
+                                sizing.put_cost_per * sizing.num_straddles
+                            )
+                            sizing.total_capital_required = (
+                                (sizing.total_call_cost + sizing.total_put_cost)
+                                * 1.05
+                            )
+                        required = (
+                            sizing.total_capital_required
+                            * config.COLLATERAL_BUFFER_FACTOR
+                        )
+                        sizing_audit = {
+                            **sizing_audit,
+                            "decision": "avail_eq_fit",
+                            "prior_qty_btc": old_qty,
+                            "final_qty_btc": resolved_qty,
+                            "avail_eq": margin_snap.avail_eq,
+                            "total_eq": margin_snap.total_eq,
+                        }
+                        log.warning(
+                            "collateral_qty_reduced",
+                            old_qty=old_qty,
+                            new_qty=resolved_qty,
+                            avail_eq=margin_snap.avail_eq,
+                            total_eq=margin_snap.total_eq,
+                            required=required,
+                        )
+                if spendable < required:
+                    avail_s = (
+                        f"${margin_snap.avail_eq:,.2f}"
+                        if margin_snap.avail_eq is not None
+                        else "n/a"
+                    )
+                    msg = (
+                        f"Insufficient isolated availEq.\n"
+                        f"availEq: {avail_s}\n"
+                        f"totalEq: ${margin_snap.total_eq:,.2f}\n"
+                        f"Required (× {config.COLLATERAL_BUFFER_FACTOR:.2f} "
+                        f"IM): ${required:,.2f}"
+                    )
+                    log.warning("collateral_check_failed", msg=msg)
+                    await notifier.notify_skip(msg)
+                    rec.blocked("insufficient_collateral")
+                    return
+                log.info(
+                    "collateral_check_ok",
+                    avail_eq=margin_snap.avail_eq,
+                    total_eq=margin_snap.total_eq,
+                    imr=margin_snap.imr,
+                    spendable=f"${spendable:,.2f}",
+                    required=f"${required:,.2f}",
                 )
-                log.warning("collateral_check_failed", msg=msg)
-                await notifier.notify_skip(msg)
-                rec.blocked("insufficient_collateral")
-                return
-            log.info("collateral_check_ok",
-                     available=f"${available:,.2f}",
-                     required=f"${required:,.2f}")
+            else:
+                log.warning("collateral_snapshot_empty")
 
+        req_im = (
+            sizing.total_capital_required * config.COLLATERAL_BUFFER_FACTOR
+        )
+        spendable_disp = (
+            margin_snap.spendable
+            if margin_snap is not None
+            and (margin_snap.total_eq > 0 or margin_snap.avail_eq is not None)
+            else sizing.available_capital
+        )
         log.info(
             "preflight_check_passed",
             num_straddles=sizing.num_straddles,
@@ -1492,15 +1579,35 @@ class Algo:
             total_call_cost=f"${sizing.total_call_cost:,.2f}",
             total_put_cost=f"${sizing.total_put_cost:,.2f}",
             total_required=f"${sizing.total_capital_required:,.2f}",
-            available=f"${sizing.available_capital:,.2f}",
-            headroom=(
-                f"${sizing.available_capital - sizing.total_capital_required:,.2f}"
-            ),
+            available=f"${spendable_disp:,.2f}",
+            headroom=f"${spendable_disp - sizing.total_capital_required:,.2f}",
         )
 
         sizing_summary = telegram_summary_line(
             sizing_audit, resolved_qty, sizing.num_straddles,
         )
+        if (
+            margin_snap is not None
+            and (margin_snap.total_eq > 0 or margin_snap.avail_eq is not None)
+        ):
+            avail_eq_s = (
+                f"${margin_snap.avail_eq:,.2f}"
+                if margin_snap.avail_eq is not None
+                else "n/a"
+            )
+            avail_line = (
+                f"  OKX availEq: {avail_eq_s} "
+                f"(totalEq ${margin_snap.total_eq:,.2f})\n"
+                f"  Required (×{config.COLLATERAL_BUFFER_FACTOR:.2f} IM): "
+                f"${req_im:,.2f}\n"
+                f"  Headroom: ${margin_snap.spendable - req_im:,.2f}\n"
+            )
+        else:
+            avail_line = (
+                f"  Available: ${sizing.available_capital:,.2f}\n"
+                f"  Headroom: "
+                f"${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
+            )
         await notifier.send(
             f"<b>PRE-FLIGHT CHECK [{label}]</b>\n"
             f"{sizing_summary}\n"
@@ -1517,9 +1624,7 @@ class Algo:
             f"  Call cost: ${sizing.total_call_cost:,.2f}\n"
             f"  Put cost: ${sizing.total_put_cost:,.2f}\n"
             f"  Total (w/ 5% buffer): ${sizing.total_capital_required:,.2f}\n"
-            f"  Available: ${sizing.available_capital:,.2f}\n"
-            f"  Headroom: "
-            f"${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
+            f"{avail_line}"
         )
 
         # Cap the entry chase to the time left in this window. A gated entry
